@@ -386,7 +386,21 @@ class FaceSwappers:
             print("[ERROR] Inswapper128 model not loaded.")
             return
 
+        # FORCE CONTIGUOUS: Essential safety check.
+        # Ensures that the memory pointer passed to TensorRT is valid and linear.
+        if not image.is_contiguous():
+            image = image.contiguous()
+        if not embedding.is_contiguous():
+            embedding = embedding.contiguous()
+        if not output.is_contiguous():
+            output = output.contiguous()
+
         io_binding = model.io_binding()
+
+        # Clear previous bindings to avoid pointer caching issues
+        io_binding.clear_binding_inputs()
+        io_binding.clear_binding_outputs()
+
         io_binding.bind_input(
             name="target",
             device_type=self.models_processor.device,

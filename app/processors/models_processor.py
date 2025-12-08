@@ -260,6 +260,7 @@ class ModelsProcessor(QtCore.QObject):
                 self.models_trt[model_name] = None  # Model Instance
                 self.models_trt_path[model_name] = model_path
 
+        self.smart_smoother = faceutil.SmartSmoother()
         self.face_detectors = FaceDetectors(self)
         self.face_landmark_detectors = FaceLandmarkDetectors(self)
         self.face_masks = FaceMasks(self)
@@ -1421,8 +1422,10 @@ class ModelsProcessor(QtCore.QObject):
         landmark_score=0.5,
         from_points=False,
         rotation_angles=None,
+        **kwargs,  # Ajout de kwargs pour passer des options comme use_mean_eyes
     ):
         rotation_angles = rotation_angles or [0]
+        # On passe **kwargs à la fonction suivante
         return self.face_detectors.run_detect(
             img,
             detect_mode,
@@ -1434,13 +1437,21 @@ class ModelsProcessor(QtCore.QObject):
             landmark_score,
             from_points,
             rotation_angles,
+            **kwargs,
         )
 
     def run_detect_landmark(
-        self, img, bbox, det_kpss, detect_mode="203", score=0.5, from_points=False
+        self,
+        img,
+        bbox,
+        det_kpss,
+        detect_mode="203",
+        score=0.5,
+        from_points=False,
+        **kwargs,
     ):
         return self.face_landmark_detectors.run_detect_landmark(
-            img, bbox, det_kpss, detect_mode, score, from_points
+            img, bbox, det_kpss, detect_mode, score, from_points, **kwargs
         )
 
     def get_arcface_model(self, face_swapper_model):

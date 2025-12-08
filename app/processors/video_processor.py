@@ -289,6 +289,29 @@ class VideoProcessor(QObject):
 
         print("[INFO] Feeder thread finished.")
 
+    def _get_target_input_height(self) -> Optional[int]:
+        """
+        Helper to determine the target input height if global resize is enabled.
+        Returns None if resizing is disabled or invalid.
+        """
+        resize_enabled = self.main_window.control.get("GlobalInputResizeToggle", False)
+
+        if not resize_enabled:
+            return None
+
+        try:
+            # Get the selected resolution string (e.g., "720p")
+            size_str = self.main_window.control.get(
+                "GlobalInputResizeSizeSelection", "720p"
+            )
+            # Extract the number (e.g., 720)
+            return int(size_str.replace("p", ""))
+        except Exception as e:
+            print(
+                f"[WARN] Could not parse global input resolution, defaulting to original size. Error: {e}"
+            )
+            return None
+
     def _feed_video_loop(self):
         """
         Unified feeder logic for standard video playback AND segment recording.
@@ -323,8 +346,6 @@ class VideoProcessor(QObject):
                     if self.current_frame_number > self.current_segment_end_frame:
                         # This segment is finished, the feeder's job is done.
                         # We break the loop to allow the thread to terminate cleanly.
-                        # Previously, this was a time.sleep(0.01) loop, which
-                        # caused the thread to become an orphan.
                         print(
                             f"[INFO] Feeder: Reached end of segment {self.current_segment_index + 1}. Stopping feed."
                         )
@@ -341,33 +362,14 @@ class VideoProcessor(QObject):
                     time.sleep(0.005)  # Wait 5ms (buffer full)
                     continue
 
-                # Check if we are in playback (not recording/segments)
-                is_playback = not self.recording and not self.is_processing_segments
-
-                # Check if the user enabled the fast preview toggle
-                fast_preview_enabled = self.main_window.control.get(
-                    "VideoPlaybackPreviewToggle", False
-                )
-
-                preview_target_height: Optional[int] = None
-                if is_playback and fast_preview_enabled:
-                    try:
-                        # Get the selected resolution string (e.g., "360p")
-                        size_str = self.main_window.control.get(
-                            "VideoPlaybackPreviewSizeSelection", "360p"
-                        )
-                        # Extract the number (e.g., 360)
-                        preview_target_height = int(size_str.replace("p", ""))
-                    except Exception as e:
-                        print(
-                            f"[WARN] Could not parse preview resolution, defaulting to None. Error: {e}"
-                        )
-                        preview_target_height = None
+                # 3. Determine Input Resolution (Global Resize)
+                # This applies to both Playback AND Recording now.
+                target_height = self._get_target_input_height()
 
                 ret, frame_bgr = misc_helpers.read_frame(
                     self.media_capture,
                     self.media_rotation,
-                    preview_target_height=preview_target_height,
+                    preview_target_height=target_height,
                 )
                 if not ret:
                     print(
@@ -753,17 +755,14 @@ class VideoProcessor(QObject):
             pass
 
         # 4. Setup Recording (if applicable)
+        # Note: FFmpeg creation is deferred until we have the first frame read
+        # to ensure we use the correct dimensions (including Global Resize).
         if self.recording:
             # Disable UI elements
             if not self.main_window.control["KeepControlsToggle"]:
                 layout_actions.disable_all_parameters_and_control_widget(
                     self.main_window
                 )
-            # Create the ffmpeg subprocess
-            if not self.create_ffmpeg_subprocess(output_filename=None):
-                print("[ERROR] Failed to start FFmpeg for default-style recording.")
-                self.stop_processing()  # Abort the start
-                return
 
         # 5. Setup Audio (if applicable)
         # Note: Audio is not started here. It's started by
@@ -797,13 +796,17 @@ class VideoProcessor(QObject):
         misc_helpers.seek_frame(self.media_capture, actual_start_frame)
 
         # 7c. Read the frame using the LOCKED helper function ONCE for dimensions.
+        # CRITICAL: We must apply the global resize here so FFmpeg and VirtualCam
+        # get initialized with the correct resized dimensions.
+        target_height = self._get_target_input_height()
+
         print(
-            f"[INFO] Sync: Reading frame {actual_start_frame} (for dimensions/state) using locked helper..."
+            f"[INFO] Sync: Reading frame {actual_start_frame} using locked helper (Target Height: {target_height})..."
         )
         ret, frame_bgr = misc_helpers.read_frame(
             self.media_capture,
             self.media_rotation,
-            preview_target_height=None,
+            preview_target_height=target_height,
         )
         print(f"[INFO] Sync: Initial read complete (Result: {ret}).")
 
@@ -822,7 +825,9 @@ class VideoProcessor(QObject):
                 f"[INFO] Sync: Retrying read for frame {fallback_frame_to_try} using locked helper..."
             )
             ret, frame_bgr = misc_helpers.read_frame(
-                self.media_capture, self.media_rotation, preview_target_height=None
+                self.media_capture,
+                self.media_rotation,
+                preview_target_height=target_height,
             )
             print(f"[INFO] Sync: Retry read complete (Result: {ret}).")
             if not ret:
@@ -838,6 +843,13 @@ class VideoProcessor(QObject):
         # 7d. Frame is valid - Store for potential FFmpeg init, DO NOT PROCESS SYNC
         frame_rgb = numpy.ascontiguousarray(frame_bgr[..., ::-1])  # BGR to RGB
         self.current_frame = frame_rgb  # Store for FFmpeg dimensions
+
+        # DELAYED FFMPEG CREATION: Now that self.current_frame has the correct size
+        if self.recording:
+            if not self.create_ffmpeg_subprocess(output_filename=None):
+                print("[ERROR] Failed to start FFmpeg for default-style recording.")
+                self.stop_processing()  # Abort the start
+                return
 
         # !!! CRITICAL: Reset position AGAIN so the feeder reads this frame too !!!
         print(
@@ -954,12 +966,20 @@ class VideoProcessor(QObject):
         frame_to_process = None
         read_successful = False
 
+        # --- Determine Input Resolution (Global Resize) ---
+        target_height = self._get_target_input_height()
+
         # --- Read the frame based on file type ---
         if self.file_type == "video" and self.media_capture:
             misc_helpers.seek_frame(self.media_capture, self.current_frame_number)
+
+            # Apply target_height for VIDEO
             ret, frame_bgr = misc_helpers.read_frame(
-                self.media_capture, self.media_rotation, preview_target_height=None
+                self.media_capture,
+                self.media_rotation,
+                preview_target_height=target_height,
             )
+
             if ret:
                 frame_to_process = frame_bgr[..., ::-1]  # BGR to RGB
                 read_successful = True
@@ -969,23 +989,26 @@ class VideoProcessor(QObject):
                     f"[ERROR] Cannot read frame {self.current_frame_number} for single processing!"
                 )
                 self.main_window.last_seek_read_failed = True
-                """
-                # Stop the dialogue box from showing, this could break jobs and batches
-                self.main_window.display_messagebox_signal.emit(
-                    "Error Reading Frame",
-                    f"Error Reading Frame {self.current_frame_number}.",
-                    self.main_window,
-                )
-                """
+
         elif self.file_type == "image":
             frame_bgr = misc_helpers.read_image_file(self.media_path)
             if frame_bgr is not None:
+                # Apply target_height for IMAGE (Manual resize)
+                if target_height is not None and frame_bgr.shape[0] > target_height:
+                    h, w = frame_bgr.shape[:2]
+                    scale = target_height / h
+                    new_w = int(w * scale)
+                    frame_bgr = cv2.resize(
+                        frame_bgr, (new_w, target_height), interpolation=cv2.INTER_AREA
+                    )
+
                 frame_to_process = frame_bgr[..., ::-1]  # BGR to RGB
                 read_successful = True
             else:
                 print("[ERROR] Unable to read image file for processing.")
 
         elif self.file_type == "webcam" and self.media_capture:
+            # DO NOT apply target_height for WEBCAM (Use native resolution)
             ret, frame_bgr = misc_helpers.read_frame(
                 self.media_capture, 0, preview_target_height=None
             )
@@ -2038,9 +2061,15 @@ class VideoProcessor(QObject):
         # 4. Seek to the start frame of the segment
         print(f"[INFO] Seeking to start frame {start_frame}...")
         misc_helpers.seek_frame(self.media_capture, start_frame)
-        # We use preview_target_height=None to ensure segments are always read at full resolution
+
+        # --- CRITICAL CHANGE: Apply Global Resize here too ---
+        target_height = self._get_target_input_height()
+        # -----------------------------------------------------
+
         ret, frame_bgr = misc_helpers.read_frame(
-            self.media_capture, self.media_rotation, preview_target_height=None
+            self.media_capture,
+            self.media_rotation,
+            preview_target_height=target_height,  # <--- Used to be None
         )
         if ret:
             self.current_frame = numpy.ascontiguousarray(
@@ -2082,6 +2111,8 @@ class VideoProcessor(QObject):
             self.worker_threads.append(worker)
 
         # 6. Setup FFmpeg subprocess for this segment
+        # create_ffmpeg_subprocess uses self.current_frame.shape, so it will automatically
+        # pick up the resized dimensions we set in step 4.
         temp_segment_filename = f"segment_{self.current_segment_index:03d}.mp4"
         temp_segment_path = os.path.join(self.segment_temp_dir, temp_segment_filename)
         self.temp_segment_files.append(temp_segment_path)

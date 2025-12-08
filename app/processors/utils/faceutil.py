@@ -1,5 +1,6 @@
 import math
 from math import sin, cos, acos, degrees, floor, ceil
+import threading
 
 import numpy as np
 import cv2
@@ -2708,140 +2709,123 @@ def interp1d_inverse(y, fp, xp, device="cpu"):
 
 
 def histogram_matching_DFL_test(source_image, target_image, diffslider):
-    # Converti i tensori Torch in array di tipo float32 e normalizza le immagini [0, 1]
-    source_image = source_image.type(torch.float32) / 255.0  # Forma (C, H, W)
-    target_image = target_image.type(torch.float32) / 255.0  # Forma (C, H, W)
+    """
+    IMPROVED 'Smart Context' Color Transfer.
+    Captures the global atmosphere (Skin + Background/Hair) like original DFL_Test,
+    BUT excludes pure black padding (0,0,0) to prevent artificial darkening/greying.
+    This gives better contrast/blending on edges than DFL_Orig.
+    """
 
-    # Converti da RGB a LAB (le funzioni dovrebbero supportare direttamente (C, H, W))
-    source = rgb_to_lab(
-        source_image, False
-    )  # Converti in LAB direttamente su (C, H, W)
-    target = rgb_to_lab(
-        target_image, False
-    )  # Converti in LAB direttamente su (C, H, W)
+    # 1. Prepare Data
+    s_img = source_image.float() / 255.0
+    t_img = target_image.float() / 255.0
 
-    # Calcola media e deviazione standard per canali L, a, b direttamente su (C, H, W)
-    target_l_mean, target_l_std = target[0].mean(), target[0].std()
-    target_a_mean, target_a_std = target[1].mean(), target[1].std()
-    target_b_mean, target_b_std = target[2].mean(), target[2].std()
+    # 2. Smart Context Mask: Select pixels that are NOT pure black (padding)
+    # We sum the channels: if R+G+B > 0, it's a valid pixel.
+    s_mask = s_img.sum(dim=0) > 0.0  # [H, W]
+    t_mask = t_img.sum(dim=0) > 0.0
 
-    source_l_mean, source_l_std = source[0].mean(), source[0].std()
-    source_a_mean, source_a_std = source[1].mean(), source[1].std()
-    source_b_mean, source_b_std = source[2].mean(), source[2].std()
+    # Fallback: if image is fully black (rare error), use whole image
+    if s_mask.sum() == 0:
+        s_mask = torch.ones_like(s_mask)
+    if t_mask.sum() == 0:
+        t_mask = torch.ones_like(t_mask)
 
-    # Scala con le deviazioni standard reciproche del fattore proposto dal paper
-    target_l = (target[0] - target_l_mean) * (
-        source_l_std / target_l_std
-    ) + source_l_mean
-    target_a = (target[1] - target_a_mean) * (
-        source_a_std / target_a_std
-    ) + source_a_mean
-    target_b = (target[2] - target_b_mean) * (
-        source_b_std / target_b_std
-    ) + source_b_mean
+    # 3. Convert to LAB
+    s_lab = rgb_to_lab(s_img, normalize=False)
+    t_lab = rgb_to_lab(t_img, normalize=False)
 
-    # Clamping dei valori
-    target_l = torch.clamp(target_l, 0, 100)
-    target_a = torch.clamp(target_a, -127, 127)
-    target_b = torch.clamp(target_b, -127, 127)
+    # 4. Calculate Stats on NON-PADDING pixels only
+    # Flatten spatial dims and mask
+    s_vals = s_lab[:, s_mask]  # [3, N_pixels]
+    t_vals = t_lab[:, t_mask]
 
-    matched_target_image = torch.stack(
-        [target_l, target_a, target_b], 0
-    )  # Forma (C, H, W)
+    s_mean = s_vals.mean(dim=1).view(3, 1, 1)
+    s_std = s_vals.std(dim=1).view(3, 1, 1)
 
-    # Converti da LAB a RGB direttamente su (C, H, W)
-    matched_target_image = lab_to_rgb(
-        matched_target_image, False
-    )  # Converti in RGB direttamente
+    t_mean = t_vals.mean(dim=1).view(3, 1, 1)
+    t_std = t_vals.std(dim=1).view(3, 1, 1)
 
-    # Calcolo dell'immagine finale
-    final_image = (1 - diffslider / 100) * target_image + (
-        diffslider / 100
-    ) * matched_target_image
-    final_image = torch.clamp(
-        final_image * 255, 0, 255
-    )  # Converti in intervallo [0, 255]
+    t_std += 1e-6
 
-    return final_image
+    # 5. Apply Reinhard Transfer
+    t_lab_trans = (t_lab - t_mean) * (s_std / t_std) + s_mean
+
+    # 6. Clamp
+    t_lab_trans[0] = torch.clamp(t_lab_trans[0], 0, 100)
+    t_lab_trans[1] = torch.clamp(t_lab_trans[1], -127, 127)
+    t_lab_trans[2] = torch.clamp(t_lab_trans[2], -127, 127)
+
+    # 7. Convert back
+    result = lab_to_rgb(t_lab_trans, normalize=False)
+    result = torch.clamp(result, 0, 1)
+
+    # 8. Blend
+    alpha = diffslider / 100.0
+    final = (1 - alpha) * t_img + alpha * result
+
+    return torch.clamp(final * 255.0, 0, 255)
 
 
 def histogram_matching_DFL_Orig(source_image, target_image, mask, diffslider):
-    # Converti i tensori Torch in array di tipo float32
-    source_image = source_image.type(torch.float32) / 255.0  # Forma (C, H, W)
-    target_image = target_image.type(torch.float32) / 255.0  # Forma (C, H, W)
-    mask = mask.type(
-        torch.float32
-    ).squeeze()  # Rimuove dimensioni inutili, Forma (H, W)
-    mask_cutoff = 0.2
+    """
+    OPTIMIZED Statistical Color Transfer (Reinhard) using Mask.
+    CRITICAL FIX: Calculates Mean and Std ONLY on valid pixels (mask > 0).
+    This prevents black background pixels from skewing the color statistics.
+    """
 
-    # Aggiungi una dimensione per i canali
-    mask = mask.unsqueeze(0)  # Forma (1, H, W)
+    # 1. Prepare Data
+    s_img = source_image.float() / 255.0
+    t_img = target_image.float() / 255.0
 
-    # Espandi la maschera per coprire tutti i canali
-    source_mask = mask.expand(source_image.shape[0], -1, -1)  # Espande a (C, H, W)
-    target_mask = mask.expand(target_image.shape[0], -1, -1)  # Espande a (C, H, W)
+    # Ensure mask is binary and right shape
+    if mask.dim() == 3 and mask.shape[0] == 1:
+        mask = mask.squeeze(0)  # [H, W]
+    valid_mask = mask > 0.05  # Threshold to exclude soft edges/noise
 
-    # Converti da RGB a LAB (richiede un formato specifico)
-    source = rgb_to_lab(
-        source_image, False
-    )  # Converti in LAB direttamente su (C, H, W)
-    target = rgb_to_lab(
-        target_image, False
-    )  # Converti in LAB direttamente su (C, H, W)
+    # If mask is empty, return original
+    if valid_mask.sum() == 0:
+        return target_image
 
-    # Applica la maschera
-    source_input = source.clone()
-    if source_mask is not None:
-        # Usa la maschera espansa per coprire tutte le dimensioni
-        source_input[source_mask < mask_cutoff] = 0.0
+    # 2. Convert to LAB
+    s_lab = rgb_to_lab(s_img, normalize=False)
+    t_lab = rgb_to_lab(t_img, normalize=False)
 
-    target_input = target.clone()
-    if target_mask is not None:
-        target_input[target_mask < mask_cutoff] = 0.0
+    # 3. Calculate Stats on VALID PIXELS ONLY
+    # We flatten the spatial dimensions and select only masked pixels
+    # Shape becomes [3, N_Valid_Pixels]
+    s_masked = s_lab[:, valid_mask]
+    t_masked = t_lab[:, valid_mask]
 
-    # Calcola media e deviazione standard per canali L, a, b direttamente su (C, H, W)
-    target_l_mean, target_l_std = target_input[0].mean(), target_input[0].std()
-    target_a_mean, target_a_std = target_input[1].mean(), target_input[1].std()
-    target_b_mean, target_b_std = target_input[2].mean(), target_input[2].std()
+    # Calculate Mean and Std along the pixel dimension (dim=1)
+    # Reshape to [3, 1, 1] for broadcasting back to image
+    s_mean = s_masked.mean(dim=1).view(3, 1, 1)
+    s_std = s_masked.std(dim=1).view(3, 1, 1)
 
-    source_l_mean, source_l_std = source_input[0].mean(), source_input[0].std()
-    source_a_mean, source_a_std = source_input[1].mean(), source_input[1].std()
-    source_b_mean, source_b_std = source_input[2].mean(), source_input[2].std()
+    t_mean = t_masked.mean(dim=1).view(3, 1, 1)
+    t_std = t_masked.std(dim=1).view(3, 1, 1)
 
-    # Scala con le deviazioni standard reciproche del fattore proposto dal paper
-    target_l = (target[0] - target_l_mean) * (
-        source_l_std / target_l_std
-    ) + source_l_mean
-    target_a = (target[1] - target_a_mean) * (
-        source_a_std / target_a_std
-    ) + source_a_mean
-    target_b = (target[2] - target_b_mean) * (
-        source_b_std / target_b_std
-    ) + source_b_mean
+    t_std += 1e-6  # Safety
 
-    # Clamping dei valori
-    target_l = torch.clamp(target_l, 0, 100)
-    target_a = torch.clamp(target_a, -127, 127)
-    target_b = torch.clamp(target_b, -127, 127)
+    # 4. Apply Transfer globally
+    # Ideally we apply it only to masked area, but blending handles the rest.
+    # Applying globally ensures smooth transition at edges.
+    t_lab_trans = (t_lab - t_mean) * (s_std / t_std) + s_mean
 
-    matched_target_image = torch.stack(
-        [target_l, target_a, target_b], 0
-    )  # Forma (C, H, W)
+    # 5. Clamp LAB values
+    t_lab_trans[0] = torch.clamp(t_lab_trans[0], 0, 100)
+    t_lab_trans[1] = torch.clamp(t_lab_trans[1], -127, 127)
+    t_lab_trans[2] = torch.clamp(t_lab_trans[2], -127, 127)
 
-    # Converti da LAB a RGB direttamente su (C, H, W)
-    matched_target_image = lab_to_rgb(
-        matched_target_image, False
-    )  # Converti in RGB direttamente
+    # 6. Convert back
+    result = lab_to_rgb(t_lab_trans, normalize=False)
+    result = torch.clamp(result, 0, 1)
 
-    # Calcolo dell'immagine finale
-    final_image = (1 - diffslider / 100) * target_image + (
-        diffslider / 100
-    ) * matched_target_image
-    final_image = torch.clamp(
-        final_image * 255, 0, 255
-    )  # Converti in intervallo [0, 255]
+    # 7. Blend
+    alpha = diffslider / 100.0
+    final = (1 - alpha) * t_img + alpha * result
 
-    return final_image
+    return torch.clamp(final * 255.0, 0, 255)
 
 
 def transform_t(img, center, output_size, scale, rotation):
@@ -3019,3 +3003,221 @@ def get_matrix_lmk_rotation_translation(R, t):
     M = t.params[0:2]
 
     return M
+
+
+class OneEuroFilter:
+    def __init__(self, min_cutoff=1.0, beta=0.0, d_cutoff=1.0, freq=30.0):
+        self.freq = freq
+        self.min_cutoff = min_cutoff
+        self.beta = beta
+        self.d_cutoff = d_cutoff
+        self.x_prev = None
+        self.dx_prev = None
+        self.t_prev = None
+        self.lock = threading.Lock()  # <--- Thread lock for parallel access
+
+    def __call__(self, x, t=None):
+        with self.lock:  # <--- Protect state update
+            if t is None:
+                if self.t_prev is None:
+                    t = 0
+                else:
+                    t = self.t_prev + 1.0 / self.freq
+
+            # Determine format (numpy or tensor)
+            is_tensor = torch.is_tensor(x)
+            device = x.device if is_tensor else None
+
+            if is_tensor:
+                x_np = x.detach().cpu().numpy()
+            else:
+                x_np = x
+
+            if self.x_prev is None:
+                self.x_prev = x_np
+                self.dx_prev = np.zeros_like(x_np)
+                self.t_prev = t
+                return x
+
+            dt = t - self.t_prev
+            # Prevent division by zero or negative time deltas in async environments
+            if dt <= 0:
+                return x if not is_tensor else torch.from_numpy(x_np).to(device)
+
+            self.t_prev = t
+
+            # Compute smoothing factor
+            dx = (x_np - self.x_prev) / dt
+            edx = self.exponential_smoothing(dx, self.dx_prev, dt, self.d_cutoff)
+
+            # Use beta to adjust cutoff based on speed (jitter reduction vs responsiveness)
+            cutoff = self.min_cutoff + self.beta * np.abs(edx)
+            x_filtered = self.exponential_smoothing(x_np, self.x_prev, dt, cutoff)
+
+            self.x_prev = x_filtered
+            self.dx_prev = edx
+
+            # Return in original format
+            if is_tensor:
+                return torch.from_numpy(x_filtered).to(device)
+            return x_filtered
+
+    def exponential_smoothing(self, x, x_prev, dt, cutoff):
+        tau = 1.0 / (2 * np.pi * cutoff)
+        alpha = 1.0 / (1.0 + tau / dt)
+        return alpha * x + (1 - alpha) * x_prev
+
+    def reset(self):
+        with self.lock:
+            self.x_prev = None
+            self.dx_prev = None
+            self.t_prev = None
+
+
+class SmartSmoother:
+    """
+    Manages multiple OneEuroFilters for different facial features with optimized parameters.
+    This class is designed to be shared across threads.
+    """
+
+    def __init__(self):
+        # Configuration for specific features
+        # High Beta = Reactive (Eyes/Blink)
+        # Low Beta = Smooth (Head Pose)
+        self.filters = {
+            "pitch": OneEuroFilter(min_cutoff=0.01, beta=0.1),  # Very smooth
+            "yaw": OneEuroFilter(min_cutoff=0.01, beta=0.1),
+            "roll": OneEuroFilter(min_cutoff=0.01, beta=0.1),
+            "t": OneEuroFilter(min_cutoff=0.01, beta=0.1),
+            "scale": OneEuroFilter(min_cutoff=0.01, beta=0.1),
+            # Expression is split into parts later, but this main filter handles the bulk
+            "exp_eyes": OneEuroFilter(min_cutoff=1.0, beta=15.0),  # Fast for blinks
+            "exp_mouth": OneEuroFilter(
+                min_cutoff=0.5, beta=0.5
+            ),  # Smooth for speech/noise
+            "exp_base": OneEuroFilter(min_cutoff=1.0, beta=2.0),  # General expression
+        }
+
+    def reset(self):
+        """Resets all internal filters."""
+        for key in self.filters:
+            self.filters[key].reset()
+
+    def smooth_pose(self, pitch, yaw, roll, t, scale):
+        """Smooths rigid head motion."""
+        s_pitch = self.filters["pitch"](pitch)
+        s_yaw = self.filters["yaw"](yaw)
+        s_roll = self.filters["roll"](roll)
+        s_t = self.filters["t"](t)
+        s_scale = self.filters["scale"](scale)
+        return s_pitch, s_yaw, s_roll, s_t, s_scale
+
+    def smooth_expression(self, exp_tensor):
+        """
+        Applies differentiated smoothing to the expression tensor.
+        Indices reference standard LivePortrait/FaceVerse expression mapping.
+        """
+        # Ensure tensor is CPU numpy for slicing/filtering, handling logic inside filters
+        # Indices:
+        # Eyes: 11, 13, 15, 16, 18
+        # Lips: 6, 12, 14, 17, 19, 20
+
+        # 1. Base Smoothing (General features)
+        exp_smooth = self.filters["exp_base"](exp_tensor)
+
+        # If input is tensor, we might need to be careful about in-place ops on the result
+        # The filter returns the same type as input.
+
+        # 2. Targeted Smoothing (We run the filters, but we only inject the result into specific indices)
+        # Note: running the filter on the *whole* tensor for specific parts is inefficient but keeps logic simple.
+        # Ideally, we filter sliced data.
+
+        # Efficient approach: Extract parts, filter parts, re-inject.
+
+        # Eyes Slice
+        eye_indices = [11, 13, 15, 16, 18]
+        eyes_vals = exp_tensor[:, eye_indices, :]
+        eyes_smooth = self.filters["exp_eyes"](eyes_vals)
+        exp_smooth[:, eye_indices, :] = eyes_smooth
+
+        # Mouth Slice
+        mouth_indices = [6, 12, 14, 17, 19, 20]
+        mouth_vals = exp_tensor[:, mouth_indices, :]
+        mouth_smooth = self.filters["exp_mouth"](mouth_vals)
+        exp_smooth[:, mouth_indices, :] = mouth_smooth
+
+        return exp_smooth
+
+
+def repair_mouth_inversion_203(landmarks):
+    """
+    Checks if inner lips are inverted (Lower lip above Upper lip) usually caused by occlusion (mic/food).
+    If inverted, it forces a minimal separation.
+    Based on standard 68-point topology mapped within 203.
+    """
+
+    up_idx = 100  # Approx center upper inner
+    lo_idx = 105  # Approx center lower inner
+
+    # Sécurité simple : vérifier si le point central bas est au-dessus du point central haut
+    # (Y axis vers le bas en image coords)
+    if lo_idx < len(landmarks) and up_idx < len(landmarks):
+        y_up = landmarks[up_idx][1]
+        y_lo = landmarks[lo_idx][1]
+
+        if y_lo < y_up:  # Inversion détectée
+            # On force une séparation minimale ou on moyenne
+            mid = (y_up + y_lo) / 2
+            separation = 2.0  # pixels
+            landmarks[up_idx][1] = mid - separation
+            landmarks[lo_idx][1] = mid + separation
+
+    return landmarks
+
+
+def calc_face_yaw_pitch(kps):
+    """
+    Estimates the Yaw (Left/Right) and Pitch (Up/Down) angles based on 5 landmarks.
+    Returns values roughly in degrees.
+    """
+    # kps order: 0:Left Eye, 1:Right Eye, 2:Nose, 3:Left Mouth, 4:Right Mouth
+    le = kps[0]
+    re = kps[1]
+    n = kps[2]
+    lm = kps[3]
+    rm = kps[4]
+
+    # --- YAW CALCULATION (Left - Right) ---
+    # Compare distance from Nose to Left Eye vs Nose to Right Eye
+    # We use horizontal distances (x-coordinates)
+    dist_n_le = n[0] - le[0]
+    dist_re_n = re[0] - n[0]
+
+    # Avoid division by zero
+    diff = dist_n_le - dist_re_n
+    sum_dist = dist_n_le + dist_re_n + 1e-6
+
+    # Ratio roughly between -1 and 1. Scaled to approx degrees.
+    # Positive = Looking Right (User's Right, Image Left)
+    # Negative = Looking Left
+    yaw = (diff / sum_dist) * 90.0
+
+    # --- PITCH CALCULATION (Up - Down) ---
+    # Compare center of eyes to nose vs nose to center of mouth
+    eye_center_y = (le[1] + re[1]) / 2
+    mouth_center_y = (lm[1] + rm[1]) / 2
+
+    dist_eye_nose = n[1] - eye_center_y
+    dist_nose_mouth = mouth_center_y - n[1]
+
+    # Typical ratio is around 0.8 to 1.0 for frontal
+    # If eye-nose distance decreases -> Looking Up
+    # If eye-nose distance increases -> Looking Down
+
+    ratio = dist_eye_nose / (dist_nose_mouth + 1e-6)
+
+    # Heuristic adjustment to center around 0 degrees
+    # This is a rough approximation suitable for masking triggers
+    pitch = (1.0 - ratio) * 90.0
+
+    return yaw, pitch
