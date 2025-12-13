@@ -36,8 +36,6 @@ class FaceMasks:
     def _faceparser_labels(self, img_uint8_3x512x512: torch.Tensor) -> torch.Tensor:
         """
         Runs FaceParser on 512x512 input and returns NATIVE 512x512 labels.
-        QUALITY UPGRADE: We no longer downscale to 128/256 here.
-        We keep full resolution for precise segmentation (hair, lips, glasses).
         """
         model_name = "FaceParser"
         ort_session = self.models_processor.models.get(model_name)
@@ -45,7 +43,6 @@ class FaceMasks:
             ort_session = self.models_processor.load_model(model_name)
 
         if not ort_session:
-            # Return empty 512 tensor
             return torch.zeros(
                 (512, 512), dtype=torch.long, device=img_uint8_3x512x512.device
             )
@@ -91,28 +88,101 @@ class FaceMasks:
             if is_lazy_build:
                 self.models_processor.hide_build_dialog.emit()
 
-        # Return full 512 resolution labels
         labels_512 = out.argmax(dim=1).squeeze(0).to(torch.long)
         return labels_512
 
+    def _create_aligned_mouth_overlay(self, img_orig, labels_orig, labels_swap):
+        """
+        STABILIZED ALIGNMENT WITH BLENDING:
+        1. Rigid alignment (Scale/Translate) based on width.
+        2. Soft edges on the mask to prevent contour artifacts.
+        """
+        # 1. Define Regions
+        mouth_classes = (labels_orig == 11) | (labels_orig == 12) | (labels_orig == 13)
+        if mouth_classes.sum() == 0:
+            return None, None
+
+        mouth_classes_swap = (
+            (labels_swap == 11) | (labels_swap == 12) | (labels_swap == 13)
+        )
+        if mouth_classes_swap.sum() == 0:
+            return None, None
+
+        hole_mask = labels_swap == 11
+        if hole_mask.sum() == 0:
+            return None, None
+
+        # 2. Get Coordinates
+        y_o, x_o = torch.where(mouth_classes)
+        y_s, x_s = torch.where(mouth_classes_swap)
+
+        # 3. Calculate Centroids
+        cy_o, cx_o = y_o.float().mean(), x_o.float().mean()
+        cy_s, cx_s = y_s.float().mean(), x_s.float().mean()
+
+        # 4. Calculate Widths
+        w_o = (x_o.max() - x_o.min()).float()
+        w_s = (x_s.max() - x_s.min()).float()
+
+        # 5. Calculate Transformations
+        # Scale based on Width Ratio + 15% Safety Margin
+        scale_factor = (w_s / (w_o + 1e-6)) * 1.05
+
+        translate_x = cx_s - cx_o
+        translate_y = cy_s - cy_o
+
+        # 6. Apply Affine Transform
+        overlay = v2.functional.affine(
+            img_orig,
+            angle=0,
+            translate=[translate_x.item(), translate_y.item()],
+            scale=scale_factor.item(),
+            shear=[0.0, 0.0],
+            interpolation=v2.InterpolationMode.BILINEAR,
+            center=[cx_o.item(), cy_o.item()],
+        )
+
+        # 7. Create Mask with Soft Edges
+        # Convert boolean mask to float
+        overlay_mask = hole_mask.float()
+
+        # Apply slight blur to edges to fix "cutting contours" artifacts
+        # We unsqueeze to [1, H, W] for the transform, then squeeze back
+        overlay_mask = v2.functional.gaussian_blur(
+            overlay_mask.unsqueeze(0), kernel_size=5, sigma=1.5
+        ).squeeze(0)
+
+        return overlay, overlay_mask
+
+    def get_mouth_overlay(self, swap_img, original_img, parameters):
+        """
+        Public helper to retrieve just the mouth overlay.
+        Used by FrameWorker to inject the mouth BEFORE the Face Restorer runs.
+        """
+        # Check requirements
+        if not parameters.get("MouthParserStretchToggle", False):
+            return None
+
+        # Run inference
+        labels_swap = self._faceparser_labels(swap_img)
+        labels_orig = self._faceparser_labels(original_img)
+
+        # Generate Overlay using the Rigid Alignment logic
+        return self._create_aligned_mouth_overlay(
+            original_img, labels_orig, labels_swap
+        )
+
     def process_masks_and_masks(
         self,
-        swap_restorecalc: torch.Tensor,  # [3,512,512] uint8
-        original_face_512: torch.Tensor,  # [3,512,512] uint8
+        swap_restorecalc: torch.Tensor,
+        original_face_512: torch.Tensor,
         parameters: dict,
         control: dict,
     ) -> dict:
-        """
-        QUALITY & PERFORMANCE OPTIMIZED PIPELINE:
-        1. Calculations at NATIVE 512x512 resolution.
-        2. GROUPED DILATION: Combines face parts with identical settings to reduce GPU overhead.
-        3. Dynamic resizing at the end.
-        """
         device = self.models_processor.device
         mode = control.get("DilatationTypeSelection", "conv")
         result = {"swap_formask": swap_restorecalc}
 
-        # Determine target resolution for final output
         target_h, target_w = swap_restorecalc.shape[1], swap_restorecalc.shape[2]
 
         resize_to_target = v2.Resize(
@@ -122,6 +192,9 @@ class FaceMasks:
         )
 
         # --- Check Requirements ---
+        # Mouth stretch is now an independent trigger
+        need_mouth_stretch = parameters.get("MouthParserStretchToggle", False)
+
         need_parser = parameters.get("FaceParserEnableToggle", False) or (
             (
                 parameters.get("TransferTextureEnableToggle", False)
@@ -139,19 +212,43 @@ class FaceMasks:
         labels_swap = None
         labels_orig = None
 
-        if need_parser or need_parser_mouth:
+        # We need labels if Parser is ON, OR MouthStretch is ON, OR XSegMouth is ON
+        if need_parser or need_parser_mouth or need_mouth_stretch:
             labels_swap = self._faceparser_labels(swap_restorecalc)
 
-        if need_parser and (
-            parameters.get("FaceParserEnableToggle", False)
-            or parameters.get("ExcludeMaskEnableToggle", False)
-        ):
+        # We need Original labels if (Parser ON OR MouthStretch ON)
+        should_get_orig_labels = need_mouth_stretch or (
+            need_parser
+            and (
+                parameters.get("FaceParserEnableToggle", False)
+                or parameters.get("ExcludeMaskEnableToggle", False)
+            )
+        )
+
+        if should_get_orig_labels:
             labels_orig = self._faceparser_labels(original_face_512)
+
+        # ---------- MOUTH FIT & ALIGN LOGIC ----------
+        if need_mouth_stretch and labels_orig is not None and labels_swap is not None:
+            # Use the new Rigid/Stable Alignment function
+            overlay, overlay_mask = self._create_aligned_mouth_overlay(
+                original_face_512, labels_orig, labels_swap
+            )
+
+            if overlay is not None:
+                if overlay.shape[1] != target_h:
+                    overlay = resize_to_target(overlay)
+                    overlay_mask = v2.Resize(
+                        (target_h, target_w), interpolation=v2.InterpolationMode.NEAREST
+                    )(overlay_mask.unsqueeze(0)).squeeze(0)
+
+                result["mouth_overlay_info"] = (overlay, overlay_mask)
+                if control.get("CommandLineDebugEnableToggle", False):
+                    print("[INFO] Mouth Align: Applied Stable Width Transform.")
 
         # ---------- MOUTH (Grouped Optimization) ----------
         if need_parser_mouth:
             mouth = torch.zeros((512, 512), device=device, dtype=torch.float32)
-            # Group classes by dilation value
             mouth_groups = {}
             mouth_specs = {
                 11: "XsegMouthParserSlider",
@@ -165,12 +262,9 @@ class FaceMasks:
                     mouth_groups[val] = []
                 mouth_groups[val].append(cls)
 
-            # Process by group instead of by class
             for val, classes in mouth_groups.items():
                 if val:
-                    # Extract combined mask for all classes in this group
                     m = self._mask_from_labels_lut(labels_swap, classes)
-                    # Perform ONE dilation for the whole group
                     m = self._dilate_binary(m, val, mode)
                     mouth = torch.maximum(mouth, m)
 
@@ -179,10 +273,7 @@ class FaceMasks:
         # ---------- FACEPARSER MASK (Grouped Optimization) ----------
         if parameters.get("FaceParserEnableToggle", False):
             fp = torch.zeros((512, 512), device=device, dtype=torch.float32)
-
-            # Key: (dilation_value, is_minimum_blend) -> List of classes
             fp_groups = {}
-
             face_classes = {
                 1: "FaceParserSlider",
                 2: "LeftEyebrowParserSlider",
@@ -197,45 +288,30 @@ class FaceMasks:
                 14: "NeckParserSlider",
                 17: "HairParserSlider",
             }
-
             mouth_inside = parameters.get("MouthParserInsideToggle", False)
 
             for cls, pname in face_classes.items():
                 val = int(parameters.get(pname, 0))
                 if val == 0:
                     continue
-
-                # Determine merge mode (min or max)
                 is_min = mouth_inside and cls == 11
-
                 key = (val, is_min)
                 if key not in fp_groups:
                     fp_groups[key] = []
                 fp_groups[key].append(cls)
 
-            # Execution Loop
             for (val, is_min), classes in fp_groups.items():
-                # 1. Mask from Swap
                 m1 = self._mask_from_labels_lut(labels_swap, classes)
                 m1 = self._dilate_binary(m1, val, mode)
 
-                # 2. Mask from Original (if needed for intersection/union)
                 if labels_orig is not None:
                     m2 = self._mask_from_labels_lut(labels_orig, classes)
-                    # We don't dilate m2 in original logic? Checking original...
-                    # Original logic: m2 = _mask...(orig), comb = min/max(m1, m2).
-                    # Original logic did NOT dilate m2 explicitly in the loop provided previously,
-                    # but logic suggests it should match m1's shape?
-                    # Let's stick to previous logic: m2 was NOT dilated in your previous file provided.
-                    # Wait, usually we want to match. Assuming NO dilation for orig based on previous code.
-
                     if is_min:
                         comb = torch.minimum(m1, m2)
                     else:
                         comb = torch.maximum(m1, m2)
                 else:
                     comb = m1
-
                 fp = torch.maximum(fp, comb)
 
             if parameters.get("FaceBlurParserSlider", 0) > 0:
@@ -252,14 +328,11 @@ class FaceMasks:
                 ).clamp(0, 1)
             result["FaceParser_mask"] = mask_final
 
-        # ---------- TEXTURE / DIFFERENCING EXCLUDE (Calculated at 512) ----------
+        # ---------- TEXTURE / DIFFERENCING EXCLUDE ----------
         if (
             parameters.get("TransferTextureEnableToggle", False)
             or parameters.get("DifferencingEnableToggle", False)
         ) and parameters.get("ExcludeMaskEnableToggle", False):
-            # This logic is complex because of 'FaceParserTextureSlider' blending and 'sub' logic.
-            # Grouping is harder here but we can optimize the standard cases.
-
             tex = torch.zeros((512, 512), device=device, dtype=torch.float32)
             tex_o = torch.zeros((512, 512), device=device, dtype=torch.float32)
 
@@ -276,10 +349,6 @@ class FaceMasks:
                 14: "NeckParserTextureSlider",
             }
 
-            # We process Class 1 (Face) separately because it has unique blending logic.
-            # Other classes can be grouped if they share Dilation AND Sign (+/-).
-
-            # Process Face (Class 1)
             face_val = int(parameters.get(tex_specs[1], 0))
             if face_val > 0:
                 blend = parameters.get("FaceParserTextureSlider", 0) / 10.0
@@ -289,12 +358,10 @@ class FaceMasks:
                     m_o = self._mask_from_labels_lut(labels_orig, [1]) * blend
                     tex_o = torch.maximum(tex_o, m_o)
 
-            # Process Others (Grouping Candidate)
-            # Group by (dilation_value)
             tex_groups = {}
             for cls, pname in tex_specs.items():
                 if cls == 1:
-                    continue  # Handled above
+                    continue
                 val = int(parameters.get(pname, 0))
                 if val == 0:
                     continue
@@ -303,7 +370,6 @@ class FaceMasks:
                 tex_groups[val].append(cls)
 
             for d, classes in tex_groups.items():
-                # Combined masks
                 m_s = self._mask_from_labels_lut(labels_swap, classes)
                 m_o = (
                     self._mask_from_labels_lut(labels_orig, classes)
@@ -312,36 +378,29 @@ class FaceMasks:
                 )
 
                 if d > 0:
-                    # Dilation
                     m_s = self._dilate_binary(m_s, d, mode)
                     m_o = self._dilate_binary(m_o, d, mode)
-
                     if parameters.get("FaceParserBlendTextureSlider", 0):
                         bl = parameters["FaceParserBlendTextureSlider"] / 100.0
                         m_s = (m_s + bl).clamp(0, 1)
                         m_o = (m_o + bl).clamp(0, 1)
-
                     tex = torch.maximum(tex, m_s)
                     tex_o = torch.maximum(tex_o, m_o)
 
                 elif d < 0:
-                    # Erosion (Negative dilation)
                     d_abs = abs(d)
                     m_s = self._dilate_binary(m_s, -d_abs, mode)
                     m_o = self._dilate_binary(m_o, -d_abs, mode)
-
                     if parameters.get("FaceParserBlendTextureSlider", 0):
                         bl = parameters["FaceParserBlendTextureSlider"] / 100.0
                         m_s = (m_s + bl).clamp(0, 1)
                         m_o = (m_o + bl).clamp(0, 1)
-
                     sub = torch.maximum(m_s, m_o)
                     tex = (tex - sub).clamp_min(0)
                     tex_o = (tex_o - sub).clamp_min(0)
 
             comb = torch.minimum(1.0 - tex.clamp(0, 1), 1.0 - tex_o.clamp(0, 1))
-            comb = comb.unsqueeze(0).clamp(0, 1)
-            result["texture_mask"] = comb  # Keep 512 native
+            result["texture_mask"] = comb.unsqueeze(0).clamp(0, 1)
 
         return result
 
@@ -364,9 +423,6 @@ class FaceMasks:
     def _dilate_binary(
         self, m: torch.Tensor, r: int, mode: str = "conv"
     ) -> torch.Tensor:
-        """
-        Dilate/erode binary mask (r>0 / r<0). Expects [H,W] or [1,1,H,W].
-        """
         if r == 0:
             return m
         squeeze_back = False
@@ -393,25 +449,15 @@ class FaceMasks:
             hits = F.conv2d(m_in, kernel, padding=rr)
             out = (hits > 0).float()
 
-        if r < 0:
-            # Erosion logic handles inversion outside or here?
-            # Helper is generic dilate. Caller handles inversion for erosion.
-            pass
-
         return out.squeeze(0).squeeze(0) if squeeze_back else out
 
     def _mask_from_labels_lut(
         self, labels: torch.Tensor, classes: list[int]
     ) -> torch.Tensor:
-        # labels are [512,512]
         lut = torch.zeros(19, device=labels.device, dtype=torch.float32)
         if classes:
             lut[torch.tensor(classes, device=labels.device, dtype=torch.long)] = 1.0
         return lut[labels]
-
-    # --- Other methods (run_occluder, apply_occlusion, run_dfl_xseg, apply_dfl_xseg, run_CLIPs, etc.)
-    # --- Should be kept as they were in the original file, or updated if you provided them before.
-    # --- Assuming you want me to provide the FULL file content with these changes merged:
 
     def apply_occlusion(self, img, amount):
         img = torch.div(img, 255)

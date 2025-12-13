@@ -1912,12 +1912,13 @@ class FrameWorker(threading.Thread):
         return border_mask, border_mask_calc
 
     def get_dynamic_side_mask(
-        self, yaw_deg, pitch_deg, height, width, device, parameters
+        self, yaw_deg, pitch_deg, height, width, device, parameters, kps_5, tform
     ):
         """
-        Creates a gradient mask to hide the stretched side of a profile face.
-        Handles both YAW (Left/Right) and PITCH (Up/Down).
-        Controlled by UI parameters.
+        Smart Profile Masking:
+        Instead of a blind gradient, this uses the projected eye positions to ensure
+        we NEVER mask the eyes (which causes double-vision/ghosting).
+        The fade only occurs on the 'stretch' area between the outer eye and the image edge.
         """
         # Base mask (White/Opaque)
         mask = torch.ones((1, height, width), dtype=torch.float32, device=device)
@@ -1929,64 +1930,88 @@ class FrameWorker(threading.Thread):
         # Get Thresholds from UI
         start_angle = parameters.get("ProfileAngleMaskThresholdSlider", 20)
         max_strength = parameters.get("ProfileAngleMaskStrengthSlider", 100) / 100.0
-        range_deg = 30.0  # Transition range
+
+        # Transform Keypoints to 512x512 space (Swap Coordinates)
+        # kps_5 order: [Left Eye, Right Eye, Nose, Left Mouth, Right Mouth]
+        # We need the transformation matrix to know where these points are on the swap.
+        if tform is not None:
+            # Transform points using the affine matrix
+            # Add column of ones for matrix multiplication
+            kps_proj = tform(kps_5)  # Returns (N, 2) array
+
+            # Extract Eye X-Coordinates (in 512px space)
+            # kps_proj[0] is Left Eye (Stage Right), kps_proj[1] is Right Eye (Stage Left)
+            le_x = kps_proj[0][0]  # Left Eye X
+            re_x = kps_proj[1][0]  # Right Eye X
+        else:
+            # Fallback if no tform (should not happen in swap_core)
+            le_x = width * 0.35
+            re_x = width * 0.65
+
+        # Normalize coordinates to 0..1 range
+        le_x_norm = np.clip(le_x / width, 0.0, 1.0)
+        re_x_norm = np.clip(re_x / width, 0.0, 1.0)
+
+        # Padding to protect the eye (keep mask opaque slightly beyond the eye)
+        eye_safety_margin = 0.05  # 5% of width
 
         # --- 1. YAW MASKING (Left/Right) ---
         abs_yaw = abs(yaw_deg)
         if abs_yaw > start_angle:
-            strength_yaw = min((abs_yaw - start_angle) / range_deg, 1.0) * max_strength
+            # Calculate intensity (0.0 to 1.0) based on how far past threshold we are
+            # We assume 90 degrees is max profile
+            angle_excess = max(0, abs_yaw - start_angle)
+            # A ramp of 45 degrees duration
+            strength_yaw = min(angle_excess / 45.0, 1.0) * max_strength
 
-            # shape [1, 1, W]
+            # Coordinate grid
             linspace_x = torch.linspace(0, 1, width, device=device).view(1, 1, width)
 
             if yaw_deg > 0:
-                # Looking Right -> Mask Left side
-                grad_yaw = torch.clamp(
-                    (linspace_x - 0.0) * (1.0 + strength_yaw * 2.0), 0, 1
-                )
+                # Looking Right -> The LEFT side of the image (Left Eye / Stage Right) is the "far" side.
+                # We want to fade the Left side, but STOP before the Left Eye.
+
+                # Gradient End Point: Slightly to the left of the left eye
+                fade_end = max(0.0, le_x_norm - eye_safety_margin)
+
+                # If eye is too close to edge, disable fade to prevent hard cut
+                if fade_end > 0.05:
+                    # Gradient: 0.0 at edge -> 1.0 at fade_end
+                    grad_yaw = torch.clamp(linspace_x / fade_end, 0, 1)
+                    # Blend based on strength: Result = 1.0 (No mask) -> grad_yaw (Full mask)
+                    grad_yaw = 1.0 - (1.0 - grad_yaw) * strength_yaw
+                    mask = mask * grad_yaw
+
             else:
-                # Looking Left -> Mask Right side
-                grad_yaw = torch.clamp(
-                    (1.0 - linspace_x) * (1.0 + strength_yaw * 2.0), 0, 1
-                )
+                # Looking Left -> The RIGHT side of the image (Right Eye / Stage Left) is the "far" side.
+                # We want to fade the Right side, but STOP after the Right Eye.
 
-            # Expand to H and Blend
-            mask_yaw = grad_yaw.expand(1, height, width)
-            mask = mask * (1.0 - strength_yaw) + mask_yaw * strength_yaw
+                # Gradient Start Point: Slightly to the right of the right eye
+                fade_start = min(1.0, re_x_norm + eye_safety_margin)
 
-        # --- 2. PITCH MASKING (Up/Down) ---
-        abs_pitch = abs(pitch_deg)
-        if abs_pitch > start_angle:
-            strength_pitch = (
-                min((abs_pitch - start_angle) / range_deg, 1.0) * max_strength
-            )
+                # If eye is too close to edge
+                if fade_start < 0.95:
+                    # Gradient: 1.0 at fade_start -> 0.0 at edge (1.0)
+                    # Mapping: (x - start) / (1 - start) gives 0->1. We want 1->0.
+                    grad_yaw = torch.clamp(
+                        (linspace_x - fade_start) / (1.0 - fade_start), 0, 1
+                    )
+                    grad_yaw = 1.0 - grad_yaw  # Now 1 at start, 0 at edge
 
-            # shape [1, H, 1] - Note dimension order for vertical gradient
-            linspace_y = torch.linspace(0, 1, height, device=device).view(1, height, 1)
+                    # Since we want to mask the right side (keep left opaque),
+                    # the area BEFORE fade_start is 1.0.
+                    # The calculation above makes area before fade_start < 0 (clamped to 0) -> incorrect logic.
 
-            if pitch_deg > 0:
-                # Looking Up (Chin exposed) -> Mask Bottom side
-                # linspace goes 0 (Top) to 1 (Bottom). We want 1 at Top, 0 at Bottom.
-                grad_pitch = torch.clamp(
-                    (1.0 - linspace_y) * (1.0 + strength_pitch * 2.0), 0, 1
-                )
-            else:
-                # Looking Down (Forehead exposed) -> Mask Top side
-                # We want 0 at Top, 1 at Bottom.
-                grad_pitch = torch.clamp(
-                    (linspace_y - 0.0) * (1.0 + strength_pitch * 2.0), 0, 1
-                )
+                    # Correct logic for Right Fade:
+                    # 1.0 until fade_start. Then ramp down to 0.0.
+                    mask_r = torch.ones_like(linspace_x)
+                    mask_r[linspace_x > fade_start] = 1.0 - (
+                        (linspace_x[linspace_x > fade_start] - fade_start)
+                        / (1.0 - fade_start)
+                    )
 
-            # Expand to W and Blend
-            mask_pitch = grad_pitch.expand(1, height, width)
-
-            # Combine with existing mask (Intersection)
-            # We multiply to keep the transparency from both yaw and pitch
-            mask_pitch_blended = (
-                torch.ones_like(mask) * (1.0 - strength_pitch)
-                + mask_pitch * strength_pitch
-            )
-            mask = mask * mask_pitch_blended
+                    grad_yaw = 1.0 - (1.0 - mask_r) * strength_yaw
+                    mask = mask * grad_yaw
 
         return mask
 
@@ -2132,7 +2157,7 @@ class FrameWorker(threading.Thread):
         # Calculate Pose (Yaw and Pitch)
         yaw_deg, pitch_deg = faceutil.calc_face_yaw_pitch(kps_5)
 
-        # Get Dynamic Side Mask based on Yaw AND Pitch
+        # Get Dynamic Side Mask based on Yaw AND Pitch (Smart Feature Aware)
         side_mask = self.get_dynamic_side_mask(
             yaw_deg,
             pitch_deg,
@@ -2140,6 +2165,8 @@ class FrameWorker(threading.Thread):
             current_swap_w,
             self.models_processor.device,
             parameters,
+            kps_5,  # <-- Added
+            tform,  # <-- Added
         )
 
         # Resize border_mask to match current swap dimensions BEFORE multiplication
@@ -2163,7 +2190,6 @@ class FrameWorker(threading.Thread):
         swap_mask = torch.unsqueeze(swap_mask, 0)
 
         # Initialize masks
-        # Since border_mask is already resized to current dimensions, we use it directly
         swap_mask_noFP = border_mask.clone()
 
         BgExclude = torch.ones(
@@ -2186,6 +2212,12 @@ class FrameWorker(threading.Thread):
 
         swap = torch.clamp(swap, 0.0, 255.0)
 
+        # --- NEW: Track changes on the Original Face as well ---
+        # If we use Face Editor/Expression Restorer at the beginning,
+        # we must apply the same geometry changes to the Original Face
+        # so that the Mouth Fit overlay creates a matching source.
+        original_face_processed = original_face_512.clone()
+
         # Expression Restorer beginning
         if (
             parameters["FaceExpressionEnableBothToggle"]
@@ -2195,8 +2227,13 @@ class FrameWorker(threading.Thread):
             )
             and parameters["FaceExpressionBeforeTypeSelection"] == "Beginning"
         ):
+            # Apply to Swap
             swap = self.frame_edits.apply_face_expression_restorer(
                 original_face_512, swap, cast(dict, parameters)
+            )
+            # Apply to Original (Sync geometry)
+            original_face_processed = self.frame_edits.apply_face_expression_restorer(
+                original_face_512, original_face_processed, cast(dict, parameters)
             )
 
         # Face editor beginning
@@ -2206,12 +2243,51 @@ class FrameWorker(threading.Thread):
             and parameters["FaceEditorBeforeTypeSelection"] == "Beginning"
         ):
             editor_mask = swap_mask.clone()
+
+            # Apply to Swap
             swap = swap * editor_mask + original_face_512 * (1 - editor_mask)
             swap = self.frame_edits.swap_edit_face_core(swap, swap, parameters, control)
+
+            # Apply to Original (Sync geometry for sliders like Jaw/Mouth Open)
+            original_face_processed = (
+                original_face_processed * editor_mask
+                + original_face_512 * (1 - editor_mask)
+            )
+            original_face_processed = self.frame_edits.swap_edit_face_core(
+                original_face_processed, original_face_processed, parameters, control
+            )
 
         # First Denoiser pass - Before Restorers
         if control.get("DenoiserUNetEnableBeforeRestorersToggle", False):
             swap = self._apply_denoiser_pass(swap, control, "Before", kv_map)
+
+        # --- MOUTH FIT & ALIGN (PRE-RESTORER INJECTION) ---
+        mouth_overlay_pkg_pre = None
+        if hasattr(self.models_processor, "face_masks"):
+            # IMPORTANT: Use 'original_face_processed' (warped) instead of 'original_face_512' (raw)
+            # This ensures the patch source has the same mouth opening/shape as the target.
+            mouth_overlay_pkg_pre = self.models_processor.face_masks.get_mouth_overlay(
+                swap, original_face_processed, parameters
+            )
+
+        if mouth_overlay_pkg_pre is not None:
+            overlay_rgb, overlay_mask = mouth_overlay_pkg_pre
+
+            if overlay_rgb is not None and overlay_mask is not None:
+                # Resize checks
+                if overlay_rgb.shape[-1] != swap.shape[-1]:
+                    overlay_rgb = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(overlay_rgb)
+                    overlay_mask = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(overlay_mask.unsqueeze(0)).squeeze(0)
+
+                # Apply the mouth patch to the RAW swap
+                swap = swap * (1.0 - overlay_mask) + overlay_rgb * overlay_mask
+
+                if debug:
+                    print("[INFO] Mouth Fit: Injected before Restorer.")
 
         # First Restorer
         swap_original = swap.clone()
@@ -2235,7 +2311,6 @@ class FrameWorker(threading.Thread):
             mask = self.models_processor.apply_occlusion(
                 original_face_256, parameters["OccluderSizeSlider"]
             )
-            # DYNAMIC RESIZE
             if mask.shape[-1] != swap_mask.shape[-1]:
                 mask = v2.Resize(
                     (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
@@ -2258,6 +2333,9 @@ class FrameWorker(threading.Thread):
         # -------------------------------
         # MASKEN: Parser / CLIPs / Restore
         # -------------------------------
+        # Separated logic for Mouth Stretch
+        need_mouth_stretch = parameters.get("MouthParserStretchToggle", False)
+
         need_any_parser = (
             parameters.get("FaceParserEnableToggle", False)
             or (
@@ -2272,6 +2350,9 @@ class FrameWorker(threading.Thread):
             )
             and (parameters.get("ExcludeMaskEnableToggle", False))
         )
+
+        # The parser pipeline runs if standard parser needs it OR mouth stretch needs it
+        need_any_parser = need_any_parser or need_mouth_stretch
 
         FaceParser_mask = None
         mouth_512 = None
@@ -2288,6 +2369,26 @@ class FrameWorker(threading.Thread):
 
             texture_exclude_512 = out.get("texture_mask", texture_exclude_512)
             mouth_512 = out.get("mouth", None)
+
+            # --- MOUTH FIT MASK PATCHING ---
+            # Image is already injected. We only need to fix the mask hole.
+            mouth_overlay_info = out.get("mouth_overlay_info", None)
+
+            if mouth_overlay_info is not None and FaceParser_mask is not None:
+                _, overlay_mask = mouth_overlay_info
+
+                if FaceParser_mask.shape[-1] != swap.shape[-1]:
+                    FaceParser_mask = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(FaceParser_mask)
+                if overlay_mask.shape[-1] != FaceParser_mask.shape[-1]:
+                    overlay_mask = v2.Resize(
+                        (FaceParser_mask.shape[-2], FaceParser_mask.shape[-1]),
+                        antialias=True,
+                    )(overlay_mask.unsqueeze(0)).squeeze(0)
+
+                # Close the hole in the mask so we see our restored overlay, not the background
+                FaceParser_mask = torch.maximum(FaceParser_mask, overlay_mask)
 
         # Merge FaceParser Mask
         if FaceParser_mask is not None:
@@ -2928,21 +3029,47 @@ class FrameWorker(threading.Thread):
             swap = self._apply_denoiser_pass(swap, control, "After", kv_map)
 
         # Face parser at end
-        if parameters.get("FaceParserEnableToggle") and parameters.get(
-            "FaceParserEndToggle"
-        ):
+        # We check if we need to run the parser pipeline again at the end
+        if (
+            parameters.get("FaceParserEnableToggle")
+            and parameters.get("FaceParserEndToggle")
+        ) or (parameters.get("MouthParserStretchToggle", False)):
             out = self.models_processor.process_masks_and_masks(
                 swap,
                 original_face_512,
                 parameters,
                 control,
             )
-            FaceParser_mask = out.get("FaceParser_mask", None)
+            # If Face Parser is ON, we get the mask
+            if parameters.get("FaceParserEnableToggle") and parameters.get(
+                "FaceParserEndToggle"
+            ):
+                FaceParser_mask = out.get("FaceParser_mask", None)
+            else:
+                FaceParser_mask = None
+
+            # --- MOUTH STRETCH MASK PATCHING (End of Pipeline) ---
+            # If Mouth Stretch is ON, we might need to patch the mask
+            # OR directly apply the overlay if no mask exists.
+            mouth_overlay_info_end = out.get("mouth_overlay_info", None)
+
+            # We have a FaceParser Mask -> We patch the hole in the mask
             if FaceParser_mask is not None:
                 if FaceParser_mask.shape[-1] != swap_mask.shape[-1]:
                     FaceParser_mask = v2.Resize(
                         (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
                     )(FaceParser_mask)
+
+                if mouth_overlay_info_end is not None:
+                    _, overlay_mask_end = mouth_overlay_info_end
+                    if overlay_mask_end.shape[-1] != FaceParser_mask.shape[-1]:
+                        overlay_mask_end = v2.Resize(
+                            (FaceParser_mask.shape[-2], FaceParser_mask.shape[-1]),
+                            interpolation=v2.InterpolationMode.NEAREST,
+                        )(overlay_mask_end.unsqueeze(0)).squeeze(0)
+
+                    FaceParser_mask = torch.maximum(FaceParser_mask, overlay_mask_end)
+
                 swap_mask = swap_mask * FaceParser_mask
 
         # AutoColor End (Use existing mask_autocolor)

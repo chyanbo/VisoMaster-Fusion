@@ -397,6 +397,12 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
         },
     },
     "Original Face Parsers": {
+        "MouthParserStretchToggle": {
+            "level": 1,
+            "label": "Mouth Fit & Align",
+            "default": False,
+            "help": "Repositions and scales the original mouth to fit the swap without distorting its shape. Can be used independently of Face Parser.",
+        },
         "FaceParserEnableToggle": {
             "level": 1,
             "label": "Face Parser Mask",
