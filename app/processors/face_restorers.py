@@ -363,7 +363,15 @@ class FaceRestorers:
         ort_session = self.models_processor.models.get(model_name)
 
         if not ort_session:
-            # Error handling logic omitted for brevity as per original code
+            # Enhanced error reporting
+            error_messages = [
+                f"[ERROR] UNet model '{model_name}' not loaded when run_ref_ldm_unet was called."
+            ]
+            error_messages.append(
+                "  This model should be loaded by ModelsProcessor.apply_denoiser_unet or a similar setup routine."
+            )
+            # ... (error reporting details omitted for brevity) ...
+            print("\n".join(error_messages))
             return
 
         onnx_output_name = "unet_output"

@@ -1774,7 +1774,12 @@ class ModelsProcessor(QtCore.QObject):
         vae_decoder_name = "RefLDMVAEDecoder"
 
         if DEBUG_DENOISER:
-            print(f"\n--- Denoiser Pass Start: Mode='{denoiser_mode}' ---")
+            print(
+                f"\n--- Denoiser Pass Start: Mode='{denoiser_mode}', CFG Scale={denoiser_cfg_scale}, VAE Scale Factor={self.vae_scale_factor} ---"
+            )
+            ModelsProcessor.print_tensor_stats(
+                image_cxhxw_uint8, "Initial input image_cxhxw_uint8", DEBUG_DENOISER
+            )
 
         with self.model_lock:
             self.ensure_denoiser_models_loaded()
@@ -1808,13 +1813,22 @@ class ModelsProcessor(QtCore.QObject):
                     return image_cxhxw_uint8
 
             if (
-                (
-                    denoiser_mode == "Full Restore (DDIM)"
-                    or denoiser_mode == "Single Step (Fast)"
-                )
+                denoiser_mode == "Full Restore (DDIM)"
                 and use_reference_exclusive_path
                 and not kv_tensor_map_for_this_run
             ):
+                print(
+                    "[ERROR] Denoiser (Full Restore): Reference K/V tensor file selected for use, but K/V map is empty. Skipping."
+                )
+                return image_cxhxw_uint8
+            if (
+                denoiser_mode == "Single Step (Fast)"
+                and use_reference_exclusive_path
+                and not kv_tensor_map_for_this_run
+            ):
+                print(
+                    "[ERROR] Denoiser (Single Step): Reference K/V tensor file selected for use, but K/V map is empty. Skipping."
+                )
                 return image_cxhxw_uint8
 
             target_proc_dim = 512
@@ -2049,6 +2063,9 @@ class ModelsProcessor(QtCore.QObject):
 
                     final_denoised_latent_x0_scaled = pred_x0_scaled_current_step
             else:
+                print(
+                    f"[ERROR] Denoiser: Unknown mode '{denoiser_mode}'. Skipping denoiser pass."
+                )
                 return image_cxhxw_uint8
 
             if final_denoised_latent_x0_scaled is None:
