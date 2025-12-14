@@ -453,12 +453,21 @@ class FaceRestorers:
                         .contiguous()
                     )
 
+        # IMPORTANT: Keep references to temporary zero tensors to prevent GC
+        keep_alive_tensors = []
+
         for onnx_kv_name, expected_shape in onnx_kv_input_names_to_shape.items():
             tensor_to_bind = actual_kv_tensors_for_binding.get(onnx_kv_name)
+
             if tensor_to_bind is None:
+                # Create a zero tensor for missing K/V inputs (e.g., unconditional pass)
                 tensor_to_bind = torch.zeros(
                     expected_shape, dtype=torch.float32, device=bind_device_type
                 ).contiguous()
+                # We MUST store this tensor in a list that persists for the function scope
+                # Otherwise, it might be garbage collected before .run() is called
+                keep_alive_tensors.append(tensor_to_bind)
+
             io_binding.bind_input(
                 name=onnx_kv_name,
                 device_type=bind_device_type,

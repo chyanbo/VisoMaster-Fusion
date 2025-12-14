@@ -260,6 +260,7 @@ class ModelsProcessor(QtCore.QObject):
                 self.models_trt[model_name] = None  # Model Instance
                 self.models_trt_path[model_name] = model_path
 
+        self.smart_smoother = faceutil.SmartSmoother()
         self.face_detectors = FaceDetectors(self)
         self.face_landmark_detectors = FaceLandmarkDetectors(self)
         self.face_masks = FaceMasks(self)
@@ -1421,8 +1422,10 @@ class ModelsProcessor(QtCore.QObject):
         landmark_score=0.5,
         from_points=False,
         rotation_angles=None,
+        **kwargs,  # Ajout de kwargs pour passer des options comme use_mean_eyes
     ):
         rotation_angles = rotation_angles or [0]
+        # On passe **kwargs à la fonction suivante
         return self.face_detectors.run_detect(
             img,
             detect_mode,
@@ -1434,13 +1437,21 @@ class ModelsProcessor(QtCore.QObject):
             landmark_score,
             from_points,
             rotation_angles,
+            **kwargs,
         )
 
     def run_detect_landmark(
-        self, img, bbox, det_kpss, detect_mode="203", score=0.5, from_points=False
+        self,
+        img,
+        bbox,
+        det_kpss,
+        detect_mode="203",
+        score=0.5,
+        from_points=False,
+        **kwargs,
     ):
         return self.face_landmark_detectors.run_detect_landmark(
-            img, bbox, det_kpss, detect_mode, score, from_points
+            img, bbox, det_kpss, detect_mode, score, from_points, **kwargs
         )
 
     def get_arcface_model(self, face_swapper_model):
@@ -1749,10 +1760,14 @@ class ModelsProcessor(QtCore.QObject):
         denoiser_cfg_scale: float = 1.0,
         denoiser_ddim_eta: float = 0.0,
         base_seed: int = 220,
-        # blur_sigma_before_sharpen: float = 0.5,
-        # sharpen_strength: float = 0.5
+        latent_sharpening_strength: float = 0.0,
     ) -> torch.Tensor:
-        # This flag is already defined in the original file.
+        # --- CONFIGURATION ---
+        ENABLE_PIXEL_SHARPENING = latent_sharpening_strength > 0.0
+        PIXEL_SHARPEN_STRENGTH = latent_sharpening_strength
+
+        ENABLE_COLOR_MATCH = True
+
         DEBUG_DENOISER = False
         unet_model_name = self.main_window.fixed_unet_model_name
         vae_encoder_name = "RefLDMVAEEncoder"
@@ -1766,8 +1781,6 @@ class ModelsProcessor(QtCore.QObject):
                 image_cxhxw_uint8, "Initial input image_cxhxw_uint8", DEBUG_DENOISER
             )
 
-        # The model_lock now protects the entire function to ensure thread safety
-        # for the stateful DDIM sampling process and global RNG state.
         with self.model_lock:
             self.ensure_denoiser_models_loaded()
             if not (
@@ -1783,7 +1796,6 @@ class ModelsProcessor(QtCore.QObject):
             kv_tensor_map_for_this_run: Dict[str, Dict[str, torch.Tensor]] | None = None
             if reference_kv_map:
                 try:
-                    # Deep copy to ensure tensors are on the correct device and to avoid side effects
                     kv_tensor_map_for_this_run = {
                         layer: {
                             "k": tens_dict["k"].clone().to(self.device),
@@ -1796,7 +1808,7 @@ class ModelsProcessor(QtCore.QObject):
                     }
                 except Exception as e:
                     print(
-                        f"[ERROR] Denoiser: Error deep copying K/V map: {e}. Skipping denoiser pass."
+                        f"[ERROR] Denoiser: Error deep copying K/V map: {e}. Skipping."
                     )
                     return image_cxhxw_uint8
 
@@ -1854,7 +1866,6 @@ class ModelsProcessor(QtCore.QObject):
             lq_latent_x0_scaled_for_unet = (
                 encoded_latent_direct_vae_out_bchw * self.vae_scale_factor
             )
-
             final_denoised_latent_x0_scaled = None
 
             is_ref_flag_tensor_for_unet = torch.tensor(
@@ -1864,10 +1875,19 @@ class ModelsProcessor(QtCore.QObject):
                 [use_reference_exclusive_path], dtype=torch.bool, device=self.device
             ).contiguous()
 
+            rng = torch.Generator(device=self.device)
+            rng.manual_seed(base_seed)
+
+            # --- PROCESS: Single Step ---
             if denoiser_mode == "Single Step (Fast)":
-                # Use torch.cuda.manual_seed_all for GPU tensors.
-                torch.cuda.manual_seed_all(base_seed + denoiser_single_step_t)
-                noise_sample = torch.randn_like(lq_latent_x0_scaled_for_unet)
+                rng.manual_seed(base_seed + denoiser_single_step_t)
+                noise_sample = torch.randn(
+                    lq_latent_x0_scaled_for_unet.shape,
+                    device=self.device,
+                    dtype=lq_latent_x0_scaled_for_unet.dtype,
+                    generator=rng,
+                )
+
                 current_t_idx = min(
                     max(0, denoiser_single_step_t), len(self.alphas_cumprod_np) - 1
                 )
@@ -1883,6 +1903,7 @@ class ModelsProcessor(QtCore.QObject):
                         alpha_t_bar_val, device=self.device, dtype=torch.float32
                     )
                 )
+
                 xt_noisy_scaled_8_channel = (
                     lq_latent_x0_scaled_for_unet * sqrt_alpha_bar_t_torch
                     + noise_sample * sqrt_one_minus_alpha_bar_t_torch
@@ -1894,9 +1915,7 @@ class ModelsProcessor(QtCore.QObject):
                     [current_t_idx], dtype=torch.int64, device=self.device
                 )
                 predicted_noise_from_unet = torch.empty(
-                    (1, 8, latent_h, latent_w),
-                    dtype=torch.float32,
-                    device=self.device,
+                    (1, 8, latent_h, latent_w), dtype=torch.float32, device=self.device
                 ).contiguous()
 
                 self.face_restorers.run_ref_ldm_unet(
@@ -1912,24 +1931,21 @@ class ModelsProcessor(QtCore.QObject):
                     - sqrt_one_minus_alpha_bar_t_torch * predicted_noise_from_unet
                 ) / sqrt_alpha_bar_t_torch
 
+            # --- PROCESS: Full Restore (DDIM) ---
             elif denoiser_mode == "Full Restore (DDIM)":
                 with torch.cuda.stream(torch.cuda.current_stream()):
-                    torch.cuda.manual_seed_all(
-                        base_seed
-                    )  # Seed once before the loop for initial x_T and subsequent noise in DDIM step
-
                     num_ddpm_timesteps = self.alphas_cumprod_np.shape[0]
                     _ddim_raw_ddpm_timesteps_np = ModelsProcessor.make_ddim_timesteps(
-                        ddim_discr_method="uniform",
-                        num_ddim_timesteps=denoiser_ddim_steps,
-                        num_ddpm_timesteps=num_ddpm_timesteps,
+                        "uniform",
+                        denoiser_ddim_steps,
+                        num_ddpm_timesteps,
                         verbose=DEBUG_DENOISER,
                     )
                     _ddim_sigmas_np, _ddim_alphas_np, _ddim_alphas_prev_np = (
                         ModelsProcessor.make_ddim_sampling_parameters(
-                            alphacums=self.alphas_cumprod_np,
-                            ddim_timesteps=_ddim_raw_ddpm_timesteps_np,
-                            eta=denoiser_ddim_eta,
+                            self.alphas_cumprod_np,
+                            _ddim_raw_ddpm_timesteps_np,
+                            denoiser_ddim_eta,
                             verbose=DEBUG_DENOISER,
                         )
                     )
@@ -1945,10 +1961,13 @@ class ModelsProcessor(QtCore.QObject):
                     ddim_sqrt_one_minus_alphas = torch.sqrt(
                         torch.clamp(1.0 - ddim_alphas, min=0.0)
                     )
-                    current_latent_xt_scaled = torch.randn_like(
-                        lq_latent_x0_scaled_for_unet
-                    )
 
+                    current_latent_xt_scaled = torch.randn(
+                        lq_latent_x0_scaled_for_unet.shape,
+                        device=self.device,
+                        dtype=lq_latent_x0_scaled_for_unet.dtype,
+                        generator=rng,
+                    )
                     time_range_ddpm_indices = np.flip(_ddim_raw_ddpm_timesteps_np)
                     total_steps = len(time_range_ddpm_indices)
                     pred_x0_scaled_current_step = torch.empty_like(
@@ -1956,10 +1975,6 @@ class ModelsProcessor(QtCore.QObject):
                     )
 
                     for i, step_ddpm_idx in enumerate(time_range_ddpm_indices):
-                        # The RNG will now evolve naturally
-                        # from the initial seed, producing different noise at each step as required by DDIM.
-                        # torch.cuda.manual_seed_all(base_seed) # <-- REMOVED
-
                         index_for_schedules = total_steps - 1 - i
                         ts_unet = torch.full(
                             (1,), step_ddpm_idx, device=self.device, dtype=torch.int64
@@ -2004,9 +2019,7 @@ class ModelsProcessor(QtCore.QObject):
                             )
 
                         schedule_idx_tensor = torch.tensor(
-                            [index_for_schedules],
-                            device=self.device,
-                            dtype=torch.long,
+                            [index_for_schedules], device=self.device, dtype=torch.long
                         )
                         a_t = ModelsProcessor.extract_into_tensor_torch(
                             ddim_alphas,
@@ -2028,6 +2041,7 @@ class ModelsProcessor(QtCore.QObject):
                             schedule_idx_tensor,
                             current_latent_xt_scaled.shape,
                         )
+
                         pred_x0_scaled_current_step = (
                             current_latent_xt_scaled - sqrt_one_minus_a_t * e_t
                         ) / torch.sqrt(a_t).clamp(min=1e-8)
@@ -2035,16 +2049,19 @@ class ModelsProcessor(QtCore.QObject):
                             torch.sqrt(torch.clamp(1.0 - a_prev - sigma_t**2, min=1e-8))
                             * e_t
                         )
-                        noise_ddim = sigma_t * torch.randn_like(
-                            current_latent_xt_scaled
+                        noise_ddim = sigma_t * torch.randn(
+                            current_latent_xt_scaled.shape,
+                            device=self.device,
+                            dtype=current_latent_xt_scaled.dtype,
+                            generator=rng,
                         )
                         current_latent_xt_scaled = (
                             torch.sqrt(a_prev) * pred_x0_scaled_current_step
                             + dir_xt
                             + noise_ddim
                         )
-                    final_denoised_latent_x0_scaled = pred_x0_scaled_current_step
 
+                    final_denoised_latent_x0_scaled = pred_x0_scaled_current_step
             else:
                 print(
                     f"[ERROR] Denoiser: Unknown mode '{denoiser_mode}'. Skipping denoiser pass."
@@ -2066,13 +2083,56 @@ class ModelsProcessor(QtCore.QObject):
             )
 
             decoded_image_soft_clamped_bchw = torch.tanh(decoded_image_normalized_bchw)
-
             image_after_postproc_float_0_1 = (
                 decoded_image_soft_clamped_bchw.squeeze(0) + 1.0
             ) / 2.0
             image_after_postproc_float_0_1 = torch.clamp(
                 image_after_postproc_float_0_1, 0.0, 1.0
             )
+
+            # --- IMPROVEMENT A: Pixel Sharpening (Unsharp Mask) ---
+            if ENABLE_PIXEL_SHARPENING:
+                gaussian = v2.GaussianBlur(kernel_size=5, sigma=1.0)
+                blurred = gaussian(image_after_postproc_float_0_1.unsqueeze(0)).squeeze(
+                    0
+                )
+                detail = image_after_postproc_float_0_1 - blurred
+                image_after_postproc_float_0_1 = (
+                    image_after_postproc_float_0_1 + detail * PIXEL_SHARPEN_STRENGTH
+                )
+                image_after_postproc_float_0_1 = image_after_postproc_float_0_1.clamp(
+                    0.0, 1.0
+                )
+            # --- END IMPROVEMENT A ---
+
+            # --- IMPROVEMENT B: Color Matching (DFL Orig - LAB Reinhard) ---
+            if ENABLE_COLOR_MATCH:
+                # DFL_Orig expects inputs in [0..255] range.
+                # Ref is already uint8 [0..255] (but tensor)
+                ref_tensor = image_to_process_cxhxw_uint8
+                # Res (denoised) is float [0..1], scale to [0..255]
+                res_tensor = image_after_postproc_float_0_1 * 255.0
+
+                # Create a mask to exclude black padding from stats (Sum of channels > 0)
+                # This is critical for DFL_Orig to calculate correct Mean/Std
+                mask = (ref_tensor.sum(dim=0) > 0).float()
+
+                try:
+                    # Apply DFL_Orig Transfer
+                    # blend=100 means full transfer. DFL_Orig uses LAB space and is robust.
+                    matched_result = faceutil.histogram_matching_DFL_Orig(
+                        ref_tensor,
+                        res_tensor,
+                        mask,
+                        100,  # Blend strength 100%
+                    )
+
+                    # Convert back to [0..1] for consistency
+                    image_after_postproc_float_0_1 = matched_result / 255.0
+
+                except Exception as e:
+                    print(f"[WARN] Color matching failed: {e}")
+            # --- END IMPROVEMENT B ---
 
             final_image_uint8 = (image_after_postproc_float_0_1 * 255.0).byte()
 

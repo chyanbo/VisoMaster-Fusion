@@ -99,6 +99,10 @@ class FrameWorker(threading.Thread):
         self.parameters: Dict[
             str, ParametersTypes
         ] = {}  # Will be populated from main_window.parameters
+
+        self.last_processed_frame_number = -1
+        self.last_detected_faces = []
+
         # VR specific constants
         self.VR_PERSPECTIVE_RENDER_SIZE = 512  # Pixels, for rendering perspective crops
         self.VR_DYNAMIC_FOV_PADDING_FACTOR = (
@@ -311,14 +315,21 @@ class FrameWorker(threading.Thread):
     ) -> torch.Tensor:
         use_exclusive_path = control.get("UseReferenceExclusivePathToggle", False)
         denoiser_seed_from_slider_val = int(control.get("DenoiserBaseSeedSlider", 1))
+
         denoiser_mode_key = f"DenoiserModeSelection{pass_suffix}"
         denoiser_mode_val = control.get(denoiser_mode_key, "Single Step (Fast)")
+
         ddim_steps_key = f"DenoiserDDIMStepsSlider{pass_suffix}"
         ddim_steps_val = int(control.get(ddim_steps_key, 20))
+
         cfg_scale_key = f"DenoiserCFGScaleDecimalSlider{pass_suffix}"
         cfg_scale_val = float(control.get(cfg_scale_key, 1.0))
+
         single_step_t_key = f"DenoiserSingleStepTimestepSlider{pass_suffix}"
         single_step_t_val = int(control.get(single_step_t_key, 1))
+
+        sharpen_key = f"DenoiserLatentSharpeningDecimalSlider{pass_suffix}"
+        sharpen_val = float(control.get(sharpen_key, 0.0))
 
         if not kv_map:
             if use_exclusive_path:
@@ -337,6 +348,7 @@ class FrameWorker(threading.Thread):
             denoiser_single_step_t=single_step_t_val,
             denoiser_ddim_steps=ddim_steps_val,
             denoiser_cfg_scale=cfg_scale_val,
+            latent_sharpening_strength=sharpen_val,
         )
         return denoised_image
 
@@ -567,6 +579,9 @@ class FrameWorker(threading.Thread):
                     landmark_score=control_global["LandmarkDetectScoreSlider"] / 100.0,
                     from_points=True,
                     rotation_angles=[0],
+                    use_mean_eyes=control_global.get(
+                        "LandmarkMeanEyesToggle", False
+                    ),  # <--- NEW
                 )
                 kps_all_for_editor_on_crop = (
                     kps_all_for_editor_list[0]
@@ -609,6 +624,21 @@ class FrameWorker(threading.Thread):
         # Check 1: At the very beginning
         if stop_event.is_set():
             return self.frame[..., ::-1]  # Return original BGR frame
+
+        # --- NEW: Check for temporal discontinuity to reset filters ---
+        if not hasattr(self, "last_processed_frame_number"):
+            self.last_processed_frame_number = -1
+
+        # Si la frame n'est pas la suite logique de la précédente, on reset le lissage
+        # Important pour le mode Preview (seek) ou lors d'un changement de scène
+        if not self.is_single_frame:
+            if self.frame_number != self.last_processed_frame_number + 1:
+                self.frame_edits.reset_temporal_state()
+            self.last_processed_frame_number = self.frame_number
+        else:
+            # En mode image unique ou preview statique, on ne veut pas d'historique
+            self.frame_edits.reset_temporal_state()
+        # --------------------------------------------------------------
 
         self.set_scaling_transforms(control)
         img_numpy_rgb_uint8 = self.frame
@@ -686,6 +716,7 @@ class FrameWorker(threading.Thread):
             rotation_angles=[0]
             if not control["AutoRotationToggle"]
             else [0, 90, 180, 270],
+            use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),  # <--- NEW
         )
 
         if not isinstance(bboxes_eq_np, np.ndarray):
@@ -778,6 +809,9 @@ class FrameWorker(threading.Thread):
                     detect_mode=control["LandmarkDetectModelSelection"],
                     score=control["LandmarkDetectScoreSlider"] / 100.0,
                     from_points=False,
+                    use_mean_eyes=control.get(
+                        "LandmarkMeanEyesToggle", False
+                    ),  # <--- NEW
                 )
             )
 
@@ -946,6 +980,21 @@ class FrameWorker(threading.Thread):
         if edit_button_is_checked_global:
             use_landmark, landmark_mode, from_points = True, "203", True
 
+        # --- Tracking Logic ---
+        detection_interval = int(control.get("FaceDetectionIntervalSlider", 1))
+        previous_faces_arg = None
+
+        # Only use tracking if:
+        # 1. We have detected faces previously
+        # 2. We are within the interval (not a "keyframe" for detection)
+        # 3. We are not skipping frames (frame_number is consecutive)
+        if (
+            len(self.last_detected_faces) > 0
+            and self.frame_number % detection_interval != 0
+            and self.frame_number == self.last_processed_frame_number + 1
+        ):
+            previous_faces_arg = self.last_detected_faces
+
         bboxes, kpss_5, kpss = self.models_processor.run_detect(
             img,
             control["DetectorModelSelection"],
@@ -959,7 +1008,22 @@ class FrameWorker(threading.Thread):
             rotation_angles=[0]
             if not control["AutoRotationToggle"]
             else [0, 90, 180, 270],
+            use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
+            previous_detections=previous_faces_arg,  # <--- Pass state for tracking
         )
+
+        # Update State for next frame
+        self.last_detected_faces = []
+        if isinstance(bboxes, np.ndarray) and bboxes.shape[0] > 0:
+            # We store the results to reuse them as "previous_detections"
+            for i in range(len(bboxes)):
+                # We store minimal info needed for tracking
+                self.last_detected_faces.append(
+                    {
+                        "bbox": bboxes[i],
+                        "score": 1.0,  # Placeholder, or retrieve actual score if available
+                    }
+                )
 
         if (
             isinstance(kpss_5, np.ndarray)
@@ -1350,20 +1414,54 @@ class FrameWorker(threading.Thread):
         dim = 1
         latent = None
 
+        # Helper to apply Identity Boost (Face Likeness) with Difference Boosting & Normalization
+        def apply_likeness_with_norm_preservation(
+            source_latent, target_embedding, params
+        ):
+            # 1. Capture the original 'Energy' (Norm) of the source latent
+            original_norm = torch.norm(source_latent)
+
+            if params["FaceLikenessEnableToggle"]:
+                factor = params["FaceLikenessFactorDecimalSlider"]
+
+                # Calculate target latent structure
+                dst_latent = (
+                    torch.from_numpy(
+                        self.models_processor.calc_inswapper_latent(target_embedding)
+                    )
+                    .float()
+                    .to(self.models_processor.device)
+                )
+
+                # 2. Apply Difference Boosting
+                # Instead of just subtracting the target (which can create a void),
+                # or adding the target (which morphs into the target),
+                # we calculate the DIFFERENCE vector and ADD it to the source.
+                # Formula: Result = Source + Factor * (Source - Target)
+                # This exaggerates the traits that make the Source unique compared to the Target.
+
+                difference_vector = source_latent - dst_latent
+                source_latent = source_latent + (factor * difference_vector)
+
+                # 3. CONDITIONAL FIX: Re-Normalize based on Toggle
+                if params.get("FaceLikenessNormalizationEnableToggle", True):
+                    new_norm = torch.norm(source_latent)
+                    if new_norm > 1e-6:
+                        # Rescale to match original energy -> Prevents artifacts/saturation
+                        source_latent = source_latent * (original_norm / new_norm)
+
+            return source_latent
+
+        # --- Inswapper128 Logic ---
         if swapper_model == "Inswapper128":
             latent = (
                 torch.from_numpy(self.models_processor.calc_inswapper_latent(s_e))
                 .float()
                 .to(self.models_processor.device)
             )
-            if parameters["FaceLikenessEnableToggle"]:
-                factor = parameters["FaceLikenessFactorDecimalSlider"]
-                dst_latent = (
-                    torch.from_numpy(self.models_processor.calc_inswapper_latent(t_e))
-                    .float()
-                    .to(self.models_processor.device)
-                )
-                latent = latent - (factor * dst_latent)
+
+            # Apply the enhanced likeness logic
+            latent = apply_likeness_with_norm_preservation(latent, t_e, parameters)
 
             dim = 1
             if parameters["SwapperResAutoSelectEnableToggle"]:
@@ -1393,6 +1491,7 @@ class FrameWorker(threading.Thread):
                     dim = 4
                     input_face_affined = original_face_512
 
+        # --- InStyleSwapper Logic ---
         elif swapper_model in (
             "InStyleSwapper256 Version A",
             "InStyleSwapper256 Version B",
@@ -1406,7 +1505,10 @@ class FrameWorker(threading.Thread):
                 .float()
                 .to(self.models_processor.device)
             )
+
+            # Manual implementation for ISS as it uses a different calc function for dst
             if parameters["FaceLikenessEnableToggle"]:
+                original_norm = torch.norm(latent)
                 factor = parameters["FaceLikenessFactorDecimalSlider"]
                 dst_latent = (
                     torch.from_numpy(
@@ -1416,6 +1518,10 @@ class FrameWorker(threading.Thread):
                     .to(self.models_processor.device)
                 )
                 latent = latent - (factor * dst_latent)
+                # Re-Normalize Fix
+                new_norm = torch.norm(latent)
+                if new_norm > 1e-6:
+                    latent = latent * (original_norm / new_norm)
 
             if (
                 (
@@ -1437,6 +1543,7 @@ class FrameWorker(threading.Thread):
                 dim = 2
                 input_face_affined = original_face_256
 
+        # --- SimSwap Logic ---
         elif swapper_model == "SimSwap512":
             latent = (
                 torch.from_numpy(
@@ -1445,7 +1552,9 @@ class FrameWorker(threading.Thread):
                 .float()
                 .to(self.models_processor.device)
             )
+
             if parameters["FaceLikenessEnableToggle"]:
+                original_norm = torch.norm(latent)
                 factor = parameters["FaceLikenessFactorDecimalSlider"]
                 dst_latent = (
                     torch.from_numpy(
@@ -1455,10 +1564,15 @@ class FrameWorker(threading.Thread):
                     .to(self.models_processor.device)
                 )
                 latent = latent - (factor * dst_latent)
+                # Re-Normalize Fix
+                new_norm = torch.norm(latent)
+                if new_norm > 1e-6:
+                    latent = latent * (original_norm / new_norm)
 
             dim = 4
             input_face_affined = original_face_512
 
+        # --- GhostFace Logic ---
         elif (
             swapper_model == "GhostFace-v1"
             or swapper_model == "GhostFace-v2"
@@ -1469,7 +1583,9 @@ class FrameWorker(threading.Thread):
                 .float()
                 .to(self.models_processor.device)
             )
+
             if parameters["FaceLikenessEnableToggle"]:
+                original_norm = torch.norm(latent)
                 factor = parameters["FaceLikenessFactorDecimalSlider"]
                 dst_latent = (
                     torch.from_numpy(
@@ -1479,17 +1595,24 @@ class FrameWorker(threading.Thread):
                     .to(self.models_processor.device)
                 )
                 latent = latent - (factor * dst_latent)
+                # Re-Normalize Fix
+                new_norm = torch.norm(latent)
+                if new_norm > 1e-6:
+                    latent = latent * (original_norm / new_norm)
 
             dim = 2
             input_face_affined = original_face_256
 
+        # --- CSCS Logic ---
         elif swapper_model == "CSCS":
             latent = (
                 torch.from_numpy(self.models_processor.calc_swapper_latent_cscs(s_e))
                 .float()
                 .to(self.models_processor.device)
             )
+
             if parameters["FaceLikenessEnableToggle"]:
+                original_norm = torch.norm(latent)
                 factor = parameters["FaceLikenessFactorDecimalSlider"]
                 dst_latent = (
                     torch.from_numpy(
@@ -1499,10 +1622,15 @@ class FrameWorker(threading.Thread):
                     .to(self.models_processor.device)
                 )
                 latent = latent - (factor * dst_latent)
+                # Re-Normalize Fix
+                new_norm = torch.norm(latent)
+                if new_norm > 1e-6:
+                    latent = latent * (original_norm / new_norm)
 
             dim = 2
             input_face_affined = original_face_256
 
+        # --- DFM Logic ---
         if swapper_model == "DeepFaceLive (DFM)" and dfm_model_name:
             dfm_model_instance = self.models_processor.load_dfm_model(dfm_model_name)
             latent = []
@@ -1530,75 +1658,116 @@ class FrameWorker(threading.Thread):
                 input_face_affined, parameters["PreSwapSharpnessDecimalSlider"]
             )
             input_face_affined = input_face_affined.permute(1, 2, 0)
+
         prev_face = input_face_affined.clone()
+
+        # --- OPTIMIZED QUEUE-THEN-SYNC LOGIC ---
+        # This approach mimics the original structure exactly (to prevent distortion)
+        # but queues all GPU tasks before waiting, maximizing throughput.
+
         if swapper_model == "Inswapper128":
-            with (
-                torch.no_grad()
-            ):  # Disabilita il calcolo del gradiente se è solo per inferenza
-                for _ in range(itex):
-                    for j in range(dim):
-                        for i in range(dim):
-                            input_face_disc = input_face_affined[j::dim, i::dim]
-                            input_face_disc = input_face_disc.permute(2, 0, 1)
-                            input_face_disc = torch.unsqueeze(
-                                input_face_disc, 0
-                            ).contiguous()
+            for k in range(itex):
+                # Lists to hold independent memory buffers for this iteration
+                tile_inputs = []
+                tile_outputs = []
+                tile_coords = []
 
-                            swapper_output = torch.empty(
-                                (1, 3, 128, 128),
-                                dtype=torch.float32,
-                                device=self.models_processor.device,
-                            ).contiguous()
-                            self.models_processor.run_inswapper(
-                                input_face_disc, latent, swapper_output
-                            )
+                # 1. PREPARATION PHASE (CPU)
+                # Create isolated tensors for all tiles
+                for j in range(dim):
+                    for i in range(dim):
+                        # Extract tile using original logic
+                        tile = input_face_affined[j::dim, i::dim]
 
-                            swapper_output = torch.squeeze(swapper_output)
-                            swapper_output = swapper_output.permute(1, 2, 0)
+                        # Prepare Input: Permute to CHW, unsqueeze to (1, C, H, W)
+                        # Force contiguous to prevent memory corruption (Black Squares)
+                        t_in = tile.permute(2, 0, 1).contiguous().unsqueeze(0)
 
-                            output[j::dim, i::dim] = swapper_output.clone()
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = output.clone()
-                    output = torch.mul(output, 255)
-                    output = torch.clamp(output, 0, 255)
+                        # Prepare Output: Empty buffer of same shape
+                        t_out = torch.empty_like(t_in)
+
+                        tile_inputs.append(t_in)
+                        tile_outputs.append(t_out)
+                        tile_coords.append((j, i))
+
+                # 2. EXECUTION PHASE (GPU - Async)
+                # Fire all tasks to GPU immediately without waiting
+                with torch.no_grad():
+                    for idx in range(len(tile_inputs)):
+                        self.models_processor.run_inswapper(
+                            tile_inputs[idx], latent, tile_outputs[idx]
+                        )
+
+                # 3. SYNCHRONIZATION PHASE
+                # Wait ONCE for all tiles to be processed
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
+                # 4. RECONSTRUCTION PHASE (CPU)
+                for idx, (j, i) in enumerate(tile_coords):
+                    # Safety check for black squares (zeros)
+                    if tile_outputs[idx].sum() < 1.0:
+                        # Fallback to input tile
+                        res = tile_inputs[idx]
+                    else:
+                        res = tile_outputs[idx]
+
+                    # Permute back to HWC and squeeze batch dim
+                    res_hwc = res.squeeze(0).permute(1, 2, 0)
+                    output[j::dim, i::dim] = res_hwc
+
+                # 5. STATE UPDATE (For next iteration)
+                prev_face = input_face_affined.clone()
+                input_face_affined = output.clone()
+                output = torch.mul(output, 255)
+                output = torch.clamp(output, 0, 255)
 
         elif swapper_model in (
             "InStyleSwapper256 Version A",
             "InStyleSwapper256 Version B",
             "InStyleSwapper256 Version C",
         ):
-            version = swapper_model[-1]  # Version Name
-            with (
-                torch.no_grad()
-            ):  # Disabilita il calcolo del gradiente se è solo per inferenza
-                dim_res = dim // 2
-                for _ in range(itex):
-                    for j in range(dim_res):
-                        for i in range(dim_res):
-                            input_face_disc = input_face_affined[j::dim_res, i::dim_res]
-                            input_face_disc = input_face_disc.permute(2, 0, 1)
-                            input_face_disc = torch.unsqueeze(
-                                input_face_disc, 0
-                            ).contiguous()
+            version = swapper_model[-1]
+            dim_res = dim // 2
 
-                            swapper_output = torch.empty(
-                                (1, 3, 256, 256),
-                                dtype=torch.float32,
-                                device=self.models_processor.device,
-                            ).contiguous()
-                            self.models_processor.run_iss_swapper(
-                                input_face_disc, latent, swapper_output, version
-                            )
+            for k in range(itex):
+                tile_inputs = []
+                tile_outputs = []
+                tile_coords = []
 
-                            swapper_output = torch.squeeze(swapper_output)
-                            swapper_output = swapper_output.permute(1, 2, 0)
+                for j in range(dim_res):
+                    for i in range(dim_res):
+                        tile = input_face_affined[j::dim_res, i::dim_res]
 
-                            output[j::dim_res, i::dim_res] = swapper_output.clone()
+                        t_in = tile.permute(2, 0, 1).contiguous().unsqueeze(0)
+                        t_out = torch.empty_like(t_in)
 
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = output.clone()
-                    output = torch.mul(output, 255)
-                    output = torch.clamp(output, 0, 255)
+                        tile_inputs.append(t_in)
+                        tile_outputs.append(t_out)
+                        tile_coords.append((j, i))
+
+                with torch.no_grad():
+                    for idx in range(len(tile_inputs)):
+                        self.models_processor.run_iss_swapper(
+                            tile_inputs[idx], latent, tile_outputs[idx], version
+                        )
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
+                for idx, (j, i) in enumerate(tile_coords):
+                    if tile_outputs[idx].sum() < 1.0:
+                        res = tile_inputs[idx]
+                    else:
+                        res = tile_outputs[idx]
+
+                    res_hwc = res.squeeze(0).permute(1, 2, 0)
+                    output[j::dim_res, i::dim_res] = res_hwc
+
+                prev_face = input_face_affined.clone()
+                input_face_affined = output.clone()
+                output = torch.mul(output, 255)
+                output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "SimSwap512":
             for k in range(itex):
@@ -1609,11 +1778,23 @@ class FrameWorker(threading.Thread):
                     dtype=torch.float32,
                     device=self.models_processor.device,
                 ).contiguous()
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
                 self.models_processor.run_swapper_simswap512(
                     input_face_disc, latent, swapper_output
                 )
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
+                if swapper_output.sum() < 1.0:
+                    swapper_output = input_face_disc
+
                 swapper_output = torch.squeeze(swapper_output)
                 swapper_output = swapper_output.permute(1, 2, 0)
+
                 prev_face = input_face_affined.clone()
                 input_face_affined = swapper_output.clone()
 
@@ -1630,21 +1811,31 @@ class FrameWorker(threading.Thread):
                 input_face_disc = torch.mul(input_face_affined, 255.0).permute(2, 0, 1)
                 input_face_disc = torch.div(input_face_disc.float(), 127.5)
                 input_face_disc = torch.sub(input_face_disc, 1)
-                # input_face_disc = input_face_disc[[2, 1, 0], :, :] # Inverte i canali da BGR a RGB (assumendo che l'input sia BGR)
                 input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
                 swapper_output = torch.empty(
                     (1, 3, 256, 256),
                     dtype=torch.float32,
                     device=self.models_processor.device,
                 ).contiguous()
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
                 self.models_processor.run_swapper_ghostface(
                     input_face_disc, latent, swapper_output, swapper_model
                 )
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
                 swapper_output = swapper_output[0]
+                if swapper_output.sum() < 1.0:
+                    pass  # Fallback? GhostFace normalization makes 0 check harder
+
                 swapper_output = swapper_output.permute(1, 2, 0)
                 swapper_output = torch.mul(swapper_output, 127.5)
                 swapper_output = torch.add(swapper_output, 127.5)
-                # swapper_output = swapper_output[:, :, [2, 1, 0]] # Inverte i canali da RGB a BGR (assumendo che l'input sia RGB)
+
                 prev_face = input_face_affined.clone()
                 input_face_affined = swapper_output.clone()
                 input_face_affined = torch.div(input_face_affined, 255)
@@ -1664,12 +1855,21 @@ class FrameWorker(threading.Thread):
                     dtype=torch.float32,
                     device=self.models_processor.device,
                 ).contiguous()
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
                 self.models_processor.run_swapper_cscs(
                     input_face_disc, latent, swapper_output
                 )
+
+                if self.models_processor.device == "cuda":
+                    torch.cuda.synchronize()
+
                 swapper_output = torch.squeeze(swapper_output)
                 swapper_output = torch.add(torch.mul(swapper_output, 0.5), 0.5)
                 swapper_output = swapper_output.permute(1, 2, 0)
+
                 prev_face = input_face_affined.clone()
                 input_face_affined = swapper_output.clone()
 
@@ -1719,6 +1919,110 @@ class FrameWorker(threading.Thread):
             border_mask = gauss(border_mask)
         return border_mask, border_mask_calc
 
+    def get_dynamic_side_mask(
+        self, yaw_deg, pitch_deg, height, width, device, parameters, kps_5, tform
+    ):
+        """
+        Smart Profile Masking:
+        Instead of a blind gradient, this uses the projected eye positions to ensure
+        we NEVER mask the eyes (which causes double-vision/ghosting).
+        The fade only occurs on the 'stretch' area between the outer eye and the image edge.
+        """
+        # Base mask (White/Opaque)
+        mask = torch.ones((1, height, width), dtype=torch.float32, device=device)
+
+        # Check Toggle
+        if not parameters.get("ProfileAngleMaskEnableToggle", False):
+            return mask
+
+        # Get Thresholds from UI
+        start_angle = parameters.get("ProfileAngleMaskThresholdSlider", 20)
+        max_strength = parameters.get("ProfileAngleMaskStrengthSlider", 100) / 100.0
+
+        # Transform Keypoints to 512x512 space (Swap Coordinates)
+        # kps_5 order: [Left Eye, Right Eye, Nose, Left Mouth, Right Mouth]
+        # We need the transformation matrix to know where these points are on the swap.
+        if tform is not None:
+            # Transform points using the affine matrix
+            # Add column of ones for matrix multiplication
+            kps_proj = tform(kps_5)  # Returns (N, 2) array
+
+            # Extract Eye X-Coordinates (in 512px space)
+            # kps_proj[0] is Left Eye (Stage Right), kps_proj[1] is Right Eye (Stage Left)
+            le_x = kps_proj[0][0]  # Left Eye X
+            re_x = kps_proj[1][0]  # Right Eye X
+        else:
+            # Fallback if no tform (should not happen in swap_core)
+            le_x = width * 0.35
+            re_x = width * 0.65
+
+        # Normalize coordinates to 0..1 range
+        le_x_norm = np.clip(le_x / width, 0.0, 1.0)
+        re_x_norm = np.clip(re_x / width, 0.0, 1.0)
+
+        # Padding to protect the eye (keep mask opaque slightly beyond the eye)
+        eye_safety_margin = 0.05  # 5% of width
+
+        # --- 1. YAW MASKING (Left/Right) ---
+        abs_yaw = abs(yaw_deg)
+        if abs_yaw > start_angle:
+            # Calculate intensity (0.0 to 1.0) based on how far past threshold we are
+            # We assume 90 degrees is max profile
+            angle_excess = max(0, abs_yaw - start_angle)
+            # A ramp of 45 degrees duration
+            strength_yaw = min(angle_excess / 45.0, 1.0) * max_strength
+
+            # Coordinate grid
+            linspace_x = torch.linspace(0, 1, width, device=device).view(1, 1, width)
+
+            if yaw_deg > 0:
+                # Looking Right -> The LEFT side of the image (Left Eye / Stage Right) is the "far" side.
+                # We want to fade the Left side, but STOP before the Left Eye.
+
+                # Gradient End Point: Slightly to the left of the left eye
+                fade_end = max(0.0, le_x_norm - eye_safety_margin)
+
+                # If eye is too close to edge, disable fade to prevent hard cut
+                if fade_end > 0.05:
+                    # Gradient: 0.0 at edge -> 1.0 at fade_end
+                    grad_yaw = torch.clamp(linspace_x / fade_end, 0, 1)
+                    # Blend based on strength: Result = 1.0 (No mask) -> grad_yaw (Full mask)
+                    grad_yaw = 1.0 - (1.0 - grad_yaw) * strength_yaw
+                    mask = mask * grad_yaw
+
+            else:
+                # Looking Left -> The RIGHT side of the image (Right Eye / Stage Left) is the "far" side.
+                # We want to fade the Right side, but STOP after the Right Eye.
+
+                # Gradient Start Point: Slightly to the right of the right eye
+                fade_start = min(1.0, re_x_norm + eye_safety_margin)
+
+                # If eye is too close to edge
+                if fade_start < 0.95:
+                    # Gradient: 1.0 at fade_start -> 0.0 at edge (1.0)
+                    # Mapping: (x - start) / (1 - start) gives 0->1. We want 1->0.
+                    grad_yaw = torch.clamp(
+                        (linspace_x - fade_start) / (1.0 - fade_start), 0, 1
+                    )
+                    grad_yaw = 1.0 - grad_yaw  # Now 1 at start, 0 at edge
+
+                    # Since we want to mask the right side (keep left opaque),
+                    # the area BEFORE fade_start is 1.0.
+                    # The calculation above makes area before fade_start < 0 (clamped to 0) -> incorrect logic.
+
+                    # Correct logic for Right Fade:
+                    # 1.0 until fade_start. Then ramp down to 0.0.
+                    mask_r = torch.ones_like(linspace_x)
+                    mask_r[linspace_x > fade_start] = 1.0 - (
+                        (linspace_x[linspace_x > fade_start] - fade_start)
+                        / (1.0 - fade_start)
+                    )
+
+                    grad_yaw = 1.0 - (1.0 - mask_r) * strength_yaw
+                    mask = mask * grad_yaw
+
+        return mask
+
     def swap_core(
         self,
         img: torch.Tensor,
@@ -1744,11 +2048,13 @@ class FrameWorker(threading.Thread):
         debug_info: dict[str, str] = {}
 
         tform = self.get_face_similarity_tform(swapper_model, kps_5)
+
+        # --- RESIZERS DEFINITION ---
         t512_mask = v2.Resize(
-            (512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
+            (512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=True
         )
         t128_mask = v2.Resize(
-            (128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
+            (128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=True
         )
 
         # Grab 512 face from image and create 256 and 128 copys
@@ -1764,6 +2070,7 @@ class FrameWorker(threading.Thread):
         swap = original_face_512
         prev_face = None
 
+        # --- SWAPPING LOGIC ---
         if valid_s_e is not None or (
             swapper_model == "DeepFaceLive (DFM)" and dfm_model_name
         ):
@@ -1782,7 +2089,7 @@ class FrameWorker(threading.Thread):
             if debug and parameters["SwapperResAutoSelectEnableToggle"]:
                 debug_info["Resolution"] = 128 * dim
 
-            # Optional Scaling # change the transform matrix scaling from center
+            # Optional Scaling
             if parameters["FaceAdjEnableToggle"]:
                 input_face_affined = v2.functional.affine(
                     input_face_affined,
@@ -1839,20 +2146,59 @@ class FrameWorker(threading.Thread):
                 prev_face = torch.mul(prev_face, 255)
                 prev_face = torch.clamp(prev_face, 0, 255)
                 prev_face = prev_face.permute(2, 0, 1)
-                # if dim != 4: prev_face = t512(prev_face)
-                prev_face = cast(v2.Resize, self.t512)(prev_face)
+
+                # Resize prev_face to match current swap resolution
+                if prev_face.shape[-1] != swap.shape[-1]:
+                    prev_face = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(prev_face)
+
                 swap = torch.mul(swap, alpha)
                 prev_face = torch.mul(prev_face, 1 - alpha)
                 swap = torch.add(swap, prev_face)
 
-        # Create masks
+        # --- DYNAMIC MASKS INITIALIZATION ---
         border_mask, border_mask_calc = self.get_border_mask(parameters)
+
+        current_swap_h, current_swap_w = swap.shape[1], swap.shape[2]
+
+        # Calculate Pose (Yaw and Pitch)
+        yaw_deg, pitch_deg = faceutil.calc_face_yaw_pitch(kps_5)
+
+        # Get Dynamic Side Mask based on Yaw AND Pitch (Smart Feature Aware)
+        side_mask = self.get_dynamic_side_mask(
+            yaw_deg,
+            pitch_deg,
+            current_swap_h,
+            current_swap_w,
+            self.models_processor.device,
+            parameters,
+            kps_5,  # <-- Added
+            tform,  # <-- Added
+        )
+
+        # Resize border_mask to match current swap dimensions BEFORE multiplication
+        if (
+            border_mask.shape[1] != current_swap_h
+            or border_mask.shape[2] != current_swap_w
+        ):
+            resizer = v2.Resize((current_swap_h, current_swap_w), antialias=True)
+            border_mask = resizer(border_mask)
+            border_mask_calc = resizer(border_mask_calc)
+
+        # Apply combined side mask to border mask
+        border_mask = border_mask * side_mask
+        border_mask_calc = border_mask_calc * side_mask
+
         swap_mask = torch.ones(
-            (128, 128), dtype=torch.float32, device=self.models_processor.device
+            (current_swap_h, current_swap_w),
+            dtype=torch.float32,
+            device=self.models_processor.device,
         )
         swap_mask = torch.unsqueeze(swap_mask, 0)
-        # calc_mask = torch.ones((256, 256), dtype=torch.float32, device=self.models_processor.device)
-        # calc_mask = torch.unsqueeze(calc_mask,0)
+
+        # Initialize masks
+        swap_mask_noFP = border_mask.clone()
 
         BgExclude = torch.ones(
             (512, 512), dtype=torch.float32, device=self.models_processor.device
@@ -1862,15 +2208,23 @@ class FrameWorker(threading.Thread):
         texture_mask_view = BgExclude.clone()
         restore_mask = BgExclude.clone()
         texture_exclude_512 = BgExclude.clone()
-        swap_mask_noFP = (
-            swap_mask.clone()
-        )  # unveränderte 128er Basismaske für Editor-End
+
+        # Initialize calc_mask
+        calc_mask = BgExclude.clone()
+        calc_mask_dill = BgExclude.clone()
+        mask_forcalc_512 = BgExclude.clone()
 
         M_ref = tform.params[0:2]
         ones_column_ref = np.ones((kps_5.shape[0], 1), dtype=np.float32)
         kps_ref = np.hstack([kps_5, ones_column_ref]) @ M_ref.T
 
         swap = torch.clamp(swap, 0.0, 255.0)
+
+        # --- NEW: Track changes on the Original Face as well ---
+        # If we use Face Editor/Expression Restorer at the beginning,
+        # we must apply the same geometry changes to the Original Face
+        # so that the Mouth Fit overlay creates a matching source.
+        original_face_processed = original_face_512.clone()
 
         # Expression Restorer beginning
         if (
@@ -1881,8 +2235,13 @@ class FrameWorker(threading.Thread):
             )
             and parameters["FaceExpressionBeforeTypeSelection"] == "Beginning"
         ):
+            # Apply to Swap
             swap = self.frame_edits.apply_face_expression_restorer(
                 original_face_512, swap, cast(dict, parameters)
+            )
+            # Apply to Original (Sync geometry)
+            original_face_processed = self.frame_edits.apply_face_expression_restorer(
+                original_face_512, original_face_processed, cast(dict, parameters)
             )
 
         # Face editor beginning
@@ -1891,13 +2250,52 @@ class FrameWorker(threading.Thread):
             and self.main_window.editFacesButton.isChecked()
             and parameters["FaceEditorBeforeTypeSelection"] == "Beginning"
         ):
-            editor_mask = t512_mask(swap_mask).clone()
+            editor_mask = swap_mask.clone()
+
+            # Apply to Swap
             swap = swap * editor_mask + original_face_512 * (1 - editor_mask)
             swap = self.frame_edits.swap_edit_face_core(swap, swap, parameters, control)
+
+            # Apply to Original (Sync geometry for sliders like Jaw/Mouth Open)
+            original_face_processed = (
+                original_face_processed * editor_mask
+                + original_face_512 * (1 - editor_mask)
+            )
+            original_face_processed = self.frame_edits.swap_edit_face_core(
+                original_face_processed, original_face_processed, parameters, control
+            )
 
         # First Denoiser pass - Before Restorers
         if control.get("DenoiserUNetEnableBeforeRestorersToggle", False):
             swap = self._apply_denoiser_pass(swap, control, "Before", kv_map)
+
+        # --- MOUTH FIT & ALIGN (PRE-RESTORER INJECTION) ---
+        mouth_overlay_pkg_pre = None
+        if hasattr(self.models_processor, "face_masks"):
+            # IMPORTANT: Use 'original_face_processed' (warped) instead of 'original_face_512' (raw)
+            # This ensures the patch source has the same mouth opening/shape as the target.
+            mouth_overlay_pkg_pre = self.models_processor.face_masks.get_mouth_overlay(
+                swap, original_face_processed, parameters
+            )
+
+        if mouth_overlay_pkg_pre is not None:
+            overlay_rgb, overlay_mask = mouth_overlay_pkg_pre
+
+            if overlay_rgb is not None and overlay_mask is not None:
+                # Resize checks
+                if overlay_rgb.shape[-1] != swap.shape[-1]:
+                    overlay_rgb = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(overlay_rgb)
+                    overlay_mask = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(overlay_mask.unsqueeze(0)).squeeze(0)
+
+                # Apply the mouth patch to the RAW swap
+                swap = swap * (1.0 - overlay_mask) + overlay_rgb * overlay_mask
+
+                if debug:
+                    print("[INFO] Mouth Fit: Injected before Restorer.")
 
         # First Restorer
         swap_original = swap.clone()
@@ -1921,27 +2319,30 @@ class FrameWorker(threading.Thread):
             mask = self.models_processor.apply_occlusion(
                 original_face_256, parameters["OccluderSizeSlider"]
             )
-            mask = t128_mask(mask)
+            if mask.shape[-1] != swap_mask.shape[-1]:
+                mask = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(mask)
+
             swap_mask = torch.mul(swap_mask, mask)
+
             gauss = transforms.GaussianBlur(
                 parameters["OccluderXSegBlurSlider"] * 2 + 1,
                 (parameters["OccluderXSegBlurSlider"] + 1) * 0.2,
             )
             swap_mask = gauss(swap_mask)
+
+            if swap_mask_noFP.shape[-1] != swap_mask.shape[-1]:
+                swap_mask_noFP = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(swap_mask_noFP)
             swap_mask_noFP *= swap_mask
 
         # -------------------------------
         # MASKEN: Parser / CLIPs / Restore
         # -------------------------------
-        t512_mask = v2.Resize(
-            (512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
-        )
-        t256_near = v2.Resize(
-            (256, 256), interpolation=v2.InterpolationMode.NEAREST, antialias=False
-        )
-        t128_bi = v2.Resize(
-            (128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
-        )
+        # Separated logic for Mouth Stretch
+        need_mouth_stretch = parameters.get("MouthParserStretchToggle", False)
 
         need_any_parser = (
             parameters.get("FaceParserEnableToggle", False)
@@ -1958,43 +2359,75 @@ class FrameWorker(threading.Thread):
             and (parameters.get("ExcludeMaskEnableToggle", False))
         )
 
-        FaceParser_mask_128 = None  # [1,128,128] float
-        # texture_exclude_512 = None  # [1,512,512] float (AUSSCHLUSS)
-        mouth_512 = None  # [512,512] float
+        # The parser pipeline runs if standard parser needs it OR mouth stretch needs it
+        need_any_parser = need_any_parser or need_mouth_stretch
+
+        FaceParser_mask = None
+        mouth_512 = None
 
         if need_any_parser:
             out = self.models_processor.process_masks_and_masks(
-                swap_restorecalc,  # aktueller Swap-Stand (uint8, 3x512x512)
-                original_face_512,  # original (uint8, 3x512x512)
+                swap_restorecalc,
+                original_face_512,
                 parameters,
                 control,
             )
             if not parameters.get("FaceParserEndToggle", False):
-                FaceParser_mask_128 = out.get(
-                    "FaceParser_mask", None
-                )  # [1,128,128], 1=behalten
-            texture_exclude_512 = out.get(
-                "texture_mask", texture_exclude_512
-            )  # [1,512,512], 1=ausschließen
-            out.get("bg_mask", t512_mask(swap_mask))  # [1,512,512], 1=ausschließen
-            mouth_512 = out.get("mouth", None)  # [512,512]
+                FaceParser_mask = out.get("FaceParser_mask", None)
 
-        # FaceParser-Maske (128) auf swap_mask anwenden (wenn vorhanden)
-        if FaceParser_mask_128 is not None:
-            swap_mask = swap_mask * FaceParser_mask_128
+            texture_exclude_512 = out.get("texture_mask", texture_exclude_512)
+            mouth_512 = out.get("mouth", None)
 
-        # ----- CLIPs (falls aktiv): liefert i. d. R. 512er-Maske -> auf 128 bringen und an 128er swap_mask anhängen
+            # --- MOUTH FIT MASK PATCHING ---
+            # Image is already injected. We only need to fix the mask hole.
+            mouth_overlay_info = out.get("mouth_overlay_info", None)
+
+            if mouth_overlay_info is not None and FaceParser_mask is not None:
+                _, overlay_mask = mouth_overlay_info
+
+                if FaceParser_mask.shape[-1] != swap.shape[-1]:
+                    FaceParser_mask = v2.Resize(
+                        (swap.shape[-2], swap.shape[-1]), antialias=True
+                    )(FaceParser_mask)
+                if overlay_mask.shape[-1] != FaceParser_mask.shape[-1]:
+                    overlay_mask = v2.Resize(
+                        (FaceParser_mask.shape[-2], FaceParser_mask.shape[-1]),
+                        antialias=True,
+                    )(overlay_mask.unsqueeze(0)).squeeze(0)
+
+                # Close the hole in the mask so we see our restored overlay, not the background
+                FaceParser_mask = torch.maximum(FaceParser_mask, overlay_mask)
+
+        # Merge FaceParser Mask
+        if FaceParser_mask is not None:
+            if FaceParser_mask.shape[-1] != swap_mask.shape[-1]:
+                FaceParser_mask = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(FaceParser_mask)
+
+            swap_mask = swap_mask * FaceParser_mask
+
+        # ----- CLIPs
         if parameters.get("ClipEnableToggle", False):
-            mask_clip_512 = self.models_processor.run_CLIPs(
+            mask_clip = self.models_processor.run_CLIPs(
                 original_face_512,
                 parameters["ClipText"],
                 parameters["ClipAmountSlider"],
             )
-            mask_clip_128 = t128_bi(mask_clip_512)
-            swap_mask *= mask_clip_128
-            swap_mask_noFP *= mask_clip_128
+            if mask_clip.shape[-1] != swap_mask.shape[-1]:
+                mask_clip = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(mask_clip)
 
-        # ----- Restore Eyes/Mouth (Steuerung im 512er Raum, danach auf 128 mappen)
+            swap_mask *= mask_clip
+
+            if swap_mask_noFP.shape[-1] != mask_clip.shape[-1]:
+                swap_mask_noFP = v2.Resize(
+                    (mask_clip.shape[-2], mask_clip.shape[-1]), antialias=True
+                )(swap_mask_noFP)
+            swap_mask_noFP *= mask_clip
+
+        # ----- Restore Eyes/Mouth
         if parameters.get("RestoreMouthEnableToggle", False) or parameters.get(
             "RestoreEyesEnableToggle", False
         ):
@@ -2043,21 +2476,25 @@ class FrameWorker(threading.Thread):
                 gauss = transforms.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
                 img_swap_mask = gauss(img_swap_mask)
 
-            mask_128 = t128_bi(img_swap_mask)
-            # swap_mask_noFP = swap_mask_noFP * mask_128
-            swap_mask = swap_mask * mask_128
+            if img_swap_mask.shape[-1] != swap_mask.shape[-1]:
+                mask_resized = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(img_swap_mask)
+            else:
+                mask_resized = img_swap_mask
+
+            swap_mask = swap_mask * mask_resized
 
         # -------------------------------
         # DFL XSeg
         # -------------------------------
-        calc_mask = torch.ones(
-            (1, 512, 512), dtype=torch.float32, device=self.models_processor.device
+        t256_near = v2.Resize(
+            (256, 256), interpolation=v2.InterpolationMode.NEAREST, antialias=False
         )
+
         if parameters.get("DFLXSegEnableToggle", False):
-            # Basisbild für XSeg
             img_xseg_256 = t256_near(original_face_512)
 
-            # Mouth ggf. auf 256 mappen
             mouth_256 = None
             if (
                 parameters.get("DFLXSegEnableToggle", False)
@@ -2066,9 +2503,8 @@ class FrameWorker(threading.Thread):
                 != parameters.get("DFLXSeg2SizeSlider", 0)
                 and mouth_512 is not None
             ):
-                mouth_256 = t256_near(mouth_512.unsqueeze(0))  # [1,256,256]
+                mouth_256 = t256_near(mouth_512.unsqueeze(0))
 
-            # apply_dfl_xseg liefert: img_mask(256), mask_forcalc(256),
             img_mask_256, mask_forcalc_256, mask_forcalc_dill_256, outpred_noFP_256 = (
                 self.models_processor.apply_dfl_xseg(
                     img_xseg_256,
@@ -2078,31 +2514,47 @@ class FrameWorker(threading.Thread):
                 )
             )
 
-            # auf 512 bringen
-            img_mask_512 = t512_mask(img_mask_256)
+            # Resize XSeg results to current swap resolution
+            if img_mask_256.shape[-1] != swap_mask.shape[-1]:
+                img_mask_res = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(img_mask_256)
+                outpred_noFP_res = v2.Resize(
+                    (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                )(outpred_noFP_256)
+            else:
+                img_mask_res = img_mask_256
+                outpred_noFP_res = outpred_noFP_256
+
+            # Updates calc_mask (keep it 512 for quality if possible, or 256)
+            # Safe route: keep internal calc masks at 512 for Texture/AutoColor
             mask_forcalc_512 = t512_mask(mask_forcalc_256)
             mask_forcalc_dill_512 = t512_mask(mask_forcalc_dill_256)
 
-            outpred_noFP_128 = t128_bi(outpred_noFP_256)
             mask_forcalc_512 = 1 - mask_forcalc_512
             mask_forcalc_dill_512 = 1 - mask_forcalc_dill_512
-            # Deine Logik: invertiert als Erlaubnis-/Calc-Masken
-            calc_mask = mask_forcalc_512  # torch.min(bg_exclude_512, mask_forcalc_512)        # [1,512,512]
-            calc_mask_dill = mask_forcalc_dill_512  # torch.max((1-bg_exclude_dill_512),(1-mask_forcalc_512))
+            calc_mask = mask_forcalc_512
+            calc_mask_dill = mask_forcalc_dill_512
 
-            # swap_mask reduzieren (128er)
-            img_mask_128 = t128_bi(img_mask_512)
-            swap_mask_noFP = swap_mask_noFP * (1.0 - outpred_noFP_128)
-            swap_mask = swap_mask * (1.0 - img_mask_128)
+            if swap_mask_noFP.shape[-1] != outpred_noFP_res.shape[-1]:
+                swap_mask_noFP = v2.Resize(
+                    (outpred_noFP_res.shape[-2], outpred_noFP_res.shape[-1]),
+                    antialias=True,
+                )(swap_mask_noFP)
+
+            swap_mask_noFP = swap_mask_noFP * (1.0 - outpred_noFP_res)
+            swap_mask = swap_mask * (1.0 - img_mask_res)
         else:
-            # kein XSeg -> calc_mask aus FaceParser/Basis
+            # If no XSeg, calc_mask derives from swap_mask
             calc_mask = t512_mask(swap_mask.clone()).clamp(0, 1)
             calc_mask_dill = calc_mask.clone()
             mask_forcalc_512 = calc_mask.clone()
-        # calc_mask = calc_mask + texture_exclude_512
-        # calc_mask = torch.where(calc_mask > 0.1, 1, 0).float()
 
-        # First Restorer and Auto Restore pass (after masks)
+        # Update AutoColor Mask variable now that calc_mask is finalized
+        mask_autocolor = calc_mask.clone()
+        mask_autocolor = mask_autocolor > 0.05
+
+        # First Restorer and Auto Restore
         if (
             parameters["FaceRestorerEnableToggle"]
             and parameters["FaceRestorerAutoEnableToggle"]
@@ -2114,7 +2566,7 @@ class FrameWorker(threading.Thread):
             scale_factor = round(tform.scale, 2)
             automasktoggle = parameters["FaceRestorerAutoMaskEnableToggle"]
             automaskadjust = parameters["FaceRestorerAutoSharpMaskAdjustDecimalSlider"]
-            automaskblur = 2  # parameters["FaceRestorerAutoSharpMaskBlurSlider"]
+            automaskblur = 2
             restore_mask = mask_forcalc_512.clone()
 
             alpha_auto, blur_value = self.face_restorer_auto(
@@ -2129,7 +2581,7 @@ class FrameWorker(threading.Thread):
                 automasktoggle,
                 automaskadjust,
                 automaskblur,
-            )  # , parameters["FaceRestorerMaskSlider"], parameters["AutoRestorerTenengradTreshSlider"]/100, parameters["AutoRestorerCombWeightSlider"]/100)
+            )
 
             if blur_value > 0:
                 kernel_size = 2 * blur_value + 1
@@ -2177,12 +2629,18 @@ class FrameWorker(threading.Thread):
             and self.main_window.editFacesButton.isChecked()
             and parameters["FaceEditorBeforeTypeSelection"] == "After First Restorer"
         ):
-            editor_mask = t512_mask(swap_mask).clone()
+            editor_mask = swap_mask.clone()
             swap = swap * editor_mask + original_face_512 * (1 - editor_mask)
             swap = self.frame_edits.swap_edit_face_core(
                 swap, swap_restorecalc, parameters, control
             )
-            swap_mask = swap_mask_noFP
+
+            if swap_mask_noFP.shape[-1] != swap.shape[-1]:
+                swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
+                    swap_mask_noFP
+                )
+            else:
+                swap_mask = swap_mask_noFP
 
         # Second Denoiser pass - After First Restorer
         if control.get("DenoiserAfterFirstRestorerToggle", False):
@@ -2217,7 +2675,7 @@ class FrameWorker(threading.Thread):
                 automaskadjust2 = parameters[
                     "FaceRestorerAutoSharpMask2AdjustDecimalSlider"
                 ]
-                automaskblur2 = 2  # parameters["FaceRestorerAutoSharpMask2BlurSlider"]
+                automaskblur2 = 2
                 restore_mask = mask_forcalc_512.clone()
 
                 alpha_auto2, blur_value2 = self.face_restorer_auto(
@@ -2232,7 +2690,7 @@ class FrameWorker(threading.Thread):
                     automasktoggle2,
                     automaskadjust2,
                     automaskblur2,
-                )  # , parameters["FaceRestorerMaskSlider"], parameters["AutoRestorerTenengradTreshSlider"]/100, parameters["AutoRestorerCombWeightSlider"]/100)
+                )
 
                 if blur_value2 > 0:
                     kernel_size = 2 * blur_value2 + 1
@@ -2282,19 +2740,18 @@ class FrameWorker(threading.Thread):
             editor_mask = t512_mask(swap_mask).clone()
             swap = swap * editor_mask + original_face_512 * (1 - editor_mask)
             swap = self.frame_edits.swap_edit_face_core(swap, swap, parameters, control)
-            swap_mask = swap_mask_noFP
 
-        # Textures and Color pass begins
+            if swap_mask_noFP.shape[-1] != swap.shape[-1]:
+                swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
+                    swap_mask_noFP
+                )
+            else:
+                swap_mask = swap_mask_noFP
 
         # -------------------------------
         # AutoColor (Maske 512)
         # -------------------------------
         if parameters.get("AutoColorEnableToggle", False):
-            # calc_mask ist [1,512,512], 1=erlaubt
-            mask_autocolor = calc_mask.clone()
-            mask_autocolor = mask_autocolor > 0.05
-            # swap_backup = swap.clone()
-
             if parameters["AutoColorTransferTypeSelection"] == "Test":
                 swap = faceutil.histogram_matching(
                     original_face_512, swap, parameters["AutoColorBlendAmountSlider"]
@@ -2307,8 +2764,6 @@ class FrameWorker(threading.Thread):
                     mask_autocolor,
                     parameters["AutoColorBlendAmountSlider"],
                 )
-                # if parameters.get("ExcludeMaskEnableToggle", False):
-                #    swap_backup = faceutil.histogram_matching_withmask(original_face_512, swap_backup, mask_autocolor, parameters["AutoColorBlendAmountSlider"])
 
             elif parameters["AutoColorTransferTypeSelection"] == "DFL_Test":
                 swap = faceutil.histogram_matching_DFL_test(
@@ -2324,77 +2779,42 @@ class FrameWorker(threading.Thread):
         # TransferTexture
         # -------------------------------
         if parameters.get("TransferTextureEnableToggle", False):
-            # Basis-Maske(n)
-            # calc_mask: [1,512,512], 1=erlaubt
-            # texture_exclude_512: [1,512,512], 1=ausschließen  (aus Parser)
-            # Wir bauen mask_final (512): 1 = erlauben, 0 = sperren
+            # Upscale swap to 512 if not already
+            if swap.shape[-1] != 512:
+                swap = t512_mask(swap)
+                swap_mask = t512_mask(swap_mask)
+                swap_mask_noFP = t512_mask(swap_mask_noFP)
+
+            # Input mask for VGG (128)
+            mask_input_vgg = t128_mask(calc_mask.clone())
+
             mask_vgg_512 = torch.ones(
                 (1, 512, 512), dtype=torch.uint8, device=self.models_processor.device
             )
-            # Optional VGG-Exclude (du hast beides kombiniert: VGG + Exclude)
             TextureFeatureLayerTypeSelection = "combo_relu3_3_relu3_1"
             upper_thresh = parameters["TextureUpperLimitSlider"] / 100
 
             if parameters.get("ExcludeOriginalVGGMaskEnableToggle", False):
-                mask_input = t128_mask(calc_mask.clone())
-                # NEU: zwei Slider
-                thr = parameters["VGGMaskThresholdSlider"]  # 0..100
-                soft = 100  # parameters['VGGMaskSoftnessSlider']     # 0..100
-                # gamma = parameters['VGGMaskGammaSlider']     # 0..100
-                # if parameters['ExcludeVGGMaskSmoothEnableToggle']:
-                #    mode='smooth'
-                # else:
-                #    mode='linear'
+                thr = parameters["VGGMaskThresholdSlider"]
+                soft = 100
                 mode = "smooth"
-                mask_vgg_512, diff_norm_texture = (
-                    self.models_processor.apply_vgg_mask_simple(
-                        swap,
-                        original_face_512,
-                        mask_input,
-                        center_pct=thr,
-                        softness_pct=soft,
-                        feature_layer=TextureFeatureLayerTypeSelection,
-                        mode=mode,  # oder 'linear'
-                    )
-                )
-                # mask_vgg_512 = (1-mask_vgg_512)
-                # diff_norm_texture = (1-diff_norm_texture)
-                # mask_vgg_512: [1,512,512] in [0..1]
-                # Wenn ExcludeVGGMaskEnableToggle==False -> mask_vgg_512 = diff_norm_texture
-                if not parameters.get("ExcludeVGGMaskEnableToggle", False):
-                    # diff_norm_texture = torch.nn.functional.interpolate(
-                    #    diff_norm_texture.unsqueeze(0),
-                    #    size=(512, 512),
-                    #    mode='bilinear',
-                    #    align_corners=True
-                    # ).squeeze(0)
-                    mask_vgg_512 = t512_mask(diff_norm_texture)
-                    mask_vgg_512 = t512_mask(mask_vgg_512).clamp(0.0, 1.0)
 
-                # mask_vgg_512 = mask_vgg_512 + (1-calc_mask)
+                mask_vgg_512, _ = self.models_processor.apply_vgg_mask_simple(
+                    swap,
+                    original_face_512,
+                    mask_input_vgg,
+                    center_pct=thr,
+                    softness_pct=soft,
+                    feature_layer=TextureFeatureLayerTypeSelection,
+                    mode=mode,
+                )
 
                 if parameters.get("TextureBlendAmountSlider", 0) > 0:
                     b = parameters["TextureBlendAmountSlider"]
                     gauss = transforms.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
                     mask_vgg_512 = gauss(mask_vgg_512.float())
 
-            # m = 1-calc_mask.clone()
             if parameters.get("ExcludeMaskEnableToggle", False):
-                # Optionaler Blend der FaceParser-Texture-Maske
-                # mask_vgg_512 = mask_vgg_512
-
-                # m = m.clamp(0.0, 1.0)
-                # mask_final_512 = (1.0 - calc_mask).clamp(0,1)# + (mask_calc)
-                # m=mask_forcalc_512
-                # if parameters.get('FaceParserBlurTextureSlider', 0) > 0:
-                #    b = parameters['FaceParserBlurTextureSlider']
-                #    gauss = transforms.GaussianBlur(b*2+1, (b+1)*0.2)
-                #    mask_vgg_512 = torch.max(gauss(mask_vgg_512.float()), mask_vgg_512)  # blur + preserve edges
-                # Ausschluss invertieren -> Erlauben
-                # mask_final_512 = mask_final_512.clamp(0,1)
-                # if parameters.get("FaceParserBlendTextureSlider", 0) != 0:
-                #    mask_final_512 = (mask_final_512 + parameters["FaceParserBlendTextureSlider"]/100.0).clamp(0,1)
-                # mask_128_for_vgg = v2.Resize((128,128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False)(mask_final_512)
                 if parameters.get("ExcludeOriginalVGGMaskEnableToggle", False):
                     mask_vgg_512 = torch.where(
                         mask_vgg_512 >= upper_thresh, upper_thresh, mask_vgg_512
@@ -2404,39 +2824,35 @@ class FrameWorker(threading.Thread):
                         mask_vgg_512 * (1 - texture_exclude_512), 1 - calc_mask_dill
                     )
                 ).clamp(0.0, 1.0)
-                mask_final_512 = mask_final_512.clamp(0.0, 1.0)
             elif parameters.get("ExcludeOriginalVGGMaskEnableToggle", False):
                 mask_vgg_512 = torch.where(
                     mask_vgg_512 >= upper_thresh, upper_thresh, mask_vgg_512
                 )
-                mask_final_512 = torch.max(
-                    mask_vgg_512, 1 - calc_mask_dill
-                )  # (1-m.clone()) #mask_calc #torch.ones((512, 512), dtype=torch.uint8, device=self.models_processor.device)
-                mask_final_512 = mask_final_512.clamp(0.0, 1.0)
+                mask_final_512 = torch.max(mask_vgg_512, 1 - calc_mask_dill).clamp(
+                    0.0, 1.0
+                )
             else:
-                mask_final_512 = 1 - mask_forcalc_512
-                mask_final_512 = mask_final_512.clamp(0, 1)
+                mask_final_512 = (1 - mask_forcalc_512).clamp(0, 1)
 
-                # mask_vgg_512 = torch.where(mask_vgg_512 >= upper_thresh, upper_thresh, mask_vgg_512)
-                # mask_final_512 = mask_vgg_512 + (1-m) #mask_vgg_512  * (1-calc_mask.clone())#(1 - mask_vgg_512.clone())# + mask_calc
-                # mask_final_512 = mask_final_512.clamp(0.0, 1.0)
-                # mask_128_for_vgg = v2.Resize((128,128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False)(mask_final_512)
-                # mask_final_512 = 1-calc_mask.clone()
-            # mask_final_512 = mask_final_512  + calc_mask
-            # mask_final_512 = mask_final_512.clamp(0.0, 1.0)
+            if parameters["FaceParserBlurTextureSlider"] > 0:
+                orig_m = mask_final_512.clone()
+                gauss = transforms.GaussianBlur(
+                    parameters["FaceParserBlurTextureSlider"] * 2 + 1,
+                    (parameters["FaceParserBlurTextureSlider"] + 1) * 0.2,
+                )
+                mask_final_512 = gauss(mask_final_512.type(torch.float32))
+                mask_final_512 = torch.max(mask_final_512, orig_m).clamp(0.0, 1.0)
 
-            # ggf. auf 128er für VGG-Diff (falls dein apply_perceptual_diff_onnx das erwartet)
-            # mask_128_for_vgg = v2.Resize((128,128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False)(mask_final_512)
+            # --- Respect Previous AutoColor Choice ---
+            if parameters.get("AutoColorEnableToggle", False):
+                # AutoColor already applied, keep it as base
+                swap_texture_backup = swap.clone()
+            else:
+                # No AutoColor, enforce DFL_Orig as base for texture
+                swap_texture_backup = faceutil.histogram_matching_DFL_Orig(
+                    original_face_512, swap.clone(), mask_autocolor, 100
+                )
 
-            mask_autocolor = calc_mask.clone()
-            mask_autocolor = mask_autocolor > 0.05
-
-            # Histogrammvor-Anpassungen (wie bei dir)
-            swap_texture_backup = faceutil.histogram_matching_DFL_Orig(
-                original_face_512, swap.clone(), mask_autocolor, 100
-            )
-
-            # Gradient (dein Shader)
             TransferTextureKernelSizeSlider = 12
             TransferTextureSigmaDecimalSlider = 4.00
             TransferTextureWeightSlider = 1
@@ -2475,50 +2891,31 @@ class FrameWorker(threading.Thread):
                 global_gamma,
                 global_contrast,
             )
+
+            # Apply color transfer to the gradient texture itself to match context
             gradient_texture = faceutil.histogram_matching_DFL_Orig(
                 original_face_512, gradient_texture, mask_autocolor, 100
             )
 
-            # Boost (Gamma < 1 macht härter, >1 macht softer)
-            # gamma = 0.9 + 0.6 * (1.0 - gamma/100.0)  # bei geringer Softness etwas härter
-            # mask_vgg_512 = mask_vgg_512.clamp(1e-6,1).pow(gamma)
-
-            # VGG-Maske als weiteres Limit: 512
-            # mask_vgg_512 = t512_mask(mask_vgg_512)
-            # final erlauben = mask_final_512 * (1 - (1 - mask_vgg_512)) = mask_final_512 * mask_vgg
-            # mask_final_512 = (mask_final_512 * mask_vgg_512).clamp(0,1)
-            # mask_final_512 = (mask_final_512 + mask_calc).clamp(0,1)
-            if parameters["FaceParserBlurTextureSlider"] > 0:
-                orig = mask_final_512.clone()
-                gauss = transforms.GaussianBlur(
-                    parameters["FaceParserBlurTextureSlider"] * 2 + 1,
-                    (parameters["FaceParserBlurTextureSlider"] + 1) * 0.2,
-                )
-                mask_final_512 = gauss(mask_final_512.type(torch.float32))
-                mask_final_512 = torch.max(mask_final_512, orig).clamp(0.0, 1.0)
-
-            # Mischen:  w = alpha*(1 - mask_final_512)
             alpha_t = parameters["TransferTextureBlendAmountSlider"] / 100.0
-            w = alpha_t * (
-                1 - mask_final_512
-            )  # torch.max((1-mask_final_512),(1-calc_mask_dill))
+            w = alpha_t * (1 - mask_final_512)
             w = w.clamp(0, 1)
+
             swap = (swap_texture_backup * (1.0 - w) + gradient_texture * w).clamp(
                 0, 255
             )
-
-            texture_mask_view = (
-                1.0 - mask_final_512
-            ).clone()  # falls du für Debug/Anzeige brauchst
+            texture_mask_view = (1.0 - mask_final_512).clone()
 
         # -------------------------------
         # Differencing
         # -------------------------------
         if parameters.get("DifferencingEnableToggle", False):
-            # 128er Eingabemaske für VGG
-            diff_mask_128 = v2.Resize(
-                (128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
-            )(calc_mask.clone())
+            if swap.shape[-1] != 512:
+                swap = t512_mask(swap)
+                swap_mask = t512_mask(swap_mask)
+                swap_mask_noFP = t512_mask(swap_mask_noFP)
+
+            diff_mask_128 = t128_mask(calc_mask.clone())
 
             swapped_face_resized = swap.clone()
             original_face_resized = original_face_512.clone()
@@ -2544,7 +2941,6 @@ class FrameWorker(threading.Thread):
                 )
             )
 
-            # piecewise auf diff_norm_texture (wie bei dir), dann 512 & Blur/Blend
             eps = 1e-6
             inv_lower = 1.0 / max(lower_thresh, eps)
             inv_mid = 1.0 / max((upper_thresh - lower_thresh), eps)
@@ -2570,13 +2966,31 @@ class FrameWorker(threading.Thread):
                 gauss = transforms.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
                 mask512 = gauss(mask512.float())
 
-            # mit calc_mask kombinieren
-            # mask512 = (mask512 + mask_calc).clamp(0,1)
             mask512 = torch.max((mask512), 1 - calc_mask_dill)
             mask512 = (mask512).clamp(0, 1)
 
             swap = (swap * mask512 + original_face_512 * (1.0 - mask512)).clamp(0, 255)
-            diff_mask = 1 - mask512.clone()  # falls du später "diff" anzeigen willst
+            diff_mask = 1 - mask512.clone()
+
+        # Face editor After Second Restorer
+        if (
+            parameters["FaceEditorEnableToggle"]
+            and self.main_window.editFacesButton.isChecked()
+            and parameters["FaceEditorBeforeTypeSelection"] == "After Texture Transfer"
+        ):
+            editor_mask = t512_mask(swap_mask).clone()
+            if swap.shape[-1] != 512:
+                swap = t512_mask(swap)
+
+            swap = swap * editor_mask + original_face_512 * (1 - editor_mask)
+            swap = self.frame_edits.swap_edit_face_core(swap, swap, parameters, control)
+
+            if swap_mask_noFP.shape[-1] != swap.shape[-1]:
+                swap_mask = v2.Resize((swap.shape[-2], swap.shape[-1]), antialias=True)(
+                    swap_mask_noFP
+                )
+            else:
+                swap_mask = swap_mask_noFP
 
         # Apply color corrections
         if parameters["ColorEnableToggle"]:
@@ -2615,17 +3029,6 @@ class FrameWorker(threading.Thread):
 
             swap = swap * 255.0
 
-        # Face editor After Second Restorer
-        if (
-            parameters["FaceEditorEnableToggle"]
-            and self.main_window.editFacesButton.isChecked()
-            and parameters["FaceEditorBeforeTypeSelection"] == "After Texture Transfer"
-        ):
-            editor_mask = t512_mask(swap_mask).clone()
-            swap = swap * editor_mask + original_face_512 * (1 - editor_mask)
-            swap = self.frame_edits.swap_edit_face_core(swap, swap, parameters, control)
-            swap_mask = swap_mask_noFP
-
         # Second Restorer - After Diff / Texture Transfer and AutoColor
         if (
             parameters["FaceRestorerEnable2Toggle"]
@@ -2656,7 +3059,7 @@ class FrameWorker(threading.Thread):
                     "FaceRestorerAutoSharpMask2AdjustDecimalSlider"
                 ]
                 automaskblur2 = 2  # parameters["FaceRestorerAutoSharpMask2BlurSlider"]
-                restore_mask = calc_mask.clone()
+                restore_mask = mask_forcalc_512.clone()
 
                 alpha_auto2, blur_value2 = self.face_restorer_auto(
                     original_face_512_autorestore2,
@@ -2670,7 +3073,7 @@ class FrameWorker(threading.Thread):
                     automasktoggle2,
                     automaskadjust2,
                     automaskblur2,
-                )  # , parameters["FaceRestorerMaskSlider"], parameters["AutoRestorerTenengradTreshSlider"]/100, parameters["AutoRestorerCombWeightSlider"]/100)
+                )
 
                 if blur_value2 > 0:
                     kernel_size = 2 * blur_value2 + 1  # 3,5,7,...
@@ -2702,31 +3105,53 @@ class FrameWorker(threading.Thread):
             swap = self._apply_denoiser_pass(swap, control, "After", kv_map)
 
         # Face parser at end
-        if parameters.get("FaceParserEnableToggle") and parameters.get(
-            "FaceParserEndToggle"
-        ):
+        # We check if we need to run the parser pipeline again at the end
+        if (
+            parameters.get("FaceParserEnableToggle")
+            and parameters.get("FaceParserEndToggle")
+        ) or (parameters.get("MouthParserStretchToggle", False)):
             out = self.models_processor.process_masks_and_masks(
-                swap,  # aktueller Swap-Stand (uint8, 3x512x512)
-                original_face_512,  # original (uint8, 3x512x512)
+                swap,
+                original_face_512,
                 parameters,
                 control,
             )
-            FaceParser_mask_128 = out.get("FaceParser_mask", None)
-            # FaceParser-Maske (128) auf swap_mask anwenden (wenn vorhanden)
-            if FaceParser_mask_128 is not None:
-                swap_mask = swap_mask * FaceParser_mask_128
+            # If Face Parser is ON, we get the mask
+            if parameters.get("FaceParserEnableToggle") and parameters.get(
+                "FaceParserEndToggle"
+            ):
+                FaceParser_mask = out.get("FaceParser_mask", None)
+            else:
+                FaceParser_mask = None
 
-        # -------------------------------
-        # AutoColor (Maske 512) - second pass at the end (to color the restored and denoized faces after the first pipeline pass)
-        # -------------------------------
+            # --- MOUTH STRETCH MASK PATCHING (End of Pipeline) ---
+            # If Mouth Stretch is ON, we might need to patch the mask
+            # OR directly apply the overlay if no mask exists.
+            mouth_overlay_info_end = out.get("mouth_overlay_info", None)
+
+            # We have a FaceParser Mask -> We patch the hole in the mask
+            if FaceParser_mask is not None:
+                if FaceParser_mask.shape[-1] != swap_mask.shape[-1]:
+                    FaceParser_mask = v2.Resize(
+                        (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+                    )(FaceParser_mask)
+
+                if mouth_overlay_info_end is not None:
+                    _, overlay_mask_end = mouth_overlay_info_end
+                    if overlay_mask_end.shape[-1] != FaceParser_mask.shape[-1]:
+                        overlay_mask_end = v2.Resize(
+                            (FaceParser_mask.shape[-2], FaceParser_mask.shape[-1]),
+                            interpolation=v2.InterpolationMode.NEAREST,
+                        )(overlay_mask_end.unsqueeze(0)).squeeze(0)
+
+                    FaceParser_mask = torch.maximum(FaceParser_mask, overlay_mask_end)
+
+                swap_mask = swap_mask * FaceParser_mask
+
+        # AutoColor End (Use existing mask_autocolor)
         if parameters.get("AutoColorEnableToggle", False) and parameters.get(
             "AutoColorEndEnableToggle", False
         ):
-            # calc_mask ist [1,512,512], 1=erlaubt
-            mask_autocolor = calc_mask.clone()
-            mask_autocolor = mask_autocolor > 0.05
-            # swap_backup = swap.clone()
-
             if parameters["AutoColorTransferTypeSelection"] == "Test":
                 swap = faceutil.histogram_matching(
                     original_face_512, swap, parameters["AutoColorBlendAmountSlider"]
@@ -2739,8 +3164,6 @@ class FrameWorker(threading.Thread):
                     mask_autocolor,
                     parameters["AutoColorBlendAmountSlider"],
                 )
-                # if parameters.get("ExcludeMaskEnableToggle", False):
-                #    swap_backup = faceutil.histogram_matching_withmask(original_face_512, swap_backup, mask_autocolor, parameters["AutoColorBlendAmountSlider"])
 
             elif parameters["AutoColorTransferTypeSelection"] == "DFL_Test":
                 swap = faceutil.histogram_matching_DFL_test(
@@ -2757,15 +3180,9 @@ class FrameWorker(threading.Thread):
             parameters["FinalBlendAdjEnableToggle"]
             and parameters["FinalBlendAmountSlider"] > 0
         ):
-            final_blur_strength = parameters[
-                "FinalBlendAmountSlider"
-            ]  # Ein Parameter steuert beides
-            # Bestimme kernel_size und sigma basierend auf dem Parameter
-            kernel_size = (
-                2 * final_blur_strength + 1
-            )  # Ungerade Zahl, z.B. 3, 5, 7, ...
-            sigma = final_blur_strength * 0.1  # Sigma proportional zur Stärke
-            # Gaussian Blur anwenden
+            final_blur_strength = parameters["FinalBlendAmountSlider"]
+            kernel_size = 2 * final_blur_strength + 1
+            sigma = final_blur_strength * 0.1
             gaussian_blur = transforms.GaussianBlur(
                 kernel_size=kernel_size, sigma=sigma
             )
@@ -2777,10 +3194,10 @@ class FrameWorker(threading.Thread):
             if jpeg_q != 100:
                 s = float(tform.scale)
 
-                gamma = 0.60  # parameters["JPEGCompressionGammaDecimalSlider"]
-                strength = 0.80  # parameters["JPEGCompressionAdjustSlider"]/100
-                q_min = 14  # parameters["JPEGCompressionQMinSlider"]
-                q_max = 100  # parameters["JPEGCompressionQMaxSlider"]
+                gamma = 0.60
+                strength = 0.80
+                q_min = 14
+                q_max = 100
 
                 jpeg_q_eff = faceutil._map_jpeg_quality(
                     base_q=jpeg_q,
@@ -2836,7 +3253,7 @@ class FrameWorker(threading.Thread):
             print(f"[DEBUG] {one_liner}")
 
         if is_perspective_crop:
-            return swap, t512_mask(swap_mask), None
+            return t512_mask(swap), t512_mask(swap_mask), None
 
         # Add blur to swap_mask results
         gauss = transforms.GaussianBlur(
@@ -2846,18 +3263,27 @@ class FrameWorker(threading.Thread):
         swap_mask = gauss(swap_mask)
 
         # Combine border and swap mask, scale, and apply to swap
+        if border_mask.shape[-1] != swap_mask.shape[-1]:
+            border_mask = v2.Resize(
+                (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
+            )(border_mask)
+
         swap_mask = torch.mul(swap_mask, border_mask)
-        swap_mask = t512_mask(swap_mask)
+
+        # Standardize for Untransform logic
+        if swap.shape[-1] != 512:
+            swap = t512_mask(swap)
+            swap_mask = t512_mask(swap_mask)
+
         swap = torch.mul(swap, swap_mask)
 
-        # For face comparing
         original_face_512_clone = None
         if self.is_view_face_compare:
             original_face_512_clone = original_face_512.clone()
             original_face_512_clone = original_face_512_clone.type(torch.uint8)
             original_face_512_clone = original_face_512_clone.permute(1, 2, 0)
+
         swap_mask_clone = None
-        # Uninvert and create image from swap mask
         if self.is_view_face_mask:
             mask_show_type = parameters["MaskShowSelection"]
             if mask_show_type == "swap_mask":
@@ -2865,21 +3291,25 @@ class FrameWorker(threading.Thread):
                     parameters["FaceEditorEnableToggle"]
                     and self.main_window.editFacesButton.isChecked()
                 ):
-                    swap_mask_clone = t512_mask(torch.ones_like(swap_mask)).clone()
+                    swap_mask_clone = torch.ones_like(swap_mask).clone()
                 else:
                     swap_mask_clone = swap_mask.clone()
             elif mask_show_type == "diff":
                 swap_mask_clone = diff_mask.clone()
             elif mask_show_type == "texture":
                 swap_mask_clone = texture_mask_view.clone()
-            swap_mask_clone = torch.sub(1, swap_mask_clone)
-            swap_mask_clone = torch.cat(
-                (swap_mask_clone, swap_mask_clone, swap_mask_clone), 0
-            )
-            swap_mask_clone = swap_mask_clone.permute(1, 2, 0)
-            swap_mask_clone = torch.mul(swap_mask_clone, 255.0).type(torch.uint8)
 
-        # Calculate the area to be mergerd back to the original frame
+            if swap_mask_clone is not None:
+                if swap_mask_clone.shape[-1] != 512:
+                    swap_mask_clone = t512_mask(swap_mask_clone)
+                swap_mask_clone = torch.sub(1, swap_mask_clone)
+                swap_mask_clone = torch.cat(
+                    (swap_mask_clone, swap_mask_clone, swap_mask_clone), 0
+                )
+                swap_mask_clone = swap_mask_clone.permute(1, 2, 0)
+                swap_mask_clone = torch.mul(swap_mask_clone, 255.0).type(torch.uint8)
+
+        # Untransform the swap
         IM512 = tform.inverse.params[0:2, :]
         corners = np.array([[0, 0], [0, 511], [511, 0], [511, 511]])
 

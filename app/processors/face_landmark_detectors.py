@@ -95,11 +95,19 @@ class FaceLandmarkDetectors:
         }
 
     def run_detect_landmark(
-        self, img, bbox, det_kpss, detect_mode="203", score=0.5, from_points=False
+        self,
+        img,
+        bbox,
+        det_kpss,
+        detect_mode="203",
+        score=0.5,
+        from_points=False,
+        **kwargs,
     ):
         """
         Main dispatcher function to run a specific landmark detector.
         It handles model loading, caching, and calling the correct processing function.
+        Accepts **kwargs to pass optional parameters like 'use_mean_eyes' to detectors.
         """
         kpss_5, kpss, scores = [], [], []
 
@@ -130,19 +138,29 @@ class FaceLandmarkDetectors:
         if detect_mode == "5":
             self._ensure_landmark_5_anchors()
 
-        # Call the specific detection function (e.g., detect_face_landmark_68).
+        # Call the specific detection function with kwargs
         kpss_5, kpss, scores = detection_function(
-            img, bbox=bbox, det_kpss=det_kpss, from_points=from_points
+            img, bbox=bbox, det_kpss=det_kpss, from_points=from_points, **kwargs
         )
 
-        # Filter the final results based on the provided confidence score.
-        if len(kpss_5) > 0 and len(scores) > 0:
-            if np.mean(scores) >= score:
+        # --- Filtering Logic ---
+        # We check if detection produced a result.
+        has_result = len(kpss_5) > 0
+        # We check if the model provided confidence scores (Regression models like 203 do not).
+        has_scores = len(scores) > 0
+
+        if has_result:
+            if has_scores:
+                # If the model supports scoring (e.g., 5, 68, 98), we apply the threshold filter.
+                if np.mean(scores) >= score:
+                    return kpss_5, kpss, scores
+                else:
+                    # Filtered out due to low confidence
+                    return [], [], []
+            else:
+                # If the model does NOT support scoring (e.g., 203, 106, 478),
+                # we implicitly trust the Face Detector's result and pass this through.
                 return kpss_5, kpss, scores
-        elif (
-            len(kpss_5) > 0
-        ):  # If no scores are returned by the model, pass through the landmarks.
-            return kpss_5, kpss, scores
 
         return [], [], []
 
@@ -258,10 +276,6 @@ class FaceLandmarkDetectors:
         # model will be None. We must abort to prevent a crash.
         if model is None:
             print(f"[ERROR] Failed to get or load model '{model_name}'.")
-            # Return empty arrays matching the expected output structure (list of np.ndarray)
-            # We must create dummy outputs based on output_names to avoid crashes upstream.
-            # A simpler approach for now: return empty list, let caller handle it.
-            # This will likely result in an empty kpss list, which is handled.
             return []
 
         io_binding = model.io_binding()
@@ -306,7 +320,7 @@ class FaceLandmarkDetectors:
 
         return net_outs
 
-    def detect_face_landmark_5(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_5(self, img, bbox, det_kpss, from_points=False, **kwargs):
         # This model's pre-processing is unique, so it doesn't use the `_prepare_crop` helper.
         if not from_points:
             w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
@@ -381,7 +395,7 @@ class FaceLandmarkDetectors:
             return landmarks, landmarks, np.array([scores])
         return [], [], []
 
-    def detect_face_landmark_68(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_68(self, img, bbox, det_kpss, from_points=False, **kwargs):
         # This model's warping function returns a specific `affine_matrix`, so it's handled separately.
         if not from_points:
             crop_image, affine_matrix = (
@@ -426,7 +440,9 @@ class FaceLandmarkDetectors:
         )
         return face_landmark_68_5, face_landmark_68, face_landmark_68_score
 
-    def detect_face_landmark_3d68(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_3d68(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
         # Ensure the 'meanshape_68.pkl' dependency is loaded once
         if len(self.models_processor.mean_lmk) == 0:
             try:
@@ -465,7 +481,7 @@ class FaceLandmarkDetectors:
         landmark2d68_5, _ = faceutil.convert_face_landmark_68_to_5(landmark2d68, [])
         return landmark2d68_5, landmark2d68, []
 
-    def detect_face_landmark_98(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_98(self, img, bbox, det_kpss, from_points=False, **kwargs):
         # This model's warping function also has a unique return value ('detail').
         h, w = 0, 0
         if not from_points:
@@ -519,7 +535,9 @@ class FaceLandmarkDetectors:
             return landmark_5, landmark, landmark_score
         return [], [], []
 
-    def detect_face_landmark_106(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_106(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
         aimg, _, IM = self._prepare_crop(
             img, bbox, det_kpss, from_points, target_size=192, warp_mode="arcface128"
         )
@@ -547,7 +565,12 @@ class FaceLandmarkDetectors:
         )
         return pred_5, pred, []
 
-    def detect_face_landmark_203(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_203(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
+        # Extract the 'use_mean_eyes' parameter from kwargs, default to False.
+        use_mean_eyes = kwargs.get("use_mean_eyes", False)
+
         # Select warp mode based on the number of keypoints available.
         warp_mode = (
             None
@@ -579,14 +602,22 @@ class FaceLandmarkDetectors:
         )  # The third output contains the landmarks.
 
         out_pts = faceutil.trans_points(out_pts, IM)
+        # Pass 'use_mean_eyes' to the converter.
         out_pts_5 = (
-            faceutil.convert_face_landmark_203_to_5(out_pts)
+            faceutil.convert_face_landmark_203_to_5(
+                out_pts, use_mean_eyes=use_mean_eyes
+            )
             if out_pts is not None
             else []
         )
         return out_pts_5, out_pts, []
 
-    def detect_face_landmark_478(self, img, bbox, det_kpss, from_points=False):
+    def detect_face_landmark_478(
+        self, img, bbox, det_kpss, from_points=False, **kwargs
+    ):
+        # Extract the 'use_mean_eyes' parameter from kwargs, default to False.
+        use_mean_eyes = kwargs.get("use_mean_eyes", False)
+
         # Ensure the 'FaceBlendShapes' dependency is loaded before we proceed
         if not self.models_processor.models.get("FaceBlendShapes"):
             # We use load_model, which handles caching. If it fails, it will return None.
@@ -629,6 +660,9 @@ class FaceLandmarkDetectors:
                 "FaceBlendShapes", {"input_points": landmark_for_score}, ["output"]
             )
 
-            landmark_5 = faceutil.convert_face_landmark_478_to_5(landmark)
+            # Pass 'use_mean_eyes' to the converter.
+            landmark_5 = faceutil.convert_face_landmark_478_to_5(
+                landmark, use_mean_eyes=use_mean_eyes
+            )
             return landmark_5, landmark, []
         return [], [], []

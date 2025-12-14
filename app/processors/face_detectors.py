@@ -262,6 +262,13 @@ class FaceDetectors:
         """
         kpss_5 = kpss.copy()
         if use_landmark_detection and len(kpss_5) > 0:
+            # We need to filter kwargs to remove arguments that are already passed positionally
+            # to run_detect_landmark to avoid "got multiple values for argument" error.
+            # run_detect_landmark signature: (img, bbox, det_kpss, detect_mode, score, from_points, **kwargs)
+            landmark_kwargs = kwargs.copy()
+            for key in ["img", "score", "from_points"]:
+                landmark_kwargs.pop(key, None)
+
             refined_kpss = []
             for i in range(kpss_5.shape[0]):
                 landmark_kpss_5, landmark_kpss, landmark_scores = (
@@ -272,6 +279,7 @@ class FaceDetectors:
                         landmark_detect_mode,
                         landmark_score,
                         from_points,
+                        **landmark_kwargs,
                     )
                 )
                 refined_kpss.append(
@@ -323,6 +331,100 @@ class FaceDetectors:
 
         return net_outs
 
+    def track_faces(self, img, previous_detections, **kwargs):
+        """
+        Attempts to track faces based on their previous positions using landmark detection directly.
+        Returns: (det, kpss, scores) or (None, None, None) if tracking failed for any face.
+        """
+        if not previous_detections:
+            return None, None, None
+
+        tracked_det = []
+        tracked_kpss = []
+        tracked_scores = []
+
+        img_height, img_width = img.shape[1], img.shape[2]
+
+        # Parameters for tracking
+        landmark_score_threshold = kwargs.get("landmark_score", 0.5)
+        detect_mode = kwargs.get("landmark_detect_mode", "203")
+        use_mean_eyes = kwargs.get("use_mean_eyes", False)
+
+        for prev_face in previous_detections:
+            # Previous bounding box
+            bbox = prev_face["bbox"]
+
+            # Expand the box slightly to account for movement
+            expansion_factor = 0.2  # 20% expansion
+            w = bbox[2] - bbox[0]
+            h = bbox[3] - bbox[1]
+
+            expanded_bbox = np.array(
+                [
+                    max(0, bbox[0] - w * expansion_factor),
+                    max(0, bbox[1] - h * expansion_factor),
+                    min(img_width, bbox[2] + w * expansion_factor),
+                    min(img_height, bbox[3] + h * expansion_factor),
+                ]
+            )
+
+            # Run landmark detection directly on the expanded previous area
+            # We assume kpss_5 is enough to verify presence
+            kpss_5, kpss_all, scores = self.models_processor.run_detect_landmark(
+                img,
+                expanded_bbox,
+                None,  # No initial keypoints known for this frame yet
+                detect_mode=detect_mode,
+                score=landmark_score_threshold,
+                from_points=False,  # Must be False here as we only have a box
+                use_mean_eyes=use_mean_eyes,
+            )
+
+            # Verification: If no landmarks found, tracking failed -> Full Redetect needed
+            if len(kpss_5) == 0:
+                return None, None, None
+
+            # Determine which keypoints to use for bbox recalculation
+            # Use dense landmarks if available (more precise), otherwise 5 points
+            current_kpss = (
+                kpss_all if (kpss_all is not None and len(kpss_all) > 0) else kpss_5
+            )
+
+            # Recalculate Bounding Box from the new landmarks
+            # This allows the box to "move" and follow the face
+            if current_kpss is not None and len(current_kpss) > 0:
+                min_x, min_y = np.min(current_kpss, axis=0)
+                max_x, max_y = np.max(current_kpss, axis=0)
+
+                # Add a little padding to the new box so it doesn't shrink over time
+                pad_w = (max_x - min_x) * 0.1
+                pad_h = (max_y - min_y) * 0.1
+
+                new_bbox = np.array(
+                    [
+                        max(0, min_x - pad_w),
+                        max(0, min_y - pad_h),
+                        min(img_width, max_x + pad_w),
+                        min(img_height, max_y + pad_h),
+                    ]
+                )
+
+                # Append results
+                tracked_det.append(new_bbox)
+                tracked_kpss.append(
+                    kpss_5
+                )  # We keep the 5-points format for consistency
+                # For score, we reuse the previous one or a default, as landmarks don't always give a bbox score
+                tracked_scores.append(prev_face.get("score", 0.99))
+            else:
+                return None, None, None
+
+        return (
+            np.array(tracked_det),
+            np.array(tracked_kpss, dtype=object),
+            np.array(tracked_scores),
+        )
+
     def run_detect(
         self,
         img,
@@ -335,10 +437,45 @@ class FaceDetectors:
         landmark_score=0.5,
         from_points=False,
         rotation_angles=None,
+        previous_detections=None,  # <--- NEW ARGUMENT
+        **kwargs,
     ):
         """
         Main dispatcher for running face detection. Selects and runs the appropriate model.
+        Supports tracking via 'previous_detections'.
         """
+
+        # --- TRACKING ATTEMPT ---
+        # If we have previous faces and tracking is requested (via implicit logic or kwargs)
+        if previous_detections is not None and len(previous_detections) > 0:
+            # Try to track
+            t_det, t_kpss, t_scores = self.track_faces(
+                img,
+                previous_detections,
+                landmark_score=landmark_score,
+                landmark_detect_mode=landmark_detect_mode,
+                **kwargs,
+            )
+
+            # If tracking succeeded (returns are not None), skip heavy detection
+            if t_det is not None:
+                # Optionally refine landmarks (if the user wants detailed landmarks)
+                if use_landmark_detection:
+                    return self._refine_landmarks(
+                        img,
+                        t_det,
+                        t_kpss,
+                        t_scores,
+                        use_landmark_detection,
+                        landmark_detect_mode,
+                        landmark_score,
+                        from_points,
+                        **kwargs,
+                    )
+                return t_det, t_kpss, t_scores
+
+        # --- FULL DETECTION FALLBACK ---
+        # If no previous detections or tracking failed, run the heavy model
         detector = self.detector_map.get(detect_mode)
         if not detector:
             return [], [], []
@@ -348,16 +485,13 @@ class FaceDetectors:
             self.models_processor.unload_model(self.current_detector_model)
         self.current_detector_model = model_name
 
-        # Ensure the required model is loaded into memory.
         if not self.models_processor.models.get(model_name):
             self.models_processor.models[model_name] = self.models_processor.load_model(
                 model_name
             )
 
-        # Fail-safe check: If model failed to load, ort_session will be None.
         ort_session = self.models_processor.models.get(model_name)
         if not ort_session:
-            # This is the primary check. The individual checks in detect_... were redundant.
             print(
                 f"[ERROR] {model_name} model failed to load or is not available. Skipping detection."
             )
@@ -365,7 +499,6 @@ class FaceDetectors:
 
         detection_function = detector["function"]
 
-        # Prepare arguments for the specific detector function.
         args = {
             "img": img,
             "max_num": max_num,
@@ -375,9 +508,10 @@ class FaceDetectors:
             "landmark_score": landmark_score,
             "from_points": from_points,
             "rotation_angles": rotation_angles or [0],
-            "ort_session": ort_session,  # Pass the session to avoid re-fetching
+            "ort_session": ort_session,
         }
-        # Some detectors have a parameterized input size, others are fixed.
+        args.update(kwargs)
+
         if detect_mode in ["RetinaFace", "SCRFD"]:
             args["input_size"] = input_size
 

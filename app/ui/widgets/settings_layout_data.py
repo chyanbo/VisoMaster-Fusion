@@ -57,6 +57,21 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": "Update parameters and controls when seeking the video to reflect the options status for it's position.",
         },
+        "GlobalInputResizeToggle": {
+            "level": 1,
+            "label": "Resize Input Source (Performance/Output)",
+            "default": False,
+            "help": "Downscales the input video/image BEFORE processing. Improves performance and sets the final output resolution to the selected size.",
+        },
+        "GlobalInputResizeSizeSelection": {
+            "level": 2,
+            "label": "Input Resolution Target",
+            "options": ["540p", "720p", "1080p"],
+            "default": "720p",
+            "parentToggle": "GlobalInputResizeToggle",
+            "requiredToggleValue": True,
+            "help": "Target height resolution (e.g. 720p). The aspect ratio is preserved.",
+        },
     },
     "Video Playback Settings": {
         "VideoPlaybackCustomFpsToggle": {
@@ -89,21 +104,6 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "label": "Playback Loop",
             "default": False,
             "help": "Auto start over when video playing to the end.(Not work for recording)",
-        },
-        "VideoPlaybackPreviewToggle": {
-            "level": 1,
-            "label": "Playback Preview Mode",
-            "default": False,
-            "help": "Playback preview mode uses low frame size to do the swap and gain in performance. This will not be used for recording and results may vary !",
-        },
-        "VideoPlaybackPreviewSizeSelection": {
-            "level": 2,
-            "label": "Preview Resolution",
-            "options": ["240p", "360p", "480p", "540p", "720p"],
-            "default": "360p",
-            "parentToggle": "VideoPlaybackPreviewToggle",
-            "requiredToggleValue": True,
-            "help": "Select a lower preview resolution for faster processing in preview mode.",
         },
         "LiveSoundVolumeDecimalSlider": {
             "level": 1,
@@ -284,6 +284,15 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "step": 1,
             "help": "Set the confidence score threshold for face detection. Higher values ensure more confident detections but may miss some faces.",
         },
+        "FaceDetectionIntervalSlider": {
+            "level": 1,
+            "label": "Detection Interval (Frames)",
+            "min_value": "1",
+            "max_value": "30",
+            "default": "1",
+            "step": 1,
+            "help": "How often to run the full face detector. Higher values improve FPS but may lose fast-moving faces. 1 = Detect every frame (Slowest).",
+        },
         "MaxFacesToDetectSlider": {
             "level": 1,
             "label": "Max No of Faces to Detect",
@@ -353,6 +362,14 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "parentToggle": "LandmarkDetectToggle",
             "requiredToggleValue": True,
             "help": "Enable detection of faces from specified landmark points.",
+        },
+        "LandmarkMeanEyesToggle": {
+            "level": 2,
+            "label": "Use Mean Eyes",
+            "default": False,
+            "parentToggle": "LandmarkDetectToggle",
+            "requiredToggleValue": True,
+            "help": "Increases stability by averaging multiple points for eyes (Recommended for 203/478 models).",
         },
         "ShowLandmarksEnableToggle": {
             "level": 1,
