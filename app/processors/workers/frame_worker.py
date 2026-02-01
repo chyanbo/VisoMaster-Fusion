@@ -2010,7 +2010,7 @@ class FrameWorker(threading.Thread):
                 dtype=torch.float32,
                 device=self.models_processor.device,
             )
-            input_face_affined = input_face_affined.permute(1, 2, 0)
+            input_face_affined = input_face_affined.permute(1, 2, 0).contiguous()
             input_face_affined = torch.div(input_face_affined, 255.0)
 
             swap, prev_face = self.get_swapped_and_prev_face(
@@ -2484,7 +2484,7 @@ class FrameWorker(threading.Thread):
             swap = torch.add(
                 torch.mul(swap_restorecalc, alpha_restorer),
                 torch.mul(swap_original, 1 - alpha_restorer),
-            )
+            ).contiguous()
 
         # Expression Restorer (After First)
         if (
