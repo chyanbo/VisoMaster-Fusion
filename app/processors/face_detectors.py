@@ -603,7 +603,7 @@ class FaceDetectors:
                     # Dense landmarks 'kpss' can remain object if shapes vary, 
                     # but refine_landmarks logic handles it
                     kpss = np.array(tracked_kpss_all, dtype=object)
-                    score_values = np.array(tracked_scores, dtype=np.float32)
+                    score_values = np.array(tracked_scores, dtype=np.float32).flatten()
                 else:
                     det, kpss_5, kpss, score_values = np.empty((0,4)), np.empty((0,5,2)), [], np.array([])
 
