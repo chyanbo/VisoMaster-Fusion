@@ -279,7 +279,6 @@ class ModelsProcessor(QtCore.QObject):
                 self.models_trt_path[model_name] = model_path
 
         # Initialize Sub-Processors
-        self.smart_smoother = faceutil.SmartSmoother()
         self.face_detectors = FaceDetectors(self)
         self.face_landmark_detectors = FaceLandmarkDetectors(self)
         self.face_masks = FaceMasks(self)

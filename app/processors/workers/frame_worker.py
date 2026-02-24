@@ -1076,7 +1076,7 @@ class FrameWorker(threading.Thread):
                         ):
                             target_face.calculate_assigned_input_embedding()
 
-                        # --- [MODIFICATION] MORPHING: Branche Swap Only Best Match ---
+                        # --- MORPHING: Swap Only Best Match ---
                         source_kps = None
                         if target_face and target_face.assigned_input_faces:
                             first_input_id = list(
@@ -1086,11 +1086,9 @@ class FrameWorker(threading.Thread):
                             if "kps_5" in store:
                                 source_kps = store["kps_5"]
 
-                        # On applique l'ajustement sur best_fface
                         best_fface["kps_5"] = keypoints_adjustments(
                             best_fface["kps_5"], params, source_kps=source_kps
                         )
-                        # -------------------------------------------------------------
 
                         s_e = None
                         arcface_model = self.models_processor.get_arcface_model(
@@ -1158,10 +1156,9 @@ class FrameWorker(threading.Thread):
                         ):
                             best_target.calculate_assigned_input_embedding()
 
-                        # --- [MODIFICATION CORRIGÉE] MORPHING: Branche Swap All Matches ---
+                        # --- MORPHING: Branch Swap All Matches ---
                         source_kps = None
                         if best_target and best_target.assigned_input_faces:
-                            # On prend la géométrie de la première image assignée
                             first_input_id = list(
                                 best_target.assigned_input_faces.keys()
                             )[0]
@@ -1169,11 +1166,9 @@ class FrameWorker(threading.Thread):
                             if "kps_5" in store:
                                 source_kps = store["kps_5"]
 
-                        # Application des ajustements et du nouveau Auto-Shape Match (Morphing)
                         fface["kps_5"] = keypoints_adjustments(
                             fface["kps_5"], params, source_kps=source_kps
                         )
-                        # ------------------------------------------------------------------
 
                         arcface_model = self.models_processor.get_arcface_model(
                             params["SwapModelSelection"]
@@ -1452,7 +1447,7 @@ class FrameWorker(threading.Thread):
                 difference_vector = source_latent - dst_latent
                 source_latent = source_latent + (factor * difference_vector)
 
-                # 3. CONDITIONAL FIX: Re-Normalize based on Toggle
+                # 3. Re-Normalize based on Toggle
                 if params.get("FaceLikenessNormalizationEnableToggle", True):
                     new_norm = torch.norm(source_latent)
                     if new_norm > 1e-6:
@@ -1663,9 +1658,6 @@ class FrameWorker(threading.Thread):
             input_face_affined = input_face_affined.permute(1, 2, 0)
 
         prev_face = input_face_affined.clone()
-
-        # --- OPTIMIZED QUEUE-THEN-SYNC LOGIC ---
-        # This approach queues all GPU tasks before waiting, maximizing throughput.
 
         if swapper_model == "Inswapper128":
             for k in range(itex):
@@ -2171,10 +2163,7 @@ class FrameWorker(threading.Thread):
             and parameters["FaceExpressionBeforeTypeSelection"] == "Beginning"
         ):
             swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512,
-                swap,
-                cast(dict, parameters),
-                frame_number=self.frame_number,
+                original_face_512, swap, cast(dict, parameters)
             )
 
         # Face editor beginning
@@ -2518,7 +2507,7 @@ class FrameWorker(threading.Thread):
             == "After First Restorer"
         ):
             swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512, swap, parameters, frame_number=self.frame_number
+                original_face_512, swap, cast(dict, parameters)
             )
 
         # Face Editor (After First)
@@ -2628,7 +2617,7 @@ class FrameWorker(threading.Thread):
             == "After Second Restorer"
         ):
             swap = self.frame_edits.apply_face_expression_restorer(
-                original_face_512, swap, parameters, frame_number=self.frame_number
+                original_face_512, swap, cast(dict, parameters)
             )
 
         # Editor (After Second)
@@ -2692,19 +2681,25 @@ class FrameWorker(threading.Thread):
                     soft = 100
                     mode = "smooth"
                 else:
-                    thr = 0
+                    thr = 35
                     soft = 100
                     mode = "smooth"
 
-                mask_vgg_512, _ = self.models_processor.apply_vgg_mask_simple(
-                    swap,
-                    original_face_512,
-                    mask_input_vgg,
-                    center_pct=thr,
-                    softness_pct=soft,
-                    feature_layer=TextureFeatureLayerTypeSelection,
-                    mode=mode,
+                mask_vgg_512, diff_norm_texture = (
+                    self.models_processor.apply_vgg_mask_simple(
+                        swap,
+                        original_face_512,
+                        mask_input_vgg,
+                        center_pct=thr,
+                        softness_pct=soft,
+                        feature_layer=TextureFeatureLayerTypeSelection,
+                        mode=mode,
+                    )
                 )
+
+                if not parameters.get("ExcludeVGGMaskEnableToggle", False):
+                    mask_vgg_512 = t512_mask(diff_norm_texture)
+                    mask_vgg_512 = t512_mask(mask_vgg_512).clamp(0.0, 1.0)
 
                 if parameters.get("TextureBlendAmountSlider", 0) > 0:
                     b = parameters["TextureBlendAmountSlider"]
@@ -2725,13 +2720,15 @@ class FrameWorker(threading.Thread):
                     mask_vgg_512 = torch.where(
                         mask_vgg_512 >= upper_thresh, upper_thresh, mask_vgg_512
                     )
-                    mask_final_512 = torch.max(mask_vgg_512, (1 - feature_mask))
-                else:
-                    mask_final_512 = 1 - feature_mask
+                #    mask_final_512 = torch.max(mask_vgg_512, (1 - feature_mask))
+                # else:
+                #    mask_final_512 = 1 - feature_mask
 
-                mask_final_512 = torch.max(mask_final_512, 1 - calc_mask_dill).clamp(
-                    0.0, 1.0
-                )
+                # mask_final_512 = torch.max(mask_final_512, 1 - calc_mask_dill).clamp(0.0, 1.0)
+                mask_final_512 = (
+                    torch.max(mask_vgg_512 * (1 - feature_mask), 1 - calc_mask_dill)
+                ).clamp(0.0, 1.0)
+                mask_final_512 = mask_final_512.clamp(0.0, 1.0)
 
             elif parameters.get("ExcludeOriginalVGGMaskEnableToggle", False):
                 mask_vgg_512 = torch.where(

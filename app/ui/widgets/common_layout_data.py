@@ -239,14 +239,6 @@ COMMON_LAYOUT_DATA: Any = {
             "requiredToggleValue": True,
             "help": "Choose 'Advanced' for fine-tuning and retargeting options.",
         },
-        "FaceExpressionTemporalSmoothingToggle": {
-            "level": 2,
-            "label": "Smart Smoothing",
-            "default": True,
-            "parentToggle": "FaceExpressionEnableBothToggle",
-            "requiredToggleValue": True,
-            "help": "Enable temporal smoothing to reduce jitter and stabilize expressions. Disable for raw, frame-by-frame processing.",
-        },
         "FaceExpressionCropScaleBothDecimalSlider": {
             "level": 2,
             "label": "Crop Scale",
