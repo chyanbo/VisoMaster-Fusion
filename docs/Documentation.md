@@ -12,6 +12,15 @@ Also note that there is no "better" or "perfect" way to use Visomaster. I'm just
 
 - [VisoMaster-Fusion (VMF)](#visomaster-fusion-vmf)
   - [Summary](#summary)
+  - [First Launch](#first-launch)
+    - [Panels interface](#panels-interface)
+    - [Panel rearrangement](#panels-rearrangement)
+    - [Top Bar Menu](#top-bar-menu)
+  - [Media Panel](#media-panel)
+    - [Filters](#filters)
+  - [First Faceswap](#first-faceswap)
+    - [Requirements](#requirements)
+    - [Swap Faces](#swap-faces)
   - [Features deep dive](#features-deep-dive)
     - [Face swap](#face-swap)
       - [Swapper](#swapper)
@@ -46,17 +55,160 @@ Also note that there is no "better" or "perfect" way to use Visomaster. I'm just
       - [Blend Adjustments](#blend-adjustments)
       - [Final Blend](#final-blend)
       - [Overall Mask Blend Amount](#overall-mask-blend-amount)
+  - [Troubleshooting](#troubleshooting)
   - [Performance deep-dive](#performance-deep-dive)
 
 ---
 
+## First Launch
+
+### "Panels" interface
+
+When you start VisoMaster, you can see that the software is organized in three main panel:
+
+1. The Media Panel
+2. The Faces Panel
+3. The Parameters Panel
+
+![alt text](Images/32.png)
+
+Each panel can be hidden by clicking on the buttons at the top of the program.
+
+### Panels rearrangement
+
+You can detach the media panel and the Parameters panel by clicking on this icon:
+
+![alt text](Images/33.png)
+
+You can then play with the panels and place them how you want.
+
+![alt text](Images/34.png)
+
+![alt text](Images/35.png)
+
+![alt text](Images/36.png)
+
+To reattach a detached panel to the media panel, double-click on the panel name at the top.
+
+### Top bar menu
+
+The top bar menu has different functions. Most of the options are on “File”.
+
+![alt text](Images/37.png)
+
+The “Workspace” is every options in the “Settings” tab configured in VisoMaster.
+
+- Load Saved Workspace : Load a workspace you saved before
+- Save Current Workspace : Save a workspace you’re satisfied with to work with it another time.
+
+You need to also know that the workspace you used when you close VM can be opened during the next startup.
+
+>[!TIP]
+VMF will ask you if you want to open your last workspace (i.e, the workspace used when you closed VM). If you choose “OK”, the configuration will be loaded. If you choose “Cancel”, then you get a blank workspace to work with.
+
+---
+
+- Load Target Images/Videos Folder: Choose a folder (made of video / images) to work with on VM.
+- Load Target Image/Video Files: Choose a file (image/video) to work with on VM.
+
+---
+
+- Load Source Images Folder: Choose a folder where your source/input faces are located (the face(s) that you want to use on your target image/video).
+- Load Source Image Files: Choose one or multiples files as source/input faces.
+
+---
+
+- Load Embeddings: Load a JSON file where you saved your embeddings files.
+- Save Embeddings: If you already opened an embedding json file, this act as a “Save” button. If no embedding file has been opened, this will act as a “Save as” button.
+- Save embeddings As : Save as action.
+
+An embeddings file contains one or more embedding target faces. An embedding is the merge of multiples face to create a embedded target face to be used for a face swap. An embedded target face can increase the likeness of the face you will use in comparison to a single image. 
+
+- The merge type to create the embeddings can be ‘Mean’ or ‘Median’.
+- You can use as many faces as you want but more than 5-6 faces for a mean merge embedding won’t increase the likeness anymore.
+- The mean type is better used to increase the likeness. The median type can have positive result if you have a lot more faces to put to the merge. There is no "better way", try it and make your choice.
+
+## Media Panel
+
+The media panel is used to manage your source video and input faces. You can select a folder or file(s) from the top menu or directly from the media panel when no media are yet loaded.
+
+![alt text](Images/38.png)
+
+Once a target video / image and or input face has been loaded, this message disappear.
+
+![alt text](Images/39.png)
+
+To change the folder / file on both of these options, you can then use the top menu to select a folder or drop one or multiple files inside one of the two boxes to **add** to the selection.
+
+Using the top menu will reset the selection by the one you select (a folder or a file).
+
+Dropping one or multiple files will add to the current selection.
+
+You can mix a folder and additional files in each of these boxes.
+
+### Filters
+
+**Filter by media type**
+
+On the media panel, you can filter in/out images/videos and webcam to be able to select them from your selected folder (including the individual files you also added by dropping them in the box).
+
+![alt text](Images/40.png)
+> [!CAUTION]
+No wildcard support
+
+## First Faceswap
+
+### Requirements
+
+Before trying a faceswap, there are few options that you need to configure:
+
+- General - Go to “Settings” - General and configure the two options.
+    - If your GPU doesn’t support TensorRT, choose CUDA.
+    - If your GPU support TensorRT, I would recommend TensorRT-Engine in most cases.
+    - If CUDA or TensorRT doesn’t work, you still have the CPU option but it’s not gonna work well…
+    - For the number of Threads, if you can use TensorRT, select 5 threads. In case VRAM gets full, lower the number.
+    - If your vram gets full and you’re stuck with cuda, keep the number of threads to 1 and increase it 1 by 1 while checking your vRAM usage. If it goes above 90%, lower the number.
+      - You may need to restart VMF if your VRAM is full.
+
+- Swapper Model
+    - To begin with, make sure that “Inswapper128” is selected in the Face Swap tab.
+    - Resolution doesn’t really matter for now, keep it per default.
+- Target Video
+    - Make sure that you imported at least one video with a face in it to do a faceswap.
+- Input Face
+    - One or more input face should be available. The input face will be used for the face swap to switch the face in the video with the face that you selected in the input face.
+- Output Directory
+    - To be able to save the video with the faceswap, you need to select an output directory. To do that, head over to the “Settings” tab.
+
+Once these options are selected, you’re ready for your first faceswap.
+
+![alt text](Images/41.png)
+
+### Swap Faces
+
+1. Select one of your video in Target Videos in the Media Panel. The video will appear in the middle of VisoMaster.
+2. Select an input face. You can see a discrete green shadow on the face once it’s selected.
+3. Scroll through the video until your find a frame with the face you want to swap. The face should be well visible, looking straight ahead and not too close or too far.
+4. Click on “Find Face”.
+
+![alt text](Images/42.png)
+
+The face will appear on the “Faces Panel”. 
+
+1. You may have to click again the the input face.
+2. Click on “Swap Faces”.
+
+![alt text](Images/43.png)
+
+Once you understand these few steps, the rest is about making the faceswap “better” and adapt it to your specific videos.
+
 ## Features deep dive
 
 ### Face swap
+
 All the features in "face swap" are per face. If you swap multiple faces, you need to click on the face for which you want to change an option before changing options in the "face swap" tab.
 
 #### Swapper
-
 
 #### Swapper model
 
@@ -70,7 +222,17 @@ Swapper models consume different compute power.
 
 After trying to alternate between these three for a while, I just stick with Inswapper now. 
 
-Note that DFM is not strictly speaking a swapper model. You can't use it as is.
+- DeepFaceLive (DFM): Give you the ability to use DFL Models inside VisoMaster. It uses .dfm files. These files aren’t made available in VisoMaster. You’ll have to find them yourself. You can also train your own models to faceswap a specific face. It can requires weeks of work to achieve a good result with a model creation. To use the feature, simply place your .dfm files inside “VisoMaster-Fusion\model_assets\dfm_models” and select the option to have a list of usable model.
+
+    - The “AMP Morph Factor” is specific to this type of model. If you need to use it, you know why.
+    - “RCT Color Transfer” will basically blend color from the destination face to the input face so that the face don’t look “out of place” in the target video.
+
+![alt text](Images/44.png)
+
+VMF doesn't support all the DFM models. You will need to convert some model to be able to use them in VMF.
+
+>[!TIP]
+Using DFL Models in VisoMaster requires the use of xSEG to blend with the target video nicely. Also note that changing xSEG Mask Size generally produce bad result with this type of model.
 
 #### Swapper Resolution - Inswapper only
 
@@ -396,3 +558,23 @@ A mask too strong can hide effects of some of the features and create visual gli
 ![alt text](Images/31.png)
 
 ---
+
+## Troubleshooting
+
+**Can’t load one or more faces**
+
+Check if you have this type of message:
+
+[ WARN:0@68.046] global loadsave.cpp:241 cv::findDecoder imread_('F:/VisoMaster/Benchmark/face\t├®l├®lod.jpg'): can't open/read file: check file path/integrity
+
+VMF won’t load files with unicode character in the filename (except digits). Make sure it’s not the case.
+
+For information: https://en.wikipedia.org/wiki/List_of_Unicode_characters
+
+**VisoMaster File extension support**
+
+VisoMaster support the following file formats:
+
+Images :  .jpg,.jpeg,.jpe,.png,.webp,.tif,.tiff,.jp2,.exr,.hdr,.ras,.pnm,.ppm,.pgm,.pbm,.pfm)
+
+Videos : .mp4,.avi,.mkv,.mov,.wmv,.flv,.webm,.m4v,.3gp,.gif
