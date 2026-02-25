@@ -32,6 +32,7 @@ from app.helpers.typing_helper import ControlTypes, FacesParametersTypes
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
+TAIL_TOLERANCE = 300  # 可调：3~10 都可以
 
 class VideoProcessor(QObject):
     """
@@ -370,6 +371,31 @@ class VideoProcessor(QObject):
                     preview_target_height=preview_target_height,
                 )
                 if not ret:
+
+                    fn = self.current_frame_number
+
+                    # 1) Segment mode: read failure near segment end -> treat as segment EOF/stop
+                    if self.is_processing_segments and self.current_segment_end_frame is not None:
+                        if fn >= self.current_segment_end_frame - TAIL_TOLERANCE:
+                            with self.state_lock:
+                                # Advance past the segment end to trigger display_next_frame()'s segment-end branch
+                                self.next_frame_to_display = self.current_segment_end_frame + 1
+                                # Optional: also advance the feeder's own frame counter to avoid other logic misinterpreting state
+                                self.current_frame_number = self.current_segment_end_frame + 1
+                            print(f"[INFO] Feeder: Treat read failure near segment tail as EOF (frame={fn}).")
+                            break
+
+                    # 2) Standard mode: read failure near max_frame -> treat as media EOF/stop
+                    if (not self.is_processing_segments) and (self.max_frame_number is not None):
+                        if fn >= self.max_frame_number - TAIL_TOLERANCE:
+                            with self.state_lock:
+                                # Advance past media end to trigger display_next_frame()'s "End of media reached" branch
+                                self.next_frame_to_display = self.max_frame_number + 1
+                                self.current_frame_number = self.max_frame_number + 1
+                            print(f"[INFO] Feeder: Treat read failure near media tail as EOF (frame={fn}).")
+                            break
+
+                    # 3) Non-tail failure: treat as a regular error (preserve original semantics)
                     print(
                         f"[ERROR] Feeder: Could not read frame {self.current_frame_number} (Mode: {'Segment' if is_segment_mode else 'Standard'})!"
                     )
@@ -965,6 +991,16 @@ class VideoProcessor(QObject):
                 read_successful = True
                 misc_helpers.seek_frame(self.media_capture, self.current_frame_number)
             else:
+                fn = self.current_frame_number
+                max_fn = self.max_frame_number
+                if fn >= max_fn - TAIL_TOLERANCE:
+                    print(
+                        f"[INFO] EOF reached at frame {fn} (max={max_fn}), stopping gracefully."
+                    )
+                    # 关键一步：推进到官方 EOF 语义
+                    self.current_frame_number = max_fn + 1
+                    return None
+                
                 print(
                     f"[ERROR] Cannot read frame {self.current_frame_number} for single processing!"
                 )
