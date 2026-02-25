@@ -1212,18 +1212,6 @@ def prompt_job_name(main_window: "MainWindow"):
                 )
                 return	
 
-
-        # Validate output file name if provided
-        if not use_job_name_for_output and output_file_name:
-            if not re.match(r"^[\w\- ]+$", output_file_name):
-                QMessageBox.warning(
-                    main_window,
-                    "Invalid Output File Name",
-                    "Output file name contains invalid characters.\n"
-                    "Only letters, numbers, spaces, dashes, and underscores are allowed.",
-                )
-                return
-
         # Save the job and refresh the list
         save_job(main_window, job_name, use_job_name_for_output, output_file_name)
         refresh_job_list(main_window)
