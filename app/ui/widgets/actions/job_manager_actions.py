@@ -1190,18 +1190,20 @@ def prompt_job_name(main_window: "MainWindow"):
                 main_window, "Invalid Job Name", "Job name cannot be empty."
             )
             return
-        if not re.match(r"^[\w\- ]+$", job_name):
+
+        invalid_chars = '<>:"/\\|?*'
+        if any(ch in job_name for ch in invalid_chars) or re.search(r'[\x00-\x1f]', job_name):
             QMessageBox.warning(
                 main_window,
                 "Invalid Job Name",
-                "Job name contains invalid characters. Only letters, numbers, spaces, dashes, and underscores are allowed.",
+                "Job name contains invalid characters.\n"
+                "Characters not allowed: <> : \" / \\ | ? * or control characters.",
             )
-            return
+            return	
 
         # Validate output file name if provided
         if not use_job_name_for_output and output_file_name:
             # Simple check for characters not allowed in filenames (e.g. Windows)
-            invalid_chars = '<>:"/\\|?*'
             if any(ch in output_file_name for ch in invalid_chars) or re.search(r'[\x00-\x1f]', output_file_name):
                 QMessageBox.warning(
                     main_window,
@@ -1209,7 +1211,7 @@ def prompt_job_name(main_window: "MainWindow"):
                     "Output file name contains invalid characters.\n"
                     "Characters not allowed: <> : \" / \\ | ? * or control characters.",
                 )
-                return
+                return	
 
         # Save the job and refresh the list
         save_job(main_window, job_name, use_job_name_for_output, output_file_name)
