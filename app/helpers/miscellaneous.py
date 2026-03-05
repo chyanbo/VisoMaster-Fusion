@@ -822,6 +822,12 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
 def keypoints_adjustments(
     kps_5: np.ndarray, parameters: dict, source_kps: np.ndarray = None
 ) -> np.ndarray:
+    """
+    Adjusts facial keypoints for morphing and manual alignments.
+    Upgraded to use OpenCV's robust Partial Affine Transform (LMEDS) to estimate
+    rotation, translation, and uniform scaling while actively ignoring outliers
+    caused by blur or obstruction (prevents frame-to-frame ghosting).
+    """
     kps_5_adj = kps_5.copy()
 
     if (
@@ -832,23 +838,35 @@ def keypoints_adjustments(
 
         if morph_amount > 0.0:
             try:
-                if hasattr(trans.SimilarityTransform, "from_estimate"):
-                    tform = trans.SimilarityTransform.from_estimate(
-                        source_kps, kps_5_adj
-                    )
+                # --- ROBUST SIMILARITY ALIGNMENT (OpenCV) ---
+                # Computes optimal similarity transform (Translation, Rotation, Uniform Scale).
+                # LMEDS is used over manual SVD to ignore corrupted keypoints (blur/occlusion)
+                # and strictly prevent the determinant flipping that causes doubling.
+                tform_matrix, _ = cv2.estimateAffinePartial2D(
+                    source_kps, kps_5_adj, method=cv2.LMEDS
+                )
+
+                if tform_matrix is not None:
+                    # Pad source keypoints with ones for matrix multiplication: [x, y] -> [x, y, 1]
+                    ones = np.ones((source_kps.shape[0], 1), dtype=source_kps.dtype)
+                    src_padded = np.hstack([source_kps, ones])
+
+                    # Apply transformation: Matrix (2x3) dot Padded_Points (3x5) -> Transpose to (5x2)
+                    source_kps_aligned = np.dot(tform_matrix, src_padded.T).T
+
+                    # Apply linear interpolation (Morphing)
+                    kps_5_adj = (
+                        kps_5_adj + morph_amount * (source_kps_aligned - kps_5_adj)
+                    ).astype(np.float32)
                 else:
-                    tform = trans.SimilarityTransform()
-                    tform.estimate(source_kps, kps_5_adj)
-
-                source_kps_aligned = tform(source_kps)
-
-                kps_5_adj = (
-                    kps_5_adj + morph_amount * (source_kps_aligned - kps_5_adj)
-                ).astype(np.float32)
+                    print(
+                        "[WARNING] Alignment failed due to severe keypoint corruption. Bypassing."
+                    )
 
             except Exception as e:
                 print(f"[WARNING] Face Keypoints Morphing bypassed: {e}")
 
+    # --- MANUAL ALIGNMENTS (Sliders) ---
     if parameters.get("FaceAdjEnableToggle", False):
         kps_5_adj[:, 0] += parameters["KpsXSlider"]
         kps_5_adj[:, 1] += parameters["KpsYSlider"]

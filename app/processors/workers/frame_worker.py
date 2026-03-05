@@ -2072,6 +2072,89 @@ class FrameWorker(threading.Thread):
 
         return input_face_affined, dfm_model_instance, dim, latent
 
+    def _fix_drift_and_texture(
+        self,
+        current_face: torch.Tensor,
+        prev_face: torch.Tensor,
+        first_face: torch.Tensor,
+        blend_texture: bool = True,
+    ) -> torch.Tensor:
+        """
+        Corrects spatial drift via Phase Correlation and restores skin textures
+        (high frequency) to prevent the plastic effect from multiple iterations.
+        Expected tensors in [C, H, W] format as Floats (0.0 - 1.0).
+        """
+        device = current_face.device
+
+        # --- 1. ANTI-DRIFT (Phase Correlation FFT) ---
+        gray_curr = current_face.mean(dim=0, keepdim=True)
+        gray_prev = prev_face.mean(dim=0, keepdim=True)
+
+        H, W = gray_curr.shape[1], gray_curr.shape[2]
+
+        # Hann window to prevent edge artifacts during FFT
+        window_y = torch.hann_window(H, device=device).view(H, 1)
+        window_x = torch.hann_window(W, device=device).view(1, W)
+        window = window_y * window_x
+
+        G_curr = torch.fft.fft2(gray_curr * window)
+        G_prev = torch.fft.fft2(gray_prev * window)
+
+        # Cross-power spectrum
+        R = G_prev * torch.conj(G_curr)
+        R = R / (torch.abs(R) + 1e-8)
+
+        # Spatial cross-correlation
+        r = torch.fft.ifft2(R).real
+        r = torch.fft.fftshift(r)
+
+        # Find the exact drift peak
+        max_idx = r.argmax()
+        dy = (max_idx // W).item() - H // 2
+        dx = (max_idx % W).item() - W // 2
+
+        # Prevent wild FFT hallucinations when faces are partially obstructed or at frame edges
+        max_drift = int(H * 0.05)  # 5% tolerance max (e.g., 25px for 512 res)
+        if abs(dy) > max_drift or abs(dx) > max_drift:
+            dy, dx = 0, 0
+
+        # Roll the tensor to cancel the drift
+        if dy != 0 or dx != 0:
+            current_face = torch.roll(current_face, shifts=(dy, dx), dims=(1, 2))
+
+            if dy > 0:
+                current_face[:, :dy, :] = prev_face[:, :dy, :]
+            elif dy < 0:
+                current_face[:, dy:, :] = prev_face[:, dy:, :]
+            if dx > 0:
+                current_face[:, :, :dx] = prev_face[:, :, :dx]
+            elif dx < 0:
+                current_face[:, :, dx:] = prev_face[:, :, dx:]
+
+        # --- 2. TEXTURE PRESERVATION (Frequency Separation) ---
+        if blend_texture and first_face is not None:
+            # Calibrate blur size based on model resolution (128, 256, 512)
+            k = max(3, (H // 32) * 2 + 1)
+            sigma = k * 0.3
+            blur = v2.GaussianBlur(kernel_size=k, sigma=sigma)
+
+            # Extract micro-details (pores, grain) from the very first pass
+            low_pass_first = blur(first_face)
+            high_pass_first = first_face - low_pass_first
+
+            # Prevents severe RGB channel clipping (purple/green smudges)
+            # if structural features (like lips) mismatch slightly between iterations.
+            high_pass_first = torch.clamp(high_pass_first, -0.3, 0.3) * 0.75
+
+            # Extract the new structure (reinforced identity) from the current pass
+            low_pass_curr = blur(current_face)
+
+            # Merge: New model identity + Detailed texture from pass 1
+            current_face = low_pass_curr + high_pass_first
+
+        # Safety clamp for color overflow after merging
+        return torch.clamp(current_face, 0.0, 1.0)
+
     def get_swapped_and_prev_face(
         self,
         output,
@@ -2117,9 +2200,13 @@ class FrameWorker(threading.Thread):
         # then interpolates between pass N-1 and pass N for fractional slider values.
         # Initialized here as a fallback for the DFM branch and itex=0 edge case.
         prev_face = input_face_affined.clone()
+        first_pass_face = None
+
+        # Strength mode 2 toggle
+        use_mode_2 = parameters.get("StrengthMode2EnableToggle", False)
 
         if swapper_model == "Inswapper128":
-            for _ in range(itex):  # FW-QUAL-06: renamed k -> _
+            for k in range(itex):
                 prev_face = (
                     input_face_affined.clone()
                 )  # save N-1 result before this pass
@@ -2128,7 +2215,6 @@ class FrameWorker(threading.Thread):
                 tile_outputs = []
                 tile_coords = []
 
-                # 1. PREPARATION PHASE (CPU)
                 for j in range(dim):
                     for i in range(dim):
                         tile = input_face_affined[j::dim, i::dim]
@@ -2139,31 +2225,55 @@ class FrameWorker(threading.Thread):
                         tile_outputs.append(t_out)
                         tile_coords.append((j, i))
 
-                # 2. EXECUTION PHASE (GPU - Async)
                 with torch.no_grad():
                     for idx in range(len(tile_inputs)):
                         self.models_processor.run_inswapper(
                             tile_inputs[idx], latent, tile_outputs[idx]
                         )
 
-                # 3. SYNCHRONIZATION PHASE
                 if self.models_processor.device == "cuda":
                     torch.cuda.synchronize()
 
-                # 4. RECONSTRUCTION PHASE (CPU)
-                for idx, (j, i) in enumerate(tile_coords):
-                    if tile_outputs[idx].sum() < 1.0:
-                        res = tile_inputs[idx]
+                # --- MODE 2 ---
+                if use_mode_2:
+                    temp_output = input_face_affined.clone()
+                    for idx, (j, i) in enumerate(tile_coords):
+                        res = (
+                            tile_inputs[idx]
+                            if tile_outputs[idx].sum() < 1.0
+                            else tile_outputs[idx]
+                        )
+                        temp_output[j::dim, i::dim] = res.squeeze(0).permute(1, 2, 0)
+
+                    curr_chw = temp_output.permute(2, 0, 1)
+                    if k == 0:
+                        first_pass_face = curr_chw.clone()
                     else:
-                        res = tile_outputs[idx]
+                        prev_chw = prev_face.permute(2, 0, 1)
+                        curr_chw = self._fix_drift_and_texture(
+                            curr_chw, prev_chw, first_pass_face
+                        )
+                        temp_output = curr_chw.permute(1, 2, 0)
 
-                    res_hwc = res.squeeze(0).permute(1, 2, 0)
-                    output[j::dim, i::dim] = res_hwc
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = temp_output.clone()
+                    output = torch.clamp(temp_output * 255.0, 0, 255)
 
-                # 5. STATE UPDATE
-                input_face_affined = output.clone()
-                output = torch.mul(output, 255)
-                output = torch.clamp(output, 0, 255)
+                # --- NORMAL MODE ---
+                else:
+                    for idx, (j, i) in enumerate(tile_coords):
+                        if tile_outputs[idx].sum() < 1.0:
+                            res = tile_inputs[idx]
+                        else:
+                            res = tile_outputs[idx]
+
+                        res_hwc = res.squeeze(0).permute(1, 2, 0)
+                        output[j::dim, i::dim] = res_hwc
+
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = output.clone()
+                    output = torch.mul(output, 255)
+                    output = torch.clamp(output, 0, 255)
 
         elif swapper_model in (
             "InStyleSwapper256 Version A",
@@ -2200,18 +2310,48 @@ class FrameWorker(threading.Thread):
                 if self.models_processor.device == "cuda":
                     torch.cuda.synchronize()
 
-                for idx, (j, i) in enumerate(tile_coords):
-                    if tile_outputs[idx].sum() < 1.0:
-                        res = tile_inputs[idx]
+                # --- MODE 2 ---
+                if use_mode_2:
+                    temp_output = input_face_affined.clone()
+                    for idx, (j, i) in enumerate(tile_coords):
+                        res = (
+                            tile_inputs[idx]
+                            if tile_outputs[idx].sum() < 1.0
+                            else tile_outputs[idx]
+                        )
+                        temp_output[j::dim_res, i::dim_res] = res.squeeze(0).permute(
+                            1, 2, 0
+                        )
+
+                    curr_chw = temp_output.permute(2, 0, 1)
+                    if k == 0:
+                        first_pass_face = curr_chw.clone()
                     else:
-                        res = tile_outputs[idx]
+                        prev_chw = prev_face.permute(2, 0, 1)
+                        curr_chw = self._fix_drift_and_texture(
+                            curr_chw, prev_chw, first_pass_face
+                        )
+                        temp_output = curr_chw.permute(1, 2, 0)
 
-                    res_hwc = res.squeeze(0).permute(1, 2, 0)
-                    output[j::dim_res, i::dim_res] = res_hwc
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = temp_output.clone()
+                    output = torch.clamp(temp_output * 255.0, 0, 255)
 
-                input_face_affined = output.clone()
-                output = torch.mul(output, 255)
-                output = torch.clamp(output, 0, 255)
+                # --- NORMAL MODE ---
+                else:
+                    for idx, (j, i) in enumerate(tile_coords):
+                        if tile_outputs[idx].sum() < 1.0:
+                            res = tile_inputs[idx]
+                        else:
+                            res = tile_outputs[idx]
+
+                        res_hwc = res.squeeze(0).permute(1, 2, 0)
+                        output[j::dim_res, i::dim_res] = res_hwc
+
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = output.clone()
+                    output = torch.mul(output, 255)
+                    output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "SimSwap512":
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
@@ -2238,13 +2378,31 @@ class FrameWorker(threading.Thread):
                     swapper_output = input_face_disc
 
                 swapper_output = torch.squeeze(swapper_output)
-                swapper_output = swapper_output.permute(1, 2, 0)
 
-                input_face_affined = swapper_output.clone()
+                # --- MODE 2 ---
+                if use_mode_2:
+                    if k == 0:
+                        first_pass_face = swapper_output.clone()
+                    else:
+                        prev_chw = prev_face.permute(2, 0, 1)
+                        swapper_output = self._fix_drift_and_texture(
+                            swapper_output, prev_chw, first_pass_face
+                        )
 
-                output = swapper_output.clone()
-                output = torch.mul(output, 255)
-                output = torch.clamp(output, 0, 255)
+                    swapper_output = swapper_output.permute(1, 2, 0)
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = swapper_output.clone()
+                    output = torch.clamp(swapper_output * 255.0, 0, 255)
+
+                # --- NORMAL MODE ---
+                else:
+                    swapper_output = swapper_output.permute(1, 2, 0)
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = swapper_output.clone()
+
+                    output = swapper_output.clone()
+                    output = torch.mul(output, 255)
+                    output = torch.clamp(output, 0, 255)
 
         # FW-QUAL-10: use GHOSTFACE_MODELS frozenset
         elif swapper_model in self.GHOSTFACE_MODELS:
@@ -2275,15 +2433,39 @@ class FrameWorker(threading.Thread):
                     # input_face_affined is [H,W,3] in [0,1]; convert to the
                     # GhostFace [-1,1] CHW range that swapper_output uses.
                     swapper_output = input_face_affined.permute(2, 0, 1) * 2.0 - 1.0
-                swapper_output = swapper_output.permute(1, 2, 0)
-                swapper_output = torch.mul(swapper_output, 127.5)
-                swapper_output = torch.add(swapper_output, 127.5)
 
-                input_face_affined = swapper_output.clone()
-                input_face_affined = torch.div(input_face_affined, 255)
+                # --- MODE 2 ---
+                if use_mode_2:
+                    swapper_output = torch.add(torch.mul(swapper_output, 127.5), 127.5)
+                    curr_chw = torch.div(swapper_output, 255.0)
 
-                output = swapper_output.clone()
-                output = torch.clamp(output, 0, 255)
+                    if k == 0:
+                        first_pass_face = curr_chw.clone()
+                    else:
+                        prev_chw = prev_face.permute(2, 0, 1)
+                        curr_chw = self._fix_drift_and_texture(
+                            curr_chw, prev_chw, first_pass_face
+                        )
+
+                    temp_output = curr_chw.permute(1, 2, 0)
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = temp_output.clone()
+                    output = torch.clamp(curr_chw.permute(1, 2, 0) * 255.0, 0, 255)
+
+                # --- NORMAL MODE ---
+                else:
+                    if swapper_output.sum() < 1.0:
+                        pass
+                    swapper_output = swapper_output.permute(1, 2, 0)
+                    swapper_output = torch.mul(swapper_output, 127.5)
+                    swapper_output = torch.add(swapper_output, 127.5)
+
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = swapper_output.clone()
+                    input_face_affined = torch.div(input_face_affined, 255)
+
+                    output = swapper_output.clone()
+                    output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "CSCS":
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
@@ -2310,13 +2492,32 @@ class FrameWorker(threading.Thread):
 
                 swapper_output = torch.squeeze(swapper_output)
                 swapper_output = torch.add(torch.mul(swapper_output, 0.5), 0.5)
-                swapper_output = swapper_output.permute(1, 2, 0)
 
-                input_face_affined = swapper_output.clone()
+                # --- MODE 2 ---
+                if use_mode_2:
+                    if k == 0:
+                        first_pass_face = swapper_output.clone()
+                    else:
+                        prev_chw = prev_face.permute(2, 0, 1)
+                        swapper_output = self._fix_drift_and_texture(
+                            swapper_output, prev_chw, first_pass_face
+                        )
 
-                output = swapper_output.clone()
-                output = torch.mul(output, 255)
-                output = torch.clamp(output, 0, 255)
+                    temp_output = swapper_output.permute(1, 2, 0)
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = temp_output.clone()
+                    output = torch.clamp(temp_output * 255.0, 0, 255)
+
+                # --- NORMAL MODE ---
+                else:
+                    swapper_output = swapper_output.permute(1, 2, 0)
+
+                    prev_face = input_face_affined.clone()
+                    input_face_affined = swapper_output.clone()
+
+                    output = swapper_output.clone()
+                    output = torch.mul(output, 255)
+                    output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "DeepFaceLive (DFM)" and dfm_model:
             # convert() expects CHW uint8; returns HWC float32 [0,1]
@@ -3230,6 +3431,13 @@ class FrameWorker(threading.Thread):
                     mask_autocolor,
                     parameters["AutoColorBlendAmountSlider"],
                 )
+            elif parameters["AutoColorTransferTypeSelection"] == "AdaIN_Statistical":
+                swap = faceutil.apply_adain_color_transfer(
+                    swap,
+                    original_face_512,
+                    mask_autocolor,
+                    parameters["AutoColorBlendAmountSlider"],
+                )
 
         # --- TRANSFER TEXTURE ---
         if parameters.get("TransferTextureEnableToggle", False):
@@ -3631,6 +3839,13 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.histogram_matching_DFL_Orig(
                     original_face_512,
                     swap,
+                    mask_autocolor,
+                    parameters["EndingColorBlendAmountSlider"],
+                )
+            elif parameters["EndingColorTransferTypeSelection"] == "AdaIN_Statistical":
+                swap = faceutil.apply_adain_color_transfer(
+                    swap,
+                    original_face_512,
                     mask_autocolor,
                     parameters["EndingColorBlendAmountSlider"],
                 )

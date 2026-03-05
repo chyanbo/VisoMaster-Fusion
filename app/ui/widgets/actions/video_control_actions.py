@@ -867,9 +867,15 @@ def record_video(main_window: "MainWindow", checked: bool):
                 )
 
     else:
-        # --- Stop logic ---
-        # VP-34: Check for multi-segment recording first as it's more complex.
-        if video_processor.is_processing_segments and not job_mgr_flag:
+        # --- Stop confirmation (manual UI only) ---
+        # The record button is toggle-based, and many call sites do not check return
+        # values. Therefore, cancellation must be handled here without relying on
+        # callers.
+        #
+        # Do NOT prompt when this stop was initiated programmatically by Job Manager.
+        if (
+            video_processor.is_processing_segments or video_processor.recording
+        ) and not job_mgr_flag:
             try:
                 box = QtWidgets.QMessageBox(main_window)
                 box.setIcon(QtWidgets.QMessageBox.Warning)

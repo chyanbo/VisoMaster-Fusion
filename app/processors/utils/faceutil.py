@@ -2899,6 +2899,63 @@ def histogram_matching_DFL_Orig(source_image, target_image, mask, diffslider):
     return torch.clamp(final * 255.0, 0, 255)
 
 
+def apply_adain_color_transfer(
+    source: torch.Tensor,
+    target: torch.Tensor,
+    mask: torch.Tensor,
+    blend_amount: float = 100.0,
+) -> torch.Tensor:
+    """
+    Applies statistical color transfer (AdaIN) from the target to the source,
+    restricted to the masked area. Avoids color banding issues of histogram matching
+    by transferring only the mean (tone) and variance (contrast).
+
+    Args:
+        source: Tensor [C, H, W] in Float (0.0 - 255.0).
+        target: Tensor [C, H, W] in Float (0.0 - 255.0).
+        mask: Tensor [1, H, W] boolean or float.
+        blend_amount: Float 0.0 to 100.0.
+    """
+    eps = 1e-6
+
+    # Ensure tensors are float
+    src_f = source.float()
+    tgt_f = target.float()
+
+    # Format mask
+    if mask.dtype == torch.bool:
+        mask = mask.float()
+    if mask.dim() == 2:
+        mask = mask.unsqueeze(0)
+
+    mask_sum = torch.sum(mask, dim=(1, 2), keepdim=True) + eps
+
+    # 1. Compute Means (Color/Brightness)
+    src_mean = torch.sum(src_f * mask, dim=(1, 2), keepdim=True) / mask_sum
+    tgt_mean = torch.sum(tgt_f * mask, dim=(1, 2), keepdim=True) / mask_sum
+
+    # 2. Compute Variances (Contrast)
+    src_var = (
+        torch.sum(mask * (src_f - src_mean) ** 2, dim=(1, 2), keepdim=True) / mask_sum
+    )
+    tgt_var = (
+        torch.sum(mask * (tgt_f - tgt_mean) ** 2, dim=(1, 2), keepdim=True) / mask_sum
+    )
+
+    src_std = torch.sqrt(src_var + eps)
+    tgt_std = torch.sqrt(tgt_var + eps)
+
+    # 3. Apply AdaIN transformation
+    src_normalized = (src_f - src_mean) / src_std
+    src_matched = (src_normalized * tgt_std) + tgt_mean
+
+    # 4. Blend based on user amount and mask
+    alpha = blend_amount / 100.0
+    result = (src_matched * mask * alpha) + (src_f * (1.0 - (mask * alpha)))
+
+    return torch.clamp(result, 0.0, 255.0)
+
+
 def transform_t(img, center, output_size, scale, rotation):
     device = img.device
     dtype = img.dtype

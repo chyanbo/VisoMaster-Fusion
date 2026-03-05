@@ -118,6 +118,14 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": "Apply additional swapping iterations to increase the strength of the result, which may increase likeness.",
         },
+        "StrengthMode2EnableToggle": {
+            "level": 2,
+            "label": "Mode 2 (Anti-Drift & Texture)",
+            "default": False,
+            "parentToggle": "StrengthEnableToggle",
+            "requiredToggleValue": True,
+            "help": "Use the advanced iteration mode (Phase Correlation & Frequency Separation) to prevent drift and preserve skin texture during multiple swaps.",
+        },
         "StrengthAmountSlider": {
             "level": 2,
             "label": "Amount",
@@ -1220,7 +1228,13 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
         "AutoColorTransferTypeSelection": {
             "level": 2,
             "label": "Transfer Type",
-            "options": ["Test", "Test_Mask", "DFL_Test", "DFL_Orig"],
+            "options": [
+                "Test",
+                "Test_Mask",
+                "DFL_Test",
+                "DFL_Orig",
+                "AdaIN_Statistical",
+            ],
             "default": "Test",
             "parentToggle": "AutoColorEnableToggle",
             "requiredToggleValue": True,
@@ -1246,7 +1260,13 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
         "EndingColorTransferTypeSelection": {
             "level": 2,
             "label": "Ending Transfer Type",
-            "options": ["Test", "Test_Mask", "DFL_Test", "DFL_Orig"],
+            "options": [
+                "Test",
+                "Test_Mask",
+                "DFL_Test",
+                "DFL_Orig",
+                "AdaIN_Statistical",
+            ],
             "default": "Test",
             "parentToggle": "EndingColorTransferEnableToggle",
             "requiredToggleValue": True,

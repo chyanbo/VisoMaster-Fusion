@@ -40,6 +40,7 @@ TAIL_TOLERANCE = 10  # Reduced from 300 (VP-34) to allow seeking closer to EOF.
 # Simple extraction used when no frames are skipped (no sync issues)
 
 
+
 class VideoProcessor(QObject):
     """
     Manages all video, image, and webcam processing pipelines.
