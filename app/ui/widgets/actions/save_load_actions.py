@@ -6,7 +6,7 @@ import copy
 from functools import partial
 from typing import TYPE_CHECKING, Dict, Union, cast
 
-from PySide6 import QtWidgets
+from PySide6 import QtWidgets, QtCore
 import numpy as np
 import torch
 
@@ -525,6 +525,17 @@ def load_saved_workspace(
             filter_actions.filter_target_videos(main_window)
             list_view_actions.load_target_webcams(main_window)
 
+            # restore dock layout if it was saved
+            dock_state_str = window_state.get("dock_state", data.get("dock_state", ""))
+            if dock_state_str:
+                try:
+                    ba = QtCore.QByteArray.fromBase64(
+                        dock_state_str.encode("utf-8")
+                    )
+                    main_window.restoreState(ba)
+                except Exception as e:
+                    print(f"[WARN] Failed to restore dock layout: {e}")
+
 
 def save_current_workspace(
     main_window: "MainWindow", data_filename: str | bool = False
@@ -535,6 +546,13 @@ def save_current_workspace(
     target_medias_data = []
 
     # --- Save Window State ---
+    # --- Save dock layout / panel sizes ---
+    try:
+        # saveState returns QByteArray; convert to base64 string for json compatibility
+        dock_state_data = main_window.saveState().toBase64().data().decode("utf-8")
+    except Exception:
+        dock_state_data = ""
+
     window_state_data = {
         "x": main_window.x(),
         "y": main_window.y(),
@@ -550,6 +568,7 @@ def save_current_workspace(
         "filterImagesCheckBox": main_window.filterImagesCheckBox.isChecked(),
         "filterVideosCheckBox": main_window.filterVideosCheckBox.isChecked(),
         "filterWebcamsCheckBox": main_window.filterWebcamsCheckBox.isChecked(),
+        "dock_state": dock_state_data,
     }
 
     # --- Check if Denoiser is enabled ---
