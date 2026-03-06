@@ -2109,72 +2109,83 @@ class FrameWorker(threading.Thread):
         device = current_face.device
 
         # --- 1. ANTI-DRIFT (Phase Correlation FFT) ---
+        anchor_face = first_face if first_face is not None else prev_face
+
         gray_curr = current_face.mean(dim=0, keepdim=True)
-        gray_prev = prev_face.mean(dim=0, keepdim=True)
+        gray_anchor = anchor_face.mean(dim=0, keepdim=True)
 
         H, W = gray_curr.shape[1], gray_curr.shape[2]
 
-        # Hann window to prevent edge artifacts during FFT
+        blur_op = v2.GaussianBlur(kernel_size=5, sigma=1.0)
+        gray_curr_blurred = blur_op(gray_curr)
+        gray_anchor_blurred = blur_op(gray_anchor)
+
         window_y = torch.hann_window(H, device=device).view(H, 1)
         window_x = torch.hann_window(W, device=device).view(1, W)
         window = window_y * window_x
 
-        G_curr = torch.fft.fft2(gray_curr * window)
-        G_prev = torch.fft.fft2(gray_prev * window)
+        G_curr = torch.fft.fft2(gray_curr_blurred * window)
+        G_anchor = torch.fft.fft2(gray_anchor_blurred * window)
 
-        # Cross-power spectrum
-        R = G_prev * torch.conj(G_curr)
+        R = G_anchor * torch.conj(G_curr)
         R = R / (torch.abs(R) + 1e-8)
 
-        # Spatial cross-correlation
         r = torch.fft.ifft2(R).real
         r = torch.fft.fftshift(r)
 
-        # Find the exact drift peak
         max_idx = r.argmax()
         dy = (max_idx // W).item() - H // 2
         dx = (max_idx % W).item() - W // 2
 
-        # Prevent wild FFT hallucinations when faces are partially obstructed or at frame edges
-        max_drift = int(H * 0.05)  # 5% tolerance max (e.g., 25px for 512 res)
-        if abs(dy) > max_drift or abs(dx) > max_drift:
+        max_drift = max(2, int(H * 0.015))
+
+        if abs(dy) <= 1 and abs(dx) <= 1:
+            dy, dx = 0, 0
+        elif abs(dy) > max_drift or abs(dx) > max_drift:
             dy, dx = 0, 0
 
-        # Roll the tensor to cancel the drift
         if dy != 0 or dx != 0:
             current_face = torch.roll(current_face, shifts=(dy, dx), dims=(1, 2))
 
             if dy > 0:
-                current_face[:, :dy, :] = prev_face[:, :dy, :]
+                current_face[:, :dy, :] = anchor_face[:, :dy, :]
             elif dy < 0:
-                current_face[:, dy:, :] = prev_face[:, dy:, :]
+                current_face[:, dy:, :] = anchor_face[:, dy:, :]
             if dx > 0:
-                current_face[:, :, :dx] = prev_face[:, :, :dx]
+                current_face[:, :, :dx] = anchor_face[:, :, :dx]
             elif dx < 0:
-                current_face[:, :, dx:] = prev_face[:, :, dx:]
+                current_face[:, :, dx:] = anchor_face[:, :, dx:]
 
-        # --- 2. TEXTURE PRESERVATION (Frequency Separation) ---
+        # --- 2. TEXTURE & COLOR PRESERVATION ---
         if blend_texture and first_face is not None:
-            # Calibrate blur size based on model resolution (128, 256, 512)
+            # --- NOUVEAU : Color & Luminance Lock (AdaIN) ---
+            # Calcule les statistiques de couleur de la TOUTE PREMIÈRE passe
+            # et force l'itération actuelle à respecter cette même distribution.
+            # Cela bloque totalement l'effondrement vers des visages pâles/yeux bleus.
+            mean_first = first_face.mean(dim=(1, 2), keepdim=True)
+            std_first = first_face.std(dim=(1, 2), keepdim=True) + 1e-6
+
+            mean_curr = current_face.mean(dim=(1, 2), keepdim=True)
+            std_curr = current_face.std(dim=(1, 2), keepdim=True) + 1e-6
+
+            # Application de l'Adaptive Instance Normalization
+            current_face = (current_face - mean_curr) * (
+                std_first / std_curr
+            ) + mean_first
+            current_face = torch.clamp(current_face, 0.0, 1.0)
+
+            # --- Frequency Separation (Micro-détails) ---
             k = max(3, (H // 32) * 2 + 1)
             sigma = k * 0.3
-            blur = v2.GaussianBlur(kernel_size=k, sigma=sigma)
+            blur_tex = v2.GaussianBlur(kernel_size=k, sigma=sigma)
 
-            # Extract micro-details (pores, grain) from the very first pass
-            low_pass_first = blur(first_face)
+            low_pass_first = blur_tex(first_face)
             high_pass_first = first_face - low_pass_first
-
-            # Prevents severe RGB channel clipping (purple/green smudges)
-            # if structural features (like lips) mismatch slightly between iterations.
             high_pass_first = torch.clamp(high_pass_first, -0.3, 0.3) * 0.75
 
-            # Extract the new structure (reinforced identity) from the current pass
-            low_pass_curr = blur(current_face)
-
-            # Merge: New model identity + Detailed texture from pass 1
+            low_pass_curr = blur_tex(current_face)
             current_face = low_pass_curr + high_pass_first
 
-        # Safety clamp for color overflow after merging
         return torch.clamp(current_face, 0.0, 1.0)
 
     def get_swapped_and_prev_face(
