@@ -755,7 +755,17 @@ class VideoProcessor(QObject):
         if self.main_window.control["SendVirtCamFramesEnableToggle"] and self.virtcam:
             height, width, _ = frame.shape
             if self.virtcam.height != height or self.virtcam.width != width:
-                self.enable_virtualcam()  # Re-enable with new dimensions
+                # Resolution changed (e.g. source swap / restorer output differs).
+                # Avoid hammering OBS with rapid close/reopen cycles — schedule a
+                # single deferred restart so the driver gets adequate settling time.
+                # We skip this frame rather than sending one with the wrong size.
+                print(
+                    f"[INFO] VirtCam resolution changed "
+                    f"({self.virtcam.width}x{self.virtcam.height} → {width}x{height}). "
+                    f"Restarting virtual camera…"
+                )
+                self.enable_virtualcam()
+                return  # Frame already consumed; next tick will send at the new size.
 
             # Need to check again if virtcam was successfully re-enabled
             if self.virtcam:
@@ -2643,24 +2653,43 @@ class VideoProcessor(QObject):
             return
 
         self.disable_virtualcam()  # Close existing cam first
-        try:
-            backend_to_use = (
-                backend or self.main_window.control["VirtCamBackendSelection"]
-            )
-            print(
-                f"[INFO] Enabling virtual camera: {frame_width}x{frame_height} @ {int(current_fps)}fps, Backend: {backend_to_use}, Format: BGR"
-            )
-            self.virtcam = pyvirtualcam.Camera(
-                width=frame_width,
-                height=frame_height,
-                fps=int(current_fps),
-                backend=backend_to_use,
-                fmt=pyvirtualcam.PixelFormat.BGR,  # Processed frame is BGR
-            )
-            print(f"[INFO] Virtual camera '{self.virtcam.device}' started.")
-        except Exception as e:
-            print(f"[ERROR] Failed to enable virtual camera: {e}")
-            self.virtcam = None
+
+        # OBS Virtual Camera (and some other backends) uses a Windows kernel-mode
+        # virtual device.  If a new pyvirtualcam.Camera() is opened immediately
+        # after close(), the driver has not yet fully released the handle and the
+        # new connection is silently ignored by OBS — producing the symptom where
+        # the virtual cam appears to stop and cannot be reactivated without
+        # switching to another cam and back.  A short settling delay eliminates
+        # this race condition.
+        time.sleep(0.15)
+
+        backend_to_use = (
+            backend or self.main_window.control["VirtCamBackendSelection"]
+        )
+        print(
+            f"[INFO] Enabling virtual camera: {frame_width}x{frame_height} @ {int(current_fps)}fps, Backend: {backend_to_use}, Format: BGR"
+        )
+
+        for attempt in range(2):
+            try:
+                self.virtcam = pyvirtualcam.Camera(
+                    width=frame_width,
+                    height=frame_height,
+                    fps=int(current_fps),
+                    backend=backend_to_use,
+                    fmt=pyvirtualcam.PixelFormat.BGR,  # Processed frame is BGR
+                )
+                print(f"[INFO] Virtual camera '{self.virtcam.device}' started.")
+                break  # success — exit retry loop
+            except Exception as e:
+                if attempt == 0:
+                    # First attempt failed (driver may still be releasing the handle).
+                    # Wait longer and try once more before giving up.
+                    print(f"[WARN] Virtual camera open failed (attempt 1): {e}. Retrying in 500 ms…")
+                    time.sleep(0.5)
+                else:
+                    print(f"[ERROR] Failed to enable virtual camera: {e}")
+                    self.virtcam = None
 
     def disable_virtualcam(self):
         """Stops the pyvirtualcam device."""
