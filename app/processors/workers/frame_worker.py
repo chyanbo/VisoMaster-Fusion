@@ -147,6 +147,11 @@ class FrameWorker(threading.Thread):
         self.last_processed_frame_number = -1
         self.last_detected_faces: list = []
 
+        # VR-specific tracking state (kept separate from standard-mode state so
+        # switching modes does not corrupt either path's detection interval logic)
+        self.last_detected_faces_vr: list = []
+        self.last_processed_frame_number_vr: int = -1
+
         # VR specific constants
         self.VR_PERSPECTIVE_RENDER_SIZE = 512  # Pixels, for rendering perspective crops
         # VR-13: renamed from VR_DYNAMIC_FOV_PADDING_FACTOR and set to 1.5
@@ -876,6 +881,23 @@ class FrameWorker(threading.Thread):
         # geometrically invalid spherical coordinates.
         vr_rotation_angles = [0]
 
+        # Detection interval / previous-detections setup (mirrors standard-mode logic).
+        # When ByteTrack is OFF and detection_interval > 1, pass previous equirect
+        # bboxes so run_detect can use the cheaper track_faces fallback on non-keyframes.
+        # When ByteTrack is ON, run_detect handles tracking internally and ignores
+        # previous_detections, but we still maintain state for scene-cut recovery.
+        _vr_detection_interval = int(control.get("FaceDetectionIntervalSlider", 1))
+        _previous_faces_vr: list | None = None
+        with self.lock:
+            _last_detected_vr = self.last_detected_faces_vr
+            _last_frame_no_vr = self.last_processed_frame_number_vr
+        if (
+            len(_last_detected_vr) > 0
+            and self.frame_number % _vr_detection_interval != 0
+            and self.frame_number == _last_frame_no_vr + 1
+        ):
+            _previous_faces_vr = _last_detected_vr
+
         # Detection on full equirectangular image.
         # Use the standard (512, 512) input size — TRT engines are compiled for this shape.
         # A custom 2:1 size like (1024, 512) produces a (1, 3, 512, 1024) tensor that TRT
@@ -893,6 +915,7 @@ class FrameWorker(threading.Thread):
             from_points=False,
             rotation_angles=vr_rotation_angles,
             use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
+            previous_detections=_previous_faces_vr,
         )
 
         if not isinstance(bboxes_eq_np, np.ndarray):
@@ -901,8 +924,6 @@ class FrameWorker(threading.Thread):
         # FW-ROBUST-07: reshape 1-D bbox (e.g. single face returned as shape (4,) or (5,))
         if bboxes_eq_np.ndim == 1 and bboxes_eq_np.shape[0] in (4, 5):
             bboxes_eq_np = bboxes_eq_np.reshape(1, -1)
-        if len(bboxes_eq_np) == 0:
-            return original_equirect_tensor_for_vr
 
         # VR-03: replace custom O(n^2) distance-NMS with torchvision IoU-NMS
         # which runs in C++ and handles the standard suppress-by-overlap case correctly.
@@ -916,6 +937,20 @@ class FrameWorker(threading.Thread):
             # Use area as proxy score so larger faces are preferred (kept) by NMS
             _keep = torchvision.ops.nms(_boxes_t, _areas, iou_threshold=0.5)
             bboxes_eq_np = bboxes_eq_np[_keep.cpu().numpy()]
+
+        # Update VR tracking state for the next frame. Done here — post-NMS so the
+        # stored bboxes are clean, pre-VR-MIRROR so synthetic bboxes are not tracked.
+        _vr_state_for_next: list = (
+            [{"bbox": row[:4], "score": 1.0} for row in bboxes_eq_np]
+            if bboxes_eq_np.ndim == 2 and bboxes_eq_np.shape[0] > 0
+            else []
+        )
+        with self.lock:
+            self.last_detected_faces_vr = _vr_state_for_next
+            self.last_processed_frame_number_vr = self.frame_number
+
+        if len(bboxes_eq_np) == 0:
+            return original_equirect_tensor_for_vr
 
         # VR-MIRROR: in Both-Eyes mode, if a face is detected on one eye side but not
         # the other, synthesize a mirrored bbox on the missing side using the same
@@ -966,6 +1001,10 @@ class FrameWorker(threading.Thread):
         unmatched_compare_crops: list[torch.Tensor] = []
         compare_mode_vr_early = self.is_view_face_mask or self.is_view_face_compare
 
+        # Phase 1: extract all perspective crops and run landmark detection.
+        # Failures are kept (kps_on_crop=None) so Phase 2 can attempt to fill them
+        # from the partner eye view before discarding.
+        _crop_landmark_results: list[dict] = []
         for bbox_eq_single in bboxes_eq_np:
             if stop_event.is_set():
                 break
@@ -1036,21 +1075,69 @@ class FrameWorker(threading.Thread):
             kpss_5_crop = [kpss_5_crop_list] if len(kpss_5_crop_list) > 0 else []
             kpss_crop = [kpss_crop_list] if len(kpss_crop_list) > 0 else []
 
-            if not (
+            # FW-BUG-07: fixed check — kpss_crop is a list not ndarray; use truthiness
+            landmark_ok = (
                 isinstance(kpss_5_crop, np.ndarray)
                 and kpss_5_crop.shape[0] > 0
                 or isinstance(kpss_5_crop, list)
                 and len(kpss_5_crop) > 0
-            ):
-                del face_crop_tensor
+            )
+            _crop_landmark_results.append(
+                {
+                    "theta": theta,
+                    "phi": phi,
+                    "original_eye_side": original_eye_side,
+                    "face_crop_tensor": face_crop_tensor,
+                    "fov_used_for_crop": dynamic_fov_for_crop,
+                    "kps_on_crop": kpss_5_crop[0] if landmark_ok else None,
+                    "kps_all_on_crop": (
+                        kpss_crop[0] if (landmark_ok and kpss_crop) else None
+                    ),
+                }
+            )
+
+        # VR-LANDMARK-MIRROR: in Both-Eyes mode, if landmark detection failed for a
+        # face crop but the partner eye view (same face, other VR180 half) succeeded,
+        # reuse those keypoints. In the equirectangular projection the partner's theta
+        # is exactly ±180° away (mirrored x-offset = width/2). A small angular
+        # tolerance (1° theta, 0.5° phi) also catches naturally-detected stereo pairs
+        # whose detector bboxes differ by a few pixels.
+        if control.get("VR180EyeModeSelection", "Both Eyes") != "Single Eye":
+            _kps_cache: dict[tuple[float, float], tuple] = {}
+            for _fd in _crop_landmark_results:
+                if _fd["kps_on_crop"] is not None:
+                    _kps_cache[(_fd["theta"], _fd["phi"])] = (
+                        _fd["kps_on_crop"],
+                        _fd["kps_all_on_crop"],
+                    )
+            for _fd in _crop_landmark_results:
+                if _fd["kps_on_crop"] is None:
+                    _mir_theta = (
+                        _fd["theta"] + 180.0
+                        if "L" in _fd["original_eye_side"]
+                        else _fd["theta"] - 180.0
+                    )
+                    for (_ct, _cp), _ckps in _kps_cache.items():
+                        if abs(_ct - _mir_theta) < 1.0 and abs(_cp - _fd["phi"]) < 0.5:
+                            _fd["kps_on_crop"], _fd["kps_all_on_crop"] = _ckps
+                            break
+
+        # Phase 2: recognition and target matching for all faces with valid landmarks.
+        for _fd in _crop_landmark_results:
+            if stop_event.is_set():
+                break
+
+            if _fd["kps_on_crop"] is None:
+                del _fd["face_crop_tensor"]
                 continue
 
-            kps_on_crop = kpss_5_crop[0]
-            # FW-BUG-07: fixed check — kpss_crop is a list not ndarray; use truthiness
-            if kpss_crop:
-                kps_all_on_crop = kpss_crop[0]
-            else:
-                kps_all_on_crop = None
+            kps_on_crop = _fd["kps_on_crop"]
+            kps_all_on_crop = _fd["kps_all_on_crop"]
+            face_crop_tensor = _fd["face_crop_tensor"]
+            theta = _fd["theta"]
+            phi = _fd["phi"]
+            original_eye_side = _fd["original_eye_side"]
+            dynamic_fov_for_crop = _fd["fov_used_for_crop"]
 
             face_emb_crop, _ = self.models_processor.run_recognize_direct(
                 face_crop_tensor,
