@@ -14,7 +14,7 @@ from app.processors.utils import faceutil
 try:
     from app.processors.external.yolox.tracker.byte_tracker import BYTETracker
 except ImportError:
-    BYTETracker = None
+    BYTETracker = None  # type: ignore[assignment,misc]
 
 
 class FaceDetectors:
@@ -39,7 +39,7 @@ class FaceDetectors:
 
         # Tracking State
         self.tracker = None
-        self.track_history = {}  # {track_id: {'cum_score': float, 'last_seen': int}}
+        self.track_history: dict = {}  # {track_id: {'cum_score': float, 'last_seen': int}}
         self._track_history_lock = threading.Lock()
         # BT-06/BT-07: dedicated lock for BYTETracker instance and frame_id to prevent
         # concurrent workers from corrupting Kalman filter state
@@ -553,7 +553,7 @@ class FaceDetectors:
 
         # BT-02: guarantee det_scores is always a 1-D array so downstream boolean
         # indexing and math operations behave consistently (some detectors return (N,1))
-        if hasattr(det_scores, 'flatten'):
+        if hasattr(det_scores, "flatten"):
             det_scores = det_scores.flatten()
 
         # Initialize score_values so it is always bound before the ByteTrack block
@@ -587,7 +587,9 @@ class FaceDetectors:
                     tracker_input = np.column_stack([det, scores_for_tracker])
                     online_targets = self.tracker.update(tracker_input, img_hw, img_hw)
                 else:
-                    online_targets = self.tracker.update(np.empty((0, 5)), img_hw, img_hw)
+                    online_targets = self.tracker.update(
+                        np.empty((0, 5)), img_hw, img_hw
+                    )
 
                 # BT-13: scene-cut detection — if fewer than 30% of active tracks matched,
                 # the scene has likely changed; reset the tracker to avoid stale Kalman state
@@ -595,11 +597,13 @@ class FaceDetectors:
                 matched_count = len(online_targets)
                 if active_before > 0 and matched_count / active_before < 0.3:
                     print("[ByteTrack] Scene cut detected — resetting tracker")
+
                     class TrackerArgs:  # noqa: F811 — local redefinition is intentional
                         track_thresh = 0.4
                         track_buffer = 30
                         match_thresh = 0.8
                         mot20 = False
+
                     self.tracker = BYTETracker(TrackerArgs())
                     with self._track_history_lock:
                         self.track_history.clear()
@@ -610,7 +614,9 @@ class FaceDetectors:
             tracked_kpss_all = []
             tracked_scores = []
 
-            current_frame_num = getattr(self.models_processor, 'current_frame_number', 0)
+            current_frame_num = getattr(
+                self.models_processor, "current_frame_number", 0
+            )
 
             for t in online_targets:
                 tlwh = t.tlwh
@@ -635,7 +641,8 @@ class FaceDetectors:
                         if tid in self.track_history:
                             prev_score = self.track_history[tid]["cum_score"]
                             cum_score = (
-                                self.lambda_s * t.score + (1 - self.lambda_s) * prev_score
+                                self.lambda_s * t.score
+                                + (1 - self.lambda_s) * prev_score
                             )
                         else:
                             cum_score = t.score
@@ -667,7 +674,8 @@ class FaceDetectors:
             track_buffer = 30
             with self._track_history_lock:
                 stale_ids = [
-                    tid for tid, data in self.track_history.items()
+                    tid
+                    for tid, data in self.track_history.items()
                     if current_frame_num - data.get("last_seen", 0) > track_buffer
                 ]
                 for tid in stale_ids:
@@ -747,7 +755,9 @@ class FaceDetectors:
 
         for angle in rotation_angles:
             if angle != 0:
-                aimg, M = faceutil.transform(det_img, (cx, cy), max(final_input_size), 1.0, angle)
+                aimg, M = faceutil.transform(
+                    det_img, (cx, cy), max(final_input_size), 1.0, angle
+                )
                 IM = faceutil.invertAffineTransform(M)
                 aimg = torch.unsqueeze(aimg, 0).contiguous()
             else:
@@ -891,7 +901,12 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
+            return (
+                np.empty((0, 4)),
+                np.empty((0, 5, 2)),
+                np.empty((0, 5, 2)),
+                np.empty((0,)),
+            )
 
         # Optionally refine landmarks with a secondary model
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)
@@ -921,7 +936,9 @@ class FaceDetectors:
 
         for angle in rotation_angles:
             if angle != 0:
-                aimg, M = faceutil.transform(det_img, (cx, cy), max(final_input_size), 1.0, angle)
+                aimg, M = faceutil.transform(
+                    det_img, (cx, cy), max(final_input_size), 1.0, angle
+                )
                 IM = faceutil.invertAffineTransform(M)
                 aimg = torch.unsqueeze(aimg, 0).contiguous()
             else:
@@ -1064,7 +1081,12 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
+            return (
+                np.empty((0, 4)),
+                np.empty((0, 5, 2)),
+                np.empty((0, 5, 2)),
+                np.empty((0,)),
+            )
 
         # Optionally refine landmarks with a secondary model
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)
@@ -1227,7 +1249,12 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
+            return (
+                np.empty((0, 4)),
+                np.empty((0, 5, 2)),
+                np.empty((0, 5, 2)),
+                np.empty((0,)),
+            )
 
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)
 
@@ -1436,6 +1463,11 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
+            return (
+                np.empty((0, 4)),
+                np.empty((0, 5, 2)),
+                np.empty((0, 5, 2)),
+                np.empty((0,)),
+            )
 
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)

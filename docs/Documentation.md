@@ -122,7 +122,7 @@ VMF will ask you if you want to open your last workspace (i.e, the workspace use
 - Save Embeddings: If you already opened an embedding json file, this act as a “Save” button. If no embedding file has been opened, this will act as a “Save as” button.
 - Save embeddings As : Save as action.
 
-An embeddings file contains one or more embedding target faces. An embedding is the merge of multiples face to create a embedded target face to be used for a face swap. An embedded target face can increase the likeness of the face you will use in comparison to a single image. 
+An embeddings file contains one or more embedding target faces. An embedding is the merge of multiples face to create a embedded target face to be used for a face swap. An embedded target face can increase the likeness of the face you will use in comparison to a single image.
 
 - The merge type to create the embeddings can be ‘Mean’ or ‘Median’.
 - You can use as many faces as you want but more than 5-6 faces for a mean merge embedding won’t increase the likeness anymore.
@@ -193,7 +193,7 @@ Once these options are selected, you’re ready for your first faceswap.
 
 ![alt text](Images/42.png)
 
-The face will appear on the “Faces Panel”. 
+The face will appear on the “Faces Panel”.
 
 1. You may have to click again the the input face.
 2. Click on “Swap Faces”.
@@ -216,11 +216,11 @@ The swapper model is the main feature used for face swapping. It's the most impo
 
 ![alt text](<Images/2026-02-24 16_39_27-Clipboard.png>)
 
-The most used and still the better one in most cases is Inswapper. InStyleSwapper A / C can sometimes provide better alternatives. 
+The most used and still the better one in most cases is Inswapper. InStyleSwapper A / C can sometimes provide better alternatives.
 
 Swapper models consume different compute power.
 
-After trying to alternate between these three for a while, I just stick with Inswapper now. 
+After trying to alternate between these three for a while, I just stick with Inswapper now.
 
 - DeepFaceLive (DFM): Give you the ability to use DFL Models inside VisoMaster. It uses .dfm files. These files aren’t made available in VisoMaster. You’ll have to find them yourself. You can also train your own models to faceswap a specific face. It can requires weeks of work to achieve a good result with a model creation. To use the feature, simply place your .dfm files inside “VisoMaster-Fusion\model_assets\dfm_models” and select the option to have a list of usable model.
 
@@ -334,7 +334,7 @@ The occlusion mask is allowing object in front of the face to still appear after
 > [!NOTE]
 > The occlusion mask feature is not needed most of the time with xseg because it is far superior in most cases. The occlusion mask can still be useful in very rare cases when xseg fail to let all the “objects” in front of the face to appear.
 
-> [!TIP] 
+> [!TIP]
 I only use occlusion with the specific cases explained above.
 
 
@@ -353,7 +353,7 @@ We can see that xseg alone is struggling. With some additional occlusion, the is
 
 No that this is a very specific example but generally xseg is doing a way better job than occlusion.
 
-> [!TIP] 
+> [!TIP]
 I would recommend to use xseg around between -2 and -5 with occlusion mask off in general. Activate occlusion only when needed. It's also better to add some blur to smooth out the result.
 
 ![alt text](Images/15.png)
@@ -507,7 +507,7 @@ Recommended configuration in the build listed at the beginning of this document
 -	Mode 2: Disable it if the effect is too strong or if the skin texture has a cracked appearance.
 -	As mention earlier, avoid Face blend above 3 as it reduce the effect of the transfer texture.
 
-I won’t go into every detail of every option. It’s more a game of try and try again until you’re satisfied with the result. 
+I won’t go into every detail of every option. It’s more a game of try and try again until you’re satisfied with the result.
 From these settings, the most important is to play with the value on the “mask features exclude” as it grows or shrink the mask to recover the input face parts. Since the blend is not good, it can be useful to change the size of the mask to hide this problem.
 
 For example, in the following picture, the mask on the mouth is clearly visible. On the second pic, the mask is bigger and for me less noticeable.

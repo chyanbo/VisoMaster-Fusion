@@ -505,7 +505,9 @@ class FrameEnhancers:
 
                 # Blend
                 alpha = float(control["FrameEnhancerBlendSlider"]) / 100.0
-                img = torch.add(torch.mul(hires, alpha), torch.mul(img_normalized, 1 - alpha))
+                img = torch.add(
+                    torch.mul(hires, alpha), torch.mul(img_normalized, 1 - alpha)
+                )
 
                 img = img.type(torch.uint8)
 

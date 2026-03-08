@@ -48,7 +48,10 @@ class FaceSwappers:
     def _manage_model(self, new_model_name):
         # FS-RACE-01: protect read-modify-write of current_swapper_model with lock
         with self.models_processor.model_lock:
-            if self.current_swapper_model and self.current_swapper_model != new_model_name:
+            if (
+                self.current_swapper_model
+                and self.current_swapper_model != new_model_name
+            ):
                 self.models_processor.unload_model(self.current_swapper_model)
             # FS-BUG-07: current_swapper_model is committed only after load confirmation (see _load_swapper_model)
 
@@ -103,7 +106,10 @@ class FaceSwappers:
     ):
         # FS-RACE-01: protect read-modify-write of current_arcface_model with lock
         with self.models_processor.model_lock:
-            if self.current_arcface_model and self.current_arcface_model != arcface_model:
+            if (
+                self.current_arcface_model
+                and self.current_arcface_model != arcface_model
+            ):
                 self.models_processor.unload_model(self.current_arcface_model)
             self.current_arcface_model = arcface_model
 

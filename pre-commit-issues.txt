@@ -1,0 +1,149 @@
+Check for UTF-8 encoding.............................(no files to check)Skipped
+trim trailing whitespace.................................................Passed
+fix end of files.........................................................Passed
+check yaml...............................................................Passed
+check toml...............................................................Passed
+check for merge conflicts................................................Passed
+check for case conflicts.................................................Passed
+check for added large files..............................................Passed
+ruff (legacy alias)......................................................Failed
+- hook id: ruff
+- exit code: 1
+
+F841 Local variable `pt4` is assigned to but never used
+    --> app/processors/utils/faceutil.py:1489:9
+     |
+1487 |     if use_lip:
+1488 |         # F-08: store intermediate result in distinct variable to avoid shadowing pt9
+1489 |         pt4 = np.stack(
+     |         ^^^
+1490 |             [
+1491 |                 (pt9[2] + pt9[3]) / 2,  # left eye
+     |
+help: Remove assignment to unused variable `pt4`
+
+Found 1 error.
+No fixes available (1 hidden fix can be enabled with the `--unsafe-fixes` option).
+
+ruff format..............................................................Passed
+mypy.....................................................................Failed
+- hook id: mypy
+- exit code: 1
+
+app/processors/external/yolox/tracker/basetrack.py:19: error: Need type annotation for "history"  [var-annotated]
+app/processors/external/yolox/tracker/basetrack.py:20: error: Need type annotation for "features" (hint: "features: list[<type>] = ...")  [var-annotated]
+app/processors/external/Equirec2Perspec_vr.py:8: error: Need type annotation for "_PERSP_GRID_CACHE"  [var-annotated]
+app/processors/external/yolox/tracker/byte_tracker.py:141: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/external/yolox/tracker/byte_tracker.py:142: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/external/yolox/tracker/byte_tracker.py:143: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/external/yolox/tracker/byte_tracker.py:192: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/external/cliplib/clip.py:59: error: Module has no attribute "request"  [attr-defined]
+app/ui/launcher/launcher_window.py:123: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/frame_edits.py:136: error: "None" not callable  [misc]
+app/processors/frame_edits.py:174: error: "None" not callable  [misc]
+app/processors/frame_edits.py:610: error: "None" not callable  [misc]
+app/processors/face_restorers.py:489: error: Need type annotation for "keep_alive_tensors" (hint: "keep_alive_tensors: list[<type>] = ...")  [var-annotated]
+app/processors/face_masks.py:504: error: Need type annotation for "mouth_groups" (hint: "mouth_groups: dict[<type>, <type>] = ...")  [var-annotated]
+app/processors/face_masks.py:528: error: Need type annotation for "fp_groups" (hint: "fp_groups: dict[<type>, <type>] = ...")  [var-annotated]
+app/processors/face_masks.py:613: error: Need type annotation for "tex_groups" (hint: "tex_groups: dict[<type>, <type>] = ...")  [var-annotated]
+app/processors/face_detectors.py:17: error: Cannot assign to a type  [misc]
+app/processors/face_detectors.py:17: error: Incompatible types in assignment (expression has type "None", variable has type "type[BYTETracker]")  [assignment]
+app/processors/face_detectors.py:42: error: Need type annotation for "track_history" (hint: "track_history: dict[<type>, <type>] = ...")  [var-annotated]
+app/ui/widgets/widget_components.py:32: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:34: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:52: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:77: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:1619: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:1623: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:1624: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:1625: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:1626: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/widget_components.py:1629: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/actions/video_control_actions.py:964: error: Incompatible return value type (got "MarkerData | None", expected "dict[Any, Any] | None")  [return-value]
+app/ui/widgets/actions/video_control_actions.py:976: error: Incompatible return value type (got "MarkerData | None", expected "dict[Any, Any] | None")  [return-value]
+app/ui/widgets/actions/control_actions.py:385: error: Argument 1 to "get" of "dict" has incompatible type "int | float | str"; expected "str"  [arg-type]
+app/ui/widgets/actions/card_actions.py:125: error: Incompatible types in assignment (expression has type "list[Never]", variable has type "bool")  [assignment]
+app/ui/widgets/actions/card_actions.py:135: error: "bool" has no attribute "append"  [attr-defined]
+app/ui/widgets/actions/card_actions.py:139: error: "Literal[True]" has no attribute "__iter__" (not iterable)  [attr-defined]
+app/ui/widgets/ui_workers.py:276: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/widgets/ui_workers.py:314: error: Need type annotation for "items_snapshot" (hint: "items_snapshot: list[<type>] = ...")  [var-annotated]
+app/ui/widgets/ui_workers.py:315: error: Need type annotation for "include_file_types" (hint: "include_file_types: list[<type>] = ...")  [var-annotated]
+app/processors/models_processor.py:240: error: Need type annotation for "models_pending_build" (hint: "models_pending_build: set[<type>] = ...")  [var-annotated]
+app/ui/widgets/actions/job_manager_actions.py:335: error: Incompatible types in assignment (expression has type "bool", variable has type "InputFacesLoaderWorker | None")  [assignment]
+app/processors/workers/frame_worker.py:128: error: Need type annotation for "last_detected_faces" (hint: "last_detected_faces: list[<type>] = ...")  [var-annotated]
+app/processors/workers/frame_worker.py:435: error: Incompatible types in assignment (expression has type "list[tuple[str, TargetFaceCardButton]]", variable has type "dict_items[Any, Any]")  [assignment]
+app/processors/workers/frame_worker.py:442: error: Need type annotation for "face_specific_params_dict"  [var-annotated]
+app/processors/workers/frame_worker.py:536: error: Argument 2 to "keypoints_adjustments" has incompatible type "ParametersDict"; expected "dict[Any, Any]"
+  [arg-type]
+app/processors/workers/frame_worker.py:582: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:598: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:710: error: Value of type "Any | None" is not indexable  [index]
+app/processors/workers/frame_worker.py:762: error: Value of type "Any | None" is not indexable  [index]
+app/processors/workers/frame_worker.py:804: error: Incompatible types in assignment (expression has type "EquirectangularConverter", variable has type "None")  [assignment]
+app/processors/workers/frame_worker.py:807: error: Incompatible types in assignment (expression has type "tuple[Any, Any]", variable has type "None")  [assignment]
+app/processors/workers/frame_worker.py:872: error: "None" has no attribute "calculate_theta_phi_from_bbox"  [attr-defined]
+app/processors/workers/frame_worker.py:878: error: "None" has no attribute "width"  [attr-defined]
+app/processors/workers/frame_worker.py:883: error: "None" has no attribute "width"  [attr-defined]
+app/processors/workers/frame_worker.py:888: error: "None" has no attribute "height"  [attr-defined]
+app/processors/workers/frame_worker.py:906: error: "None" has no attribute "get_perspective_crop"  [attr-defined]
+app/processors/workers/frame_worker.py:1278: error: Argument 2 to "keypoints_adjustments" has incompatible type "ParametersDict"; expected "dict[Any, Any]"  [arg-type]
+app/processors/workers/frame_worker.py:1302: error: Argument "parameters" to "swap_core" of "FrameWorker" has incompatible type "ParametersDict"; expected
+ "dict[Any, Any] | None"  [arg-type]
+app/processors/workers/frame_worker.py:1460: error: Need type annotation for "face_specific"  [var-annotated]
+app/processors/workers/frame_worker.py:1461: error: Argument 1 to "get" of "dict" has incompatible type "Any | None"; expected "str"  [arg-type]
+app/processors/workers/frame_worker.py:1490: error: Need type annotation for "face_specific"  [var-annotated]
+app/processors/workers/frame_worker.py:1491: error: Argument 1 to "get" of "dict" has incompatible type "Any | None"; expected "str"  [arg-type]
+app/processors/workers/frame_worker.py:1503: error: Argument 3 to "get_cropped_face_using_kps" of "FrameWorker" has incompatible type "ParametersDict"; expected "dict[Any, Any]"  [arg-type]
+app/processors/workers/frame_worker.py:2722: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2732: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2738: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2763: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2764: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2780: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2793: error: Item "None" of "Any | None" has no attribute "clone"  [union-attr]
+app/processors/workers/frame_worker.py:2938: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2981: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2982: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2983: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:2985: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3018: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3019: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3154: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3155: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3156: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3158: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3202: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3222: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3224: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3351: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3459: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3476: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3477: error: "None" not callable  [misc]
+app/processors/workers/frame_worker.py:3508: error: "None" not callable  [misc]
+app/processors/video_processor.py:322: error: Item "int" of "int | float | str" has no attribute "replace"  [union-attr]
+app/processors/video_processor.py:322: error: Item "float" of "int | float | str" has no attribute "replace"  [union-attr]
+app/processors/video_processor.py:453: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/video_processor.py:454: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/processors/video_processor.py:1037: error: Value of type "Any | None" is not indexable  [index]
+app/processors/video_processor.py:1077: error: Value of type "Any | None" is not indexable  [index]
+app/ui/main_ui.py:73: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:74: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:90: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:93: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:96: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:99: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:100: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:103: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:116: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:117: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:118: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:119: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:121: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:123: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:124: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:128: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:131: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+app/ui/main_ui.py:135: note: By default the bodies of untyped functions are not checked, consider using --check-untyped-defs  [annotation-unchecked]
+Found 76 errors in 15 files (checked 58 source files)
+
+use logger.warning(......................................................Passed

@@ -57,7 +57,9 @@ def open_embeddings_from_file(main_window: "MainWindow"):
                         embedding_id=str(uuid.uuid1().int),
                     )
         except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
-            QtWidgets.QMessageBox.critical(main_window, "Error", f"Failed to load embeddings: {e}")
+            QtWidgets.QMessageBox.critical(
+                main_window, "Error", f"Failed to load embeddings: {e}"
+            )
             return
 
     main_window.loaded_embedding_filename = (
@@ -606,7 +608,9 @@ def save_current_workspace(
     for face_id, input_face in main_window.input_faces.items():
         kv_map_path = None
         if is_denoiser_enabled and hasattr(input_face, "kv_map") and input_face.kv_map:
-            kv_data_dir = str(main_window.project_root_path / "model_assets" / "reference_kv_data")
+            kv_data_dir = str(
+                main_window.project_root_path / "model_assets" / "reference_kv_data"
+            )
             os.makedirs(kv_data_dir, exist_ok=True)
             kv_map_path = os.path.join(kv_data_dir, f"input_{input_face.face_id}.pt")
             try:
@@ -792,7 +796,9 @@ def save_current_job(main_window: "MainWindow"):
     for face_id, input_face in main_window.input_faces.items():
         kv_map_path = None
         if is_denoiser_enabled and hasattr(input_face, "kv_map") and input_face.kv_map:
-            kv_data_dir = str(main_window.project_root_path / "model_assets" / "reference_kv_data")
+            kv_data_dir = str(
+                main_window.project_root_path / "model_assets" / "reference_kv_data"
+            )
             os.makedirs(kv_data_dir, exist_ok=True)
             kv_map_path = os.path.join(kv_data_dir, f"input_{input_face.face_id}.pt")
             try:

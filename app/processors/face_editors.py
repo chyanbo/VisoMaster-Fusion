@@ -63,6 +63,7 @@ class FaceEditors:
         except Exception as e:
             # FE-02: broaden exception handling to catch any load failure, not just FileNotFoundError
             import logging
+
             logging.warning(f"lip_array load failed: {e}")
             self.lp_lip_array = None
 
@@ -79,9 +80,12 @@ class FaceEditors:
             The loaded data from the pickle file.
         """
         import logging
+
         # FE-01: SHA-256 verification before loading the pickle file
         # Update KNOWN_LIP_ARRAY_SHA256 with the trusted file's digest to enforce integrity.
-        KNOWN_LIP_ARRAY_SHA256 = None  # Set to a hex-digest string to enable strict check
+        KNOWN_LIP_ARRAY_SHA256 = (
+            None  # Set to a hex-digest string to enable strict check
+        )
 
         # Use os.path.join for better cross-platform compatibility.
         lip_array_path = os.path.join(models_dir, "liveportrait_onnx", "lip_array.pkl")
@@ -234,7 +238,9 @@ class FaceEditors:
                             )
                         )
                     # FE-05: move models_trt access inside the face_editor_type guard
-                    motion_extractor_model = self.models_processor.models_trt[model_name]
+                    motion_extractor_model = self.models_processor.models_trt[
+                        model_name
+                    ]
                 else:
                     motion_extractor_model = None
 
@@ -394,9 +400,9 @@ class FaceEditors:
                             )
                         )
                     # FE-05: move models_trt access inside the face_editor_type guard
-                    appearance_feature_extractor_model = self.models_processor.models_trt[
-                        model_name
-                    ]
+                    appearance_feature_extractor_model = (
+                        self.models_processor.models_trt[model_name]
+                    )
                 else:
                     appearance_feature_extractor_model = None
 

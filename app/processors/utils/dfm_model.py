@@ -20,6 +20,7 @@ def _load_model_bytes_with_shape_inference(model_path: str) -> bytes:
     try:
         import onnx
         from onnx import shape_inference as onnx_shape_inference
+
         model_proto = onnx.load(str(model_path))
         model_proto = onnx_shape_inference.infer_shapes(model_proto)
         return model_proto.SerializeToString()
@@ -53,10 +54,14 @@ class DFMModel:
             if trt_error:
                 # Strip TensorRT from the provider list and retry on CUDA/CPU.
                 fallback_providers = [
-                    p for p in self.providers
-                    if (p[0] if isinstance(p, (list, tuple)) else p) != "TensorrtExecutionProvider"
+                    p
+                    for p in self.providers
+                    if (p[0] if isinstance(p, (list, tuple)) else p)
+                    != "TensorrtExecutionProvider"
                 ]
-                print(f"[WARN] DFM model TensorRT load failed ({e}); retrying without TensorRT.")
+                print(
+                    f"[WARN] DFM model TensorRT load failed ({e}); retrying without TensorRT."
+                )
                 try:
                     sess = self._sess = onnxruntime.InferenceSession(
                         model_bytes, providers=fallback_providers

@@ -12,7 +12,7 @@ import numpy
 from PIL import Image
 from PySide6 import QtGui, QtWidgets, QtCore
 
-from app.helpers.typing_helper import ControlTypes, FacesParametersTypes
+from app.helpers.typing_helper import ControlTypes, FacesParametersTypes, MarkerData
 from app.helpers.miscellaneous import get_video_rotation
 
 if TYPE_CHECKING:
@@ -804,7 +804,9 @@ def record_video(main_window: "MainWindow", checked: bool):
         # callers.
         #
         # Do NOT prompt when this stop was initiated programmatically by Job Manager.
-        if (video_processor.is_processing_segments or video_processor.recording) and not job_mgr_flag:
+        if (
+            video_processor.is_processing_segments or video_processor.recording
+        ) and not job_mgr_flag:
             try:
                 box = QtWidgets.QMessageBox(main_window)
                 box.setIcon(QtWidgets.QMessageBox.Warning)
@@ -837,7 +839,7 @@ def record_video(main_window: "MainWindow", checked: bool):
                 main_window.buttonMediaRecord.blockSignals(False)
                 set_record_button_icon_to_stop(main_window)
                 return
-            
+
         if video_processor.is_processing_segments:
             print(
                 "[INFO] Record button released: User requested stop during segment processing. Finalizing..."
@@ -949,7 +951,7 @@ def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
 
 def _get_marker_data_for_position(
     main_window: "MainWindow", new_position: int
-) -> dict | None:
+) -> MarkerData | None:
     """
     Finds the marker data that should be active at a given frame position.
     It looks for the marker at the exact position, or the nearest one *before* it.

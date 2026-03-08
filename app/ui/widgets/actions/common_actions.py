@@ -162,7 +162,10 @@ def update_parameter(
         # BUG-16 / THREAD-03: feeder_parameters None check moved inside the lock to prevent TOCTOU race
         if main_window.video_processor.processing:
             with main_window.video_processor.state_lock:
-                if main_window.video_processor.feeder_parameters and face_id in main_window.video_processor.feeder_parameters:
+                if (
+                    main_window.video_processor.feeder_parameters
+                    and face_id in main_window.video_processor.feeder_parameters
+                ):
                     main_window.video_processor.feeder_parameters[face_id][
                         parameter_name
                     ] = parameter_value
@@ -187,7 +190,7 @@ def update_parameter(
 
 def refresh_frame(main_window: "MainWindow"):
     # PERF-05: Skip frame refresh if a batch update is in progress
-    if getattr(main_window, '_batch_update_in_progress', False):
+    if getattr(main_window, "_batch_update_in_progress", False):
         return
     video_processor = main_window.video_processor
     if not video_processor.processing:
@@ -254,20 +257,38 @@ def show_hide_related_widgets(
                     if selection_condition_met and toggle_condition_met:
                         current_widget.show()
                         # QUAL-15: Guard attribute access with hasattr/None checks (CASE 1 show path)
-                        if hasattr(current_widget, 'label_widget') and current_widget.label_widget:
+                        if (
+                            hasattr(current_widget, "label_widget")
+                            and current_widget.label_widget
+                        ):
                             current_widget.label_widget.show()
-                        if hasattr(current_widget, 'reset_default_button') and current_widget.reset_default_button:
+                        if (
+                            hasattr(current_widget, "reset_default_button")
+                            and current_widget.reset_default_button
+                        ):
                             current_widget.reset_default_button.show()
-                        if hasattr(current_widget, 'line_edit') and current_widget.line_edit:
+                        if (
+                            hasattr(current_widget, "line_edit")
+                            and current_widget.line_edit
+                        ):
                             current_widget.line_edit.show()
                     else:
                         current_widget.hide()
                         # QUAL-15: Guard attribute access with hasattr/None checks (CASE 1 hide path)
-                        if hasattr(current_widget, 'label_widget') and current_widget.label_widget:
+                        if (
+                            hasattr(current_widget, "label_widget")
+                            and current_widget.label_widget
+                        ):
                             current_widget.label_widget.hide()
-                        if hasattr(current_widget, 'reset_default_button') and current_widget.reset_default_button:
+                        if (
+                            hasattr(current_widget, "reset_default_button")
+                            and current_widget.reset_default_button
+                        ):
                             current_widget.reset_default_button.hide()
-                        if hasattr(current_widget, 'line_edit') and current_widget.line_edit:
+                        if (
+                            hasattr(current_widget, "line_edit")
+                            and current_widget.line_edit
+                        ):
                             current_widget.line_edit.hide()
 
         # --- CASE 2: PARENT IS A TOGGLE BUTTON ---
@@ -352,20 +373,38 @@ def show_hide_related_widgets(
                     if selection_condition_met and toggle_condition_met:
                         current_widget.show()
                         # QUAL-15: Guard attribute access with hasattr/None checks (CASE 2 show path)
-                        if hasattr(current_widget, 'label_widget') and current_widget.label_widget:
+                        if (
+                            hasattr(current_widget, "label_widget")
+                            and current_widget.label_widget
+                        ):
                             current_widget.label_widget.show()
-                        if hasattr(current_widget, 'reset_default_button') and current_widget.reset_default_button:
+                        if (
+                            hasattr(current_widget, "reset_default_button")
+                            and current_widget.reset_default_button
+                        ):
                             current_widget.reset_default_button.show()
-                        if hasattr(current_widget, 'line_edit') and current_widget.line_edit:
+                        if (
+                            hasattr(current_widget, "line_edit")
+                            and current_widget.line_edit
+                        ):
                             current_widget.line_edit.show()
                     else:
                         current_widget.hide()
                         # QUAL-15: Guard attribute access with hasattr/None checks (CASE 2 hide path)
-                        if hasattr(current_widget, 'label_widget') and current_widget.label_widget:
+                        if (
+                            hasattr(current_widget, "label_widget")
+                            and current_widget.label_widget
+                        ):
                             current_widget.label_widget.hide()
-                        if hasattr(current_widget, 'reset_default_button') and current_widget.reset_default_button:
+                        if (
+                            hasattr(current_widget, "reset_default_button")
+                            and current_widget.reset_default_button
+                        ):
                             current_widget.reset_default_button.hide()
-                        if hasattr(current_widget, 'line_edit') and current_widget.line_edit:
+                        if (
+                            hasattr(current_widget, "line_edit")
+                            and current_widget.line_edit
+                        ):
                             current_widget.line_edit.hide()
 
             parent_widget.start_animation()
@@ -443,7 +482,7 @@ def set_gpu_memory_progressbar_value(
 
     # BUG-05: Guard against division by zero; PERF-03: Only call setStyleSheet when threshold crosses
     is_high = memory_total > 0 and (memory_used / memory_total) > 0.85
-    was_high = getattr(main_window, '_vram_high_style_active', None)
+    was_high = getattr(main_window, "_vram_high_style_active", None)
     if is_high != was_high:
         main_window._vram_high_style_active = is_high
         if is_high:

@@ -237,7 +237,7 @@ class ModelsProcessor(QtCore.QObject):
         }
         # A set to keep track of models that have been loaded but
         # have not had their engine built (lazy build).
-        self.models_pending_build = set()
+        self.models_pending_build: set = set()
         self.providers = [
             ("TensorrtExecutionProvider", self.trt_ep_options),
             ("CUDAExecutionProvider"),
@@ -582,7 +582,9 @@ class ModelsProcessor(QtCore.QObject):
                             f"[WARN] Failed to load/build TRT engine for '{model_name}'. Falling back to ONNX Runtime."
                         )
 
-            build_was_triggered = False  # MP-05: flag to track if build dialog was shown
+            build_was_triggered = (
+                False  # MP-05: flag to track if build dialog was shown
+            )
             is_tensorrt_load = any(
                 (p[0] if isinstance(p, tuple) else p) == "TensorrtExecutionProvider"
                 for p in self.providers
@@ -654,7 +656,9 @@ class ModelsProcessor(QtCore.QObject):
                                     # Run a local event loop to keep the GUI responsive.
                                     while probe_process.is_alive():
                                         QtCore.QCoreApplication.processEvents()
-                                        time.sleep(0.02)  # Yield to other threads/processes
+                                        time.sleep(
+                                            0.02
+                                        )  # Yield to other threads/processes
 
                                     # MP-24: join the probe process after the spin loop
                                     probe_process.join()
@@ -2042,9 +2046,16 @@ class ModelsProcessor(QtCore.QObject):
 
                     # MP-10: Pre-allocate loop-invariant-shape buffers outside the loop
                     latent_shape = lq_latent_x0_scaled_for_unet.shape
-                    e_t_cond = torch.empty(latent_shape, dtype=torch.float32, device=self.device)
+                    e_t_cond = torch.empty(
+                        latent_shape, dtype=torch.float32, device=self.device
+                    )
                     unet_input_cond = torch.empty(
-                        (latent_shape[0], latent_shape[1] * 2, latent_shape[2], latent_shape[3]),
+                        (
+                            latent_shape[0],
+                            latent_shape[1] * 2,
+                            latent_shape[2],
+                            latent_shape[3],
+                        ),
                         dtype=torch.float32,
                         device=self.device,
                     )
@@ -2053,7 +2064,9 @@ class ModelsProcessor(QtCore.QObject):
                     )
                     # Pre-allocate CFG buffers only if needed
                     if denoiser_cfg_scale != 1.0:
-                        e_t_uncond = torch.empty(latent_shape, dtype=torch.float32, device=self.device)
+                        e_t_uncond = torch.empty(
+                            latent_shape, dtype=torch.float32, device=self.device
+                        )
                         unet_input_uncond = torch.empty_like(unet_input_cond)
                         uncond_flag_tensor = torch.tensor(
                             [False], dtype=torch.bool, device=self.device
@@ -2069,8 +2082,10 @@ class ModelsProcessor(QtCore.QObject):
                             (1,), step_ddpm_idx, device=self.device, dtype=torch.int64
                         )
                         # MP-10: reuse pre-allocated buffer via in-place cat equivalent
-                        unet_input_cond[:, :latent_shape[1]] = current_latent_xt_scaled
-                        unet_input_cond[:, latent_shape[1]:] = lq_latent_x0_scaled_for_unet
+                        unet_input_cond[:, : latent_shape[1]] = current_latent_xt_scaled
+                        unet_input_cond[:, latent_shape[1] :] = (
+                            lq_latent_x0_scaled_for_unet
+                        )
 
                         self.face_restorers.run_ref_ldm_unet(
                             x_noisy_plus_lq_latent=unet_input_cond,
@@ -2084,8 +2099,12 @@ class ModelsProcessor(QtCore.QObject):
 
                         if denoiser_cfg_scale != 1.0:
                             # MP-10: reuse pre-allocated uncond buffer
-                            unet_input_uncond[:, :latent_shape[1]] = current_latent_xt_scaled
-                            unet_input_uncond[:, latent_shape[1]:] = lq_latent_x0_scaled_for_unet
+                            unet_input_uncond[:, : latent_shape[1]] = (
+                                current_latent_xt_scaled
+                            )
+                            unet_input_uncond[:, latent_shape[1] :] = (
+                                lq_latent_x0_scaled_for_unet
+                            )
                             self.face_restorers.run_ref_ldm_unet(
                                 x_noisy_plus_lq_latent=unet_input_uncond,
                                 timesteps_tensor=ts_unet,
@@ -2143,11 +2162,26 @@ class ModelsProcessor(QtCore.QObject):
                             + noise_ddim
                         )
                         # MP-16: del intermediate tensors each iteration to free memory
-                        del dir_xt, noise_ddim, a_t, a_prev, sigma_t, sqrt_one_minus_a_t, schedule_idx_tensor
+                        del (
+                            dir_xt,
+                            noise_ddim,
+                            a_t,
+                            a_prev,
+                            sigma_t,
+                            sqrt_one_minus_a_t,
+                            schedule_idx_tensor,
+                        )
 
-                    final_denoised_latent_x0_scaled = pred_x0_scaled_current_step.clone()
+                    final_denoised_latent_x0_scaled = (
+                        pred_x0_scaled_current_step.clone()
+                    )
                     # MP-16: del DDIM loop buffers after loop ends
-                    del current_latent_xt_scaled, e_t_cond, unet_input_cond, pred_x0_scaled_current_step
+                    del (
+                        current_latent_xt_scaled,
+                        e_t_cond,
+                        unet_input_cond,
+                        pred_x0_scaled_current_step,
+                    )
                     if e_t_uncond is not None:
                         del e_t_uncond, unet_input_uncond
             else:

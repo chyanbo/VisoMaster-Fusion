@@ -33,7 +33,10 @@ class FrameEdits:
         self.models_processor = models_processor
 
         # Transforms will be updated per frame/settings via set_transforms
-        self.t256_face = None
+        self.t256_face: v2.Resize = v2.Resize(
+            (256, 256),
+            interpolation=v2.InterpolationMode.BILINEAR,
+        )
         self.interpolation_expression_faceeditor_back = None
 
     def set_transforms(self, t256_face, interpolation_expression_faceeditor_back):

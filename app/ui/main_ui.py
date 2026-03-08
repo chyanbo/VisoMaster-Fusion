@@ -445,8 +445,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if denoiser_mode_before_combo:
             # Pass the new text (current_mode_text) from the signal to the handler
             denoiser_mode_before_combo.currentTextChanged.connect(
-                lambda text,
-                ps="Before": self.update_denoiser_controls_visibility_for_pass(ps, text)
+                lambda text, ps="Before": (
+                    self.update_denoiser_controls_visibility_for_pass(ps, text)
+                )
             )
             # Initial call using the value from self.control, which should be the default
             initial_mode_before = self.control.get(
@@ -461,9 +462,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         if denoiser_mode_after_first_combo:
             denoiser_mode_after_first_combo.currentTextChanged.connect(
-                lambda text,
-                ps="AfterFirst": self.update_denoiser_controls_visibility_for_pass(
-                    ps, text
+                lambda text, ps="AfterFirst": (
+                    self.update_denoiser_controls_visibility_for_pass(ps, text)
                 )
             )
             initial_mode_after_first = self.control.get(
@@ -478,8 +478,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         if denoiser_mode_after_combo:
             denoiser_mode_after_combo.currentTextChanged.connect(
-                lambda text,
-                ps="After": self.update_denoiser_controls_visibility_for_pass(ps, text)
+                lambda text, ps="After": (
+                    self.update_denoiser_controls_visibility_for_pass(ps, text)
+                )
             )
             initial_mode_after = self.control.get(
                 "DenoiserModeSelectionAfter", "Single Step (Fast)"
@@ -546,7 +547,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         set_widget_visibility(ddim_steps_widget, is_full_restore_mode)
         set_widget_visibility(cfg_scale_widget, is_full_restore_mode)
 
-    def _populate_model_file_selection_widget(self, widget_name: str, scan_dir: str, prefix: str, ext: str):
+    def _populate_model_file_selection_widget(
+        self, widget_name: str, scan_dir: str, prefix: str, ext: str
+    ):
         """Helper that scans scan_dir for files matching prefix+ext, populates a SelectionBox widget."""
         model_files = []
         if os.path.exists(scan_dir):
@@ -556,7 +559,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         model_files.sort()
 
         selection_widget = self.parameter_widgets.get(widget_name)
-        if selection_widget and isinstance(selection_widget, widget_components.SelectionBox):
+        if selection_widget and isinstance(
+            selection_widget, widget_components.SelectionBox
+        ):
             current_selection = self.control.get(widget_name)
             selection_widget.clear()
             if model_files:
@@ -614,9 +619,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                         new_kv_tensors_map = None
                     self.model_loaded_signal.emit()
                 except Exception as e:
-                    print(
-                        f"[ERROR] Error loading K/V tensor file {kv_file_path}: {e}"
-                    )
+                    print(f"[ERROR] Error loading K/V tensor file {kv_file_path}: {e}")
                     new_kv_tensors_map = None
                     self.model_loaded_signal.emit()
             else:
@@ -696,7 +699,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         super().resizeEvent(event)
         # Call the method to fit the image to the view whenever the window resizes
         items = self.scene.items()
-        pixmap_item = next((item for item in items if isinstance(item, QtWidgets.QGraphicsPixmapItem)), None)
+        pixmap_item = next(
+            (item for item in items if isinstance(item, QtWidgets.QGraphicsPixmapItem)),
+            None,
+        )
         if pixmap_item:
             # Set the scene rectangle to the bounding rectangle of the pixmap
             scene_rect = pixmap_item.boundingRect()
@@ -740,7 +746,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         list_view_actions.clear_stop_loading_input_media(self)
         list_view_actions.clear_stop_loading_target_media(self)
 
-        save_load_actions.save_current_workspace(self, str(self.project_root_path / "last_workspace.json"))
+        save_load_actions.save_current_workspace(
+            self, str(self.project_root_path / "last_workspace.json")
+        )
         self.video_processor.join_and_clear_threads()
         # Optionally handle the event if needed
         event.accept()
@@ -812,7 +820,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Max-Höhen: Liste + Buttons zusammen ~170px
         # -> Liste (Thumbnails)
         try:
-            self.targetFacesList.setMaximumHeight(_FACE_STRIP_LIST_HEIGHT)  # kompakte Thumbnail-Zeile
+            self.targetFacesList.setMaximumHeight(
+                _FACE_STRIP_LIST_HEIGHT
+            )  # kompakte Thumbnail-Zeile
         except Exception as e:
             print(f"[WARN] Layout operation failed: {e}")
 

@@ -501,7 +501,7 @@ class FaceMasks:
         # ---------- 2. MOUTH MASK (Grouped Optimization) ----------
         if need_parser_mouth:
             mouth = torch.zeros((512, 512), device=device, dtype=torch.float32)
-            mouth_groups = {}
+            mouth_groups: dict = {}
             mouth_specs = {
                 11: "XsegMouthParserSlider",
                 12: "XsegUpperLipParserSlider",
@@ -525,7 +525,7 @@ class FaceMasks:
         # ---------- 3. FACEPARSER MASK (Grouped Optimization) ----------
         if parameters.get("FaceParserEnableToggle", False):
             fp = torch.zeros((512, 512), device=device, dtype=torch.float32)
-            fp_groups = {}
+            fp_groups: dict = {}
             face_classes = {
                 1: "FaceParserSlider",
                 2: "LeftEyebrowParserSlider",
@@ -610,7 +610,7 @@ class FaceMasks:
                     m_o = self._mask_from_labels_lut(labels_orig, [1]) * blend
                     tex_o = torch.maximum(tex_o, m_o)
 
-            tex_groups = {}
+            tex_groups: dict = {}
             for cls, pname in tex_specs.items():
                 if cls == 1:
                     continue
@@ -1161,7 +1161,14 @@ class FaceMasks:
     # --- Restoration Helpers (Eyes/Mouth) ---
 
     def soft_oval_mask(
-        self, height, width, center, radius_x, radius_y, feather_radius=None, device=None
+        self,
+        height,
+        width,
+        center,
+        radius_x,
+        radius_y,
+        feather_radius=None,
+        device=None,
     ):
         if feather_radius is None:
             feather_radius = max(radius_x, radius_y) // 2

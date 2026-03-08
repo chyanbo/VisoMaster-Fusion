@@ -609,7 +609,9 @@ def set_up_menu_actions(main_window: "MainWindow"):
     )
 
 
-def set_all_parameters_and_control_widgets_enabled(main_window: "MainWindow", enabled: bool):
+def set_all_parameters_and_control_widgets_enabled(
+    main_window: "MainWindow", enabled: bool
+):
     disabled = not enabled
 
     # Bottom buttons

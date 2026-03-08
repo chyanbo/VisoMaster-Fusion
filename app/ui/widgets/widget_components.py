@@ -1445,8 +1445,7 @@ class ProgressDialog(QtWidgets.QProgressDialog):
             box.setWindowTitle("Confirm stop")
             box.setText("Stop the current task?")
             box.setInformativeText(
-                "Processing will stop immediately.\n"
-                "Outputs may be incomplete."
+                "Processing will stop immediately.\nOutputs may be incomplete."
             )
             box.setStandardButtons(QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No)
             box.setDefaultButton(QtWidgets.QMessageBox.No)
@@ -1553,7 +1552,7 @@ class SaveJobDialog(QtWidgets.QDialog):
         # Widgets
         self.job_name_label = QtWidgets.QLabel("Job Name:")
         self.job_name_edit = QtWidgets.QLineEdit(self)
-        #self.job_name_edit.setPlaceholderText("Enter job name")
+        # self.job_name_edit.setPlaceholderText("Enter job name")
         self.job_name_edit.setText(input_filename)
 
         self.set_output_name_checkbox = QtWidgets.QCheckBox(
@@ -1563,7 +1562,7 @@ class SaveJobDialog(QtWidgets.QDialog):
 
         self.output_name_label = QtWidgets.QLabel("Output File Name:")
         self.output_name_edit = QtWidgets.QLineEdit(self)
-        #self.output_name_edit.setPlaceholderText("Leave blank for default")
+        # self.output_name_edit.setPlaceholderText("Leave blank for default")
         self.output_name_edit.setText(input_filename)
 
         # Button box

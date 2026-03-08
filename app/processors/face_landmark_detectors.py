@@ -482,14 +482,18 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-        net_outs_3d68 = self._run_onnx_binding("FaceLandmark3d68", {"data": aimg}, ["fc1"])
+        net_outs_3d68 = self._run_onnx_binding(
+            "FaceLandmark3d68", {"data": aimg}, ["fc1"]
+        )
         if not net_outs_3d68 or len(net_outs_3d68) < 1:
             return [], [], []
         pred = net_outs_3d68[0][0]
 
         # Post-process the 1D prediction array into 3D/2D coordinates.
         # 68 * 3 = 204 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
-        pred = pred.reshape((-1, 3)) if pred.shape[0] == 68 * 3 else pred.reshape((-1, 2))
+        pred = (
+            pred.reshape((-1, 3)) if pred.shape[0] == 68 * 3 else pred.reshape((-1, 2))
+        )
         if 68 < pred.shape[0]:
             pred = pred[-68:]
         pred[:, 0:2] = (pred[:, 0:2] + 1) * 96.0  # Scale to image size (192/2)
@@ -573,13 +577,17 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-        net_outs_106 = self._run_onnx_binding("FaceLandmark106", {"data": aimg}, ["fc1"])
+        net_outs_106 = self._run_onnx_binding(
+            "FaceLandmark106", {"data": aimg}, ["fc1"]
+        )
         if not net_outs_106 or len(net_outs_106) < 1:
             return [], [], []
         pred = net_outs_106[0][0]
 
         # 106 * 3 = 318 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
-        pred = pred.reshape((-1, 3)) if pred.shape[0] == 106 * 3 else pred.reshape((-1, 2))
+        pred = (
+            pred.reshape((-1, 3)) if pred.shape[0] == 106 * 3 else pred.reshape((-1, 2))
+        )
         if 106 < pred.shape[0]:
             pred = pred[-106:]
 

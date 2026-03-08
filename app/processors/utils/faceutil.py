@@ -1485,17 +1485,6 @@ def parse_pt2_from_pt9(pt9, use_lip=True):
     ['right eye right', 'right eye left', 'left eye right', 'left eye left', 'nose tip', 'lip right', 'lip left', 'upper lip', 'lower lip']
     """
     if use_lip:
-        # F-08: store intermediate result in distinct variable to avoid shadowing pt9
-        pt4 = np.stack(
-            [
-                (pt9[2] + pt9[3]) / 2,  # left eye
-                (pt9[0] + pt9[1]) / 2,  # right eye
-                pt9[4],
-                (pt9[5] + pt9[6]) / 2,  # lip
-            ],
-            axis=0,
-        )
-        # compute pt2 from the original pt9, not the shadowed variable
         pt2 = np.stack(
             [
                 (pt9[2] + pt9[3]) / 2,  # eye center (left+right eye avg)
@@ -1857,7 +1846,9 @@ def paste_back(
 
     # Converti i tensor al tipo appropriato prima delle operazioni in-place
     output = output.float()  # Converte output in torch.float32
-    img_ori = img_ori.clone().float()  # F-03: clone before in-place ops to avoid mutating the caller's tensor
+    img_ori = (
+        img_ori.clone().float()
+    )  # F-03: clone before in-place ops to avoid mutating the caller's tensor
 
     # Ottimizzazione con operazioni in-place
     output.mul_(mask_ori)  # In-place multiplication
@@ -1889,7 +1880,9 @@ def paste_back_adv(
     tform.params[0:2] = M_c2o
     # F-04: use actual img_crop dimensions instead of hardcoded 512
     crop_h, crop_w = img_crop.shape[1], img_crop.shape[2]
-    corners = np.array([[0, 0], [0, crop_h - 1], [crop_w - 1, 0], [crop_w - 1, crop_h - 1]])
+    corners = np.array(
+        [[0, 0], [0, crop_h - 1], [crop_w - 1, 0], [crop_w - 1, crop_h - 1]]
+    )
 
     # Calcola i nuovi limiti
     x = M_c2o[0][0] * corners[:, 0] + M_c2o[0][1] * corners[:, 1] + M_c2o[0][2]
@@ -1906,7 +1899,8 @@ def paste_back_adv(
     # Trasforma img_crop senza inverso
     # F-04: use actual img_crop dimensions instead of hardcoded 512
     img_crop = v2.functional.pad(
-        img_crop, (0, 0, img.shape[2] - img_crop.shape[2], img.shape[1] - img_crop.shape[1])
+        img_crop,
+        (0, 0, img.shape[2] - img_crop.shape[2], img.shape[1] - img_crop.shape[1]),
     )
     img_crop = v2.functional.affine(
         img_crop,
@@ -1922,7 +1916,8 @@ def paste_back_adv(
     # Trasforma mask_crop nello stesso modo di img_crop
     # F-04: use actual mask_crop dimensions instead of hardcoded 512
     mask_crop = v2.functional.pad(
-        mask_crop, (0, 0, img.shape[2] - mask_crop.shape[2], img.shape[1] - mask_crop.shape[1])
+        mask_crop,
+        (0, 0, img.shape[2] - mask_crop.shape[2], img.shape[1] - mask_crop.shape[1]),
     )
     mask_crop = v2.functional.affine(
         mask_crop,

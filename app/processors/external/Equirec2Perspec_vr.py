@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-_PERSP_GRID_CACHE = OrderedDict()  # module-level cache — persists across frames
+_PERSP_GRID_CACHE: OrderedDict = OrderedDict()  # module-level cache — persists across frames
 _PERSP_GRID_CACHE_MAX = 256
 
 

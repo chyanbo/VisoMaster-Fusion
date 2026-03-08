@@ -1,5 +1,4 @@
 import uuid
-import threading
 from functools import partial
 from typing import TYPE_CHECKING, Dict
 import traceback
@@ -312,8 +311,8 @@ class FilterWorker(qtc.QThread):
         self.filter_list = filter_list
         # Snapshot attributes set by filter_actions before start() is called.
         # Initialised to safe empty defaults so the worker never accesses Qt widgets.
-        self.items_snapshot = []
-        self.include_file_types = []
+        self.items_snapshot: list = []
+        self.include_file_types: list = []
         self.filter_list_widget = self.get_list_widget()
         self.filtered_results.connect(
             partial(

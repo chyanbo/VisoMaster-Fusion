@@ -99,7 +99,9 @@ class VideoProcessor(QObject):
         self.media_rotation: int = 0
         self.current_frame_number = 0  # The *next* frame to be read/processed
         self.max_frame_number = 0
-        self.current_frame: Optional[numpy.ndarray] = None  # The most recently read/processed frame
+        self.current_frame: Optional[numpy.ndarray] = (
+            None  # The most recently read/processed frame
+        )
 
         # --- Processing State Flags ---
         self.processing = False  # MASTER flag: True if playback, recording, or webcam stream is active
@@ -329,7 +331,7 @@ class VideoProcessor(QObject):
                 "GlobalInputResizeSizeSelection", "720p"
             )
             # Extract the number (e.g., 720)
-            return int(size_str.replace("p", ""))
+            return int(str(size_str).replace("p", ""))
         except Exception as e:
             print(
                 f"[WARN] Could not parse global input resolution, defaulting to original size. Error: {e}"
@@ -364,7 +366,9 @@ class VideoProcessor(QObject):
         self.total_skipped_frames = 0
 
         # VP-19: Cache target input height outside the loop; only re-read on detected change.
-        cached_resize_toggle = self.main_window.control.get("GlobalInputResizeToggle", False)
+        cached_resize_toggle = self.main_window.control.get(
+            "GlobalInputResizeToggle", False
+        )
         cached_target_height = self._get_target_input_height()
 
         while stop_flag_check():
@@ -403,7 +407,9 @@ class VideoProcessor(QObject):
 
                 # 3. Determine Input Resolution (Global Resize)
                 # VP-19: Use cached value; only re-read when the toggle changes.
-                current_resize_toggle = self.main_window.control.get("GlobalInputResizeToggle", False)
+                current_resize_toggle = self.main_window.control.get(
+                    "GlobalInputResizeToggle", False
+                )
                 if current_resize_toggle != cached_resize_toggle:
                     cached_resize_toggle = current_resize_toggle
                     cached_target_height = self._get_target_input_height()
@@ -418,14 +424,23 @@ class VideoProcessor(QObject):
                     fn = self.current_frame_number
 
                     # 1) Segment mode: read failure near segment end -> treat as segment EOF/stop
-                    if self.is_processing_segments and self.current_segment_end_frame is not None:
+                    if (
+                        self.is_processing_segments
+                        and self.current_segment_end_frame is not None
+                    ):
                         if fn >= self.current_segment_end_frame - TAIL_TOLERANCE:
                             with self.state_lock:
                                 # Advance past the segment end to trigger display_next_frame()'s segment-end branch
-                                self.next_frame_to_display = self.current_segment_end_frame + 1
+                                self.next_frame_to_display = (
+                                    self.current_segment_end_frame + 1
+                                )
                                 # Optional: also advance the feeder's own frame counter to avoid other logic misinterpreting state
-                                self.current_frame_number = self.current_segment_end_frame + 1
-                            print(f"[INFO] Feeder: Treat read failure near segment tail as EOF (frame={fn}).")
+                                self.current_frame_number = (
+                                    self.current_segment_end_frame + 1
+                                )
+                            print(
+                                f"[INFO] Feeder: Treat read failure near segment tail as EOF (frame={fn})."
+                            )
                             break
 
                     # 2) Standard mode: unified frame skip logic (no longer depends on potentially inaccurate max_frame_number)
@@ -433,7 +448,7 @@ class VideoProcessor(QObject):
                     self.consecutive_read_errors += 1
                     self.skipped_frames.add(self.current_frame_number)
                     self.total_skipped_frames += 1
-                    
+
                     # Check if too many consecutive errors (likely reached actual EOF)
                     if self.consecutive_read_errors > self.max_consecutive_errors:
                         print(
@@ -444,7 +459,7 @@ class VideoProcessor(QObject):
                         else:
                             self.processing = False
                         break
-                    
+
                     # Log skip and move to next frame
                     print(
                         f"[WARN] Feeder: Skipping corrupted frame {self.current_frame_number} (Total skipped: {self.total_skipped_frames}, Consecutive errors: {self.consecutive_read_errors})."
@@ -1065,7 +1080,7 @@ class VideoProcessor(QObject):
                 preview_target_height=target_height,
             )
 
-            if ret:
+            if ret and frame_bgr is not None:
                 frame_to_process = frame_bgr[..., ::-1]  # BGR to RGB
                 read_successful = True
                 misc_helpers.seek_frame(self.media_capture, self.current_frame_number)
@@ -1108,7 +1123,7 @@ class VideoProcessor(QObject):
             ret, frame_bgr = misc_helpers.read_frame(
                 self.media_capture, 0, preview_target_height=None
             )
-            if ret:
+            if ret and frame_bgr is not None:
                 frame_to_process = frame_bgr[..., ::-1]  # BGR to RGB
                 read_successful = True
             else:
@@ -1155,6 +1170,7 @@ class VideoProcessor(QObject):
         self.main_window.models_processor.face_detectors.track_history = {}
         try:
             from app.processors.external.yolox.tracker.basetrack import BaseTrack
+
             BaseTrack._count = 0
         except ImportError:
             pass
@@ -2663,9 +2679,7 @@ class VideoProcessor(QObject):
         # this race condition.
         time.sleep(0.15)
 
-        backend_to_use = (
-            backend or self.main_window.control["VirtCamBackendSelection"]
-        )
+        backend_to_use = backend or self.main_window.control["VirtCamBackendSelection"]
         print(
             f"[INFO] Enabling virtual camera: {frame_width}x{frame_height} @ {int(current_fps)}fps, Backend: {backend_to_use}, Format: BGR"
         )
@@ -2685,7 +2699,9 @@ class VideoProcessor(QObject):
                 if attempt == 0:
                     # First attempt failed (driver may still be releasing the handle).
                     # Wait longer and try once more before giving up.
-                    print(f"[WARN] Virtual camera open failed (attempt 1): {e}. Retrying in 500 ms…")
+                    print(
+                        f"[WARN] Virtual camera open failed (attempt 1): {e}. Retrying in 500 ms…"
+                    )
                     time.sleep(0.5)
                 else:
                     print(f"[ERROR] Failed to enable virtual camera: {e}")
@@ -2880,7 +2896,10 @@ class VideoProcessor(QObject):
             self.frame_queue.queue.clear()
 
         self.start_frame_worker(
-            current_start_frame, self.current_frame, is_single_frame=True, synchronous=True
+            current_start_frame,
+            self.current_frame,
+            is_single_frame=True,
+            synchronous=True,
         )
 
         # 8. Update counters

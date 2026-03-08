@@ -32,7 +32,7 @@ numpy_to_torch_dtype_dict = {
 }
 # Handle boolean type compatibility across numpy versions.
 # T-05: use tuple comparison instead of string comparison for version numbers
-if tuple(int(x) for x in np.__version__.split('.')[:3]) >= (1, 24, 0):
+if tuple(int(x) for x in np.__version__.split(".")[:3]) >= (1, 24, 0):
     numpy_to_torch_dtype_dict[np.bool_] = torch.bool
 else:
     numpy_to_torch_dtype_dict[np.bool] = torch.bool
@@ -87,7 +87,7 @@ class TensorRTPredictor:
                 raise RuntimeError(f"Error loading the custom plugin: {e}")
 
         # T-02: guard against missing TRT at the point of use
-        if 'trt' not in globals():
+        if "trt" not in globals():
             raise ImportError("TensorRT is required but not installed.")
 
         engine_path = kwargs.get("model_path", None)
@@ -135,7 +135,7 @@ class TensorRTPredictor:
             stream (torch.cuda.Stream): The CUDA stream on which to execute the inference.
         """
         # T-02: guard against missing TRT at the point of use
-        if 'trt' not in globals():
+        if "trt" not in globals():
             raise ImportError("TensorRT is required but not installed.")
 
         if self.context_pool is None:

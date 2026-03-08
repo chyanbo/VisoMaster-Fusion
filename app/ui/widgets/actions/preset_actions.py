@@ -1,5 +1,4 @@
 import json
-from pathlib import Path
 from PySide6 import QtWidgets, QtCore
 from typing import TYPE_CHECKING
 from functools import partial
@@ -15,7 +14,8 @@ if TYPE_CHECKING:
 
 def control_preset_toggle(main_window: "MainWindow"):
     main_window.controlPresetButton.setToolTip(
-        "Apply Settings from preset: ON" if main_window.controlPresetButton.isChecked()
+        "Apply Settings from preset: ON"
+        if main_window.controlPresetButton.isChecked()
         else "Apply Settings from preset: OFF"
     )
 
@@ -281,9 +281,7 @@ def apply_selected_preset(main_window: "MainWindow"):
     main_window.current_widget_parameters = ParametersDict(
         new_params, main_window.default_parameters.data
     )  # type: ignore
-    common_widget_actions.set_widgets_values_using_face_id_parameters(
-        main_window, None
-    )
+    common_widget_actions.set_widgets_values_using_face_id_parameters(main_window, None)
 
     if main_window.controlPresetButton.isChecked():
         new_ctl = preset_ctl.copy()

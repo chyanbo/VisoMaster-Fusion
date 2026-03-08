@@ -21,6 +21,7 @@ def handle_face_detector_tracking_reset(main_window: "MainWindow", value):
     main_window.models_processor.face_detectors.track_history = {}
     try:
         from app.processors.external.yolox.tracker.basetrack import BaseTrack
+
         BaseTrack._count = 0
     except ImportError:
         pass
@@ -381,7 +382,7 @@ def handle_landmark_state_change(
         current_selection = main_window.control.get(
             "LandmarkDetectModelSelection", "203"
         )
-        model_to_load = landmark_model_mapping.get(current_selection)
+        model_to_load = landmark_model_mapping.get(str(current_selection))
 
         if model_to_load:
             print(

@@ -122,7 +122,7 @@ def find_target_faces(main_window: "MainWindow"):
                 else [0, 90, 180, 270],
             )
 
-            ret = []
+            faces_list: list = []
             for face_kps in kpss_5:
                 face_emb, cropped_img = (
                     main_window.models_processor.run_recognize_direct(
@@ -132,11 +132,11 @@ def find_target_faces(main_window: "MainWindow"):
                         control["RecognitionModelSelection"],
                     )
                 )
-                ret.append([face_kps, face_emb, cropped_img, img])
+                faces_list.append([face_kps, face_emb, cropped_img, img])
 
-            if ret:
+            if faces_list:
                 # Loop through all faces in video frame
-                for face in ret:
+                for face in faces_list:
                     found = False
                     # Check if this face has already been found
                     for face_id, target_face in main_window.target_faces.items():

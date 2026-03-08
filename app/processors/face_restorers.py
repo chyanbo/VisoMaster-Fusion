@@ -175,7 +175,9 @@ class FaceRestorers:
 
         if restorer_type == "GFPGAN-v1.4":
             outpred = torch.empty(
-                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
             ).contiguous()
             self.run_GFPGAN(temp, outpred)
 
@@ -189,7 +191,9 @@ class FaceRestorers:
 
         elif restorer_type == "CodeFormer":
             outpred = torch.empty(
-                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
             ).contiguous()
             self.run_codeformer(temp, outpred, fidelity_weight)
 
@@ -203,7 +207,9 @@ class FaceRestorers:
 
         elif restorer_type == "GPEN-512":
             outpred = torch.empty(
-                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
             ).contiguous()
             self.run_GPEN_512(temp, outpred)
 
@@ -227,13 +233,17 @@ class FaceRestorers:
 
         elif restorer_type == "RestoreFormer++":
             outpred = torch.empty(
-                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
             ).contiguous()
             self.run_RestoreFormerPlusPlus(temp, outpred)
 
         elif restorer_type == "VQFR-v2":
             outpred = torch.empty(
-                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+                (1, 3, 512, 512),
+                dtype=torch.float32,
+                device=self.models_processor.device,
             ).contiguous()
             self.run_VQFR_v2(temp, outpred, fidelity_weight)
 
@@ -476,7 +486,7 @@ class FaceRestorers:
                     )
 
         # IMPORTANT: Keep references to temporary zero tensors to prevent GC
-        keep_alive_tensors = []
+        keep_alive_tensors: list = []
         # FS-MEM-01: also keep actual KV tensors alive to prevent premature GC
         keep_alive_tensors.extend(actual_kv_tensors_for_binding.values())
 
@@ -713,7 +723,9 @@ class FaceRestorers:
 
         # FR-ROBUST-05: replace assert with an explicit ValueError so it is never silenced by -O flag
         if not (0.0 <= fidelity_ratio_value <= 1.0):
-            raise ValueError(f"fidelity_ratio_value must be in [0,1], got {fidelity_ratio_value}")
+            raise ValueError(
+                f"fidelity_ratio_value must be in [0,1], got {fidelity_ratio_value}"
+            )
         fidelity_ratio = torch.tensor(fidelity_ratio_value).to(
             self.models_processor.device
         )
