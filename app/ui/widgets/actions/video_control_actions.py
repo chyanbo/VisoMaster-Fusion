@@ -37,6 +37,7 @@ def set_up_video_seek_line_edit(main_window: "MainWindow"):
 
 def set_up_video_seek_slider(main_window: "MainWindow"):
     main_window.videoSeekSlider.markers = set()  # Store unique tick positions
+    main_window.videoSeekSlider.markers_sorted = []  # Sorted list for iteration in paintEvent
     main_window.videoSeekSlider.setTickPosition(
         QtWidgets.QSlider.TickPosition.TicksBelow
     )  # Default position for tick marks
@@ -47,6 +48,9 @@ def set_up_video_seek_slider(main_window: "MainWindow"):
             value = self.value()
         if self.minimum() <= value <= self.maximum() and value not in self.markers:
             self.markers.add(value)
+            if value not in self.markers_sorted:
+                self.markers_sorted.append(value)
+                self.markers_sorted.sort()
             self.update()
 
     def remove_marker_and_paint(self: QtWidgets.QSlider, value=None):
@@ -55,9 +59,13 @@ def set_up_video_seek_slider(main_window: "MainWindow"):
             value = self.value()
         if value in self.markers:
             self.markers.remove(value)
+            if value in self.markers_sorted:
+                self.markers_sorted.remove(value)
             self.update()
 
     def paintEvent(self: QtWidgets.QSlider, event: QtGui.QPaintEvent):
+        if self.maximum() == self.minimum():
+            return super(QtWidgets.QSlider, self).paintEvent(event)
         # Do not draw the slider if the current media is a single image
         if main_window.video_processor.file_type == "image":
             return super(QtWidgets.QSlider, self).paintEvent(event)
@@ -113,7 +121,7 @@ def set_up_video_seek_slider(main_window: "MainWindow"):
             painter.setPen(
                 QtGui.QPen(QtGui.QColor("#4090a3"), 3)
             )  # Marker color and thickness
-            for value in sorted(self.markers):
+            for value in self.markers_sorted:
                 # Calculate marker position
                 marker_normalized_value = (value - self.minimum()) / (
                     self.maximum() - self.minimum()

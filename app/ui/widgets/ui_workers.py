@@ -1,4 +1,5 @@
 import uuid
+import threading
 from functools import partial
 from typing import TYPE_CHECKING, Dict
 import traceback
@@ -154,7 +155,10 @@ class TargetMediaLoaderWorker(qtc.QThread):
     def stop(self):
         """Stop the thread by setting the running flag to False."""
         self._running = False
-        self.wait()
+        self.quit()
+        self.wait(1000)
+        if self.isRunning():
+            self.terminate()
 
 
 class InputFacesLoaderWorker(qtc.QThread):
@@ -290,7 +294,10 @@ class InputFacesLoaderWorker(qtc.QThread):
     def stop(self):
         """Stop the thread by setting the running flag to False."""
         self._running = False
-        self.wait()
+        self.quit()
+        self.wait(1000)
+        if self.isRunning():
+            self.terminate()
 
 
 class FilterWorker(qtc.QThread):
@@ -303,6 +310,10 @@ class FilterWorker(qtc.QThread):
         self.main_window = main_window
         self.search_text = search_text
         self.filter_list = filter_list
+        # Snapshot attributes set by filter_actions before start() is called.
+        # Initialised to safe empty defaults so the worker never accesses Qt widgets.
+        self.items_snapshot = []
+        self.include_file_types = []
         self.filter_list_widget = self.get_list_widget()
         self.filtered_results.connect(
             partial(
@@ -328,54 +339,45 @@ class FilterWorker(qtc.QThread):
         self,
     ):
         if self.filter_list == "target_videos":
-            self.filter_target_videos(self.main_window, self.search_text)
+            self.filter_target_videos()
         elif self.filter_list == "input_faces":
-            self.filter_input_faces(self.main_window, self.search_text)
+            self.filter_input_faces()
         elif self.filter_list == "merged_embeddings":
-            self.filter_merged_embeddings(self.main_window, self.search_text)
+            self.filter_merged_embeddings()
 
-    def filter_target_videos(self, main_window: "MainWindow", search_text: str = ""):
-        search_text = main_window.targetVideosSearchBox.text().lower()
-        include_file_types = []
-        if main_window.filterImagesCheckBox.isChecked():
-            include_file_types.append("image")
-        if main_window.filterVideosCheckBox.isChecked():
-            include_file_types.append("video")
-        if main_window.filterWebcamsCheckBox.isChecked():
-            include_file_types.append("webcam")
+    def filter_target_videos(self):
+        # Operates only on pre-captured plain Python data — no Qt widget access.
+        search_text = self.search_text
+        include_file_types = self.include_file_types
 
         visible_indices = []
-        for i in range(main_window.targetVideosList.count()):
-            item = main_window.targetVideosList.item(i)
-            item_widget = main_window.targetVideosList.itemWidget(item)
-            if (not search_text or search_text in item_widget.media_path.lower()) and (
-                item_widget.file_type in include_file_types
+        for index, media_path, file_type in self.items_snapshot:
+            if (not search_text or search_text in media_path.lower()) and (
+                file_type in include_file_types
             ):
-                visible_indices.append(i)
+                visible_indices.append(index)
 
         self.filtered_results.emit(visible_indices)
 
-    def filter_input_faces(self, main_window: "MainWindow", search_text: str):
-        search_text = search_text.lower()
-        visible_indices = []
+    def filter_input_faces(self):
+        # Operates only on pre-captured plain Python data — no Qt widget access.
+        search_text = self.search_text
 
-        for i in range(main_window.inputFacesList.count()):
-            item = main_window.inputFacesList.item(i)
-            item_widget = main_window.inputFacesList.itemWidget(item)
-            if not search_text or search_text in item_widget.media_path.lower():
-                visible_indices.append(i)
+        visible_indices = []
+        for index, media_path in self.items_snapshot:
+            if not search_text or search_text in media_path.lower():
+                visible_indices.append(index)
 
         self.filtered_results.emit(visible_indices)
 
-    def filter_merged_embeddings(self, main_window: "MainWindow", search_text: str):
-        search_text = search_text.lower()
-        visible_indices = []
+    def filter_merged_embeddings(self):
+        # Operates only on pre-captured plain Python data — no Qt widget access.
+        search_text = self.search_text
 
-        for i in range(main_window.inputEmbeddingsList.count()):
-            item = main_window.inputEmbeddingsList.item(i)
-            item_widget = main_window.inputEmbeddingsList.itemWidget(item)
-            if not search_text or search_text in item_widget.embedding_name.lower():
-                visible_indices.append(i)
+        visible_indices = []
+        for index, embedding_name in self.items_snapshot:
+            if not search_text or search_text in embedding_name.lower():
+                visible_indices.append(index)
 
         self.filtered_results.emit(visible_indices)
 

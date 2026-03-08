@@ -26,7 +26,7 @@ def clear_target_faces(main_window: "MainWindow", refresh_frame=True):
     main_window.selected_target_face_id = None
     # Set Parameter widget values to default
     common_widget_actions.set_widgets_values_using_face_id_parameters(
-        main_window=main_window, face_id=False
+        main_window=main_window, face_id=None
     )
     if refresh_frame:
         common_widget_actions.refresh_frame(main_window=main_window)
@@ -89,9 +89,6 @@ def find_target_faces(main_window: "MainWindow"):
             # MODIFICATION: Pass 0 for webcam rotation
             ret, frame = misc_helpers.read_frame(media_capture, 0)
             # ---
-            media_capture.set(
-                cv2.CAP_PROP_POS_FRAMES, video_processor.current_frame_number
-            )
 
         if frame is not None:
             # Frame must be in RGB format

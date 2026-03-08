@@ -32,29 +32,33 @@ def open_embeddings_from_file(main_window: "MainWindow"):
         dir=misc_helpers.get_dir_of_file(main_window.loaded_embedding_filename),
     )
     if embedding_filename:
-        with open(embedding_filename, "r") as embed_file:  # pylint: disable=unspecified-encoding
-            embeddings_list = json.load(embed_file)
-            card_actions.clear_merged_embeddings(main_window)
+        try:
+            with open(embedding_filename, "r") as embed_file:  # pylint: disable=unspecified-encoding
+                embeddings_list = json.load(embed_file)
+                card_actions.clear_merged_embeddings(main_window)
 
-            # Reset per ogni target face
-            for _, target_face in main_window.target_faces.items():
-                target_face.assigned_merged_embeddings = {}
-                target_face.assigned_input_embedding = {}
+                # Reset for each target face
+                for _, target_face in main_window.target_faces.items():
+                    target_face.assigned_merged_embeddings = {}
+                    target_face.assigned_input_embedding = {}
 
-            # Carica gli embedding dal file e crea il dizionario embedding_store
-            for embed_data in embeddings_list:
-                embedding_store = embed_data.get("embedding_store", {})
-                # Converte ogni embedding in numpy array
-                for recogn_model, embed in embedding_store.items():
-                    embedding_store[recogn_model] = np.array(embed)
+                # Load embeddings from file and build the embedding_store dictionary
+                for embed_data in embeddings_list:
+                    embedding_store = embed_data.get("embedding_store", {})
+                    # Convert each embedding to a numpy array
+                    for recogn_model, embed in embedding_store.items():
+                        embedding_store[recogn_model] = np.array(embed)
 
-                # Passa l'intero embedding_store alla funzione
-                list_view_actions.create_and_add_embed_button_to_list(
-                    main_window,
-                    embed_data["name"],
-                    embedding_store,  # Passa l'intero embedding_store
-                    embedding_id=str(uuid.uuid1().int),
-                )
+                    # Pass the entire embedding_store to the function
+                    list_view_actions.create_and_add_embed_button_to_list(
+                        main_window,
+                        embed_data["name"],
+                        embedding_store,
+                        embedding_id=str(uuid.uuid1().int),
+                    )
+        except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
+            QtWidgets.QMessageBox.critical(main_window, "Error", f"Failed to load embeddings: {e}")
+            return
 
     main_window.loaded_embedding_filename = (
         embedding_filename or main_window.loaded_embedding_filename
@@ -71,7 +75,7 @@ def save_embeddings_to_file(main_window: "MainWindow", save_as=False):
         )
         return
 
-    # Definisce il nome del file di salvataggio
+    # Define the save filename
     embedding_filename = main_window.loaded_embedding_filename
     if (
         not embedding_filename
@@ -82,26 +86,26 @@ def save_embeddings_to_file(main_window: "MainWindow", save_as=False):
             main_window, filter="JSON (*.json)"
         )
 
-    # Crea una lista di dizionari, ciascuno con il nome dell'embedding e il relativo embedding_store
+    # Build a list of dicts, each containing the embedding name and its embedding_store
     embeddings_list = [
         {
             "name": embed_button.embedding_name,
             "embedding_store": {
                 k: v.tolist() for k, v in embed_button.embedding_store.items()
-            },  # Converti gli embedding in liste
+            },  # Convert embeddings to lists
         }
         for embedding_id, embed_button in main_window.merged_embeddings.items()
     ]
 
-    # Salva su file
+    # Save to file
     if embedding_filename:
         with open(embedding_filename, "w") as embed_file:  # pylint: disable=unspecified-encoding
             embeddings_as_json = json.dumps(
                 embeddings_list, indent=4
-            )  # Salva con indentazione per leggibilità
+            )  # Save with indentation for readability
             embed_file.write(embeddings_as_json)
 
-            # Mostra un messaggio di conferma
+            # Show a confirmation message
             common_widget_actions.create_and_show_toast_message(
                 main_window,
                 "Embeddings Saved",
@@ -163,7 +167,7 @@ def save_current_parameters_and_control(main_window: "MainWindow", face_id):
         with open(data_filename, "w") as data_file:  # pylint: disable=unspecified-encoding
             data_as_json = json.dumps(
                 data, indent=4
-            )  # Salva con indentazione per leggibilità
+            )  # Save with indentation for readability
             data_file.write(data_as_json)
 
 
@@ -219,6 +223,7 @@ def load_saved_workspace(
     if data_filename:
         with open(data_filename, "r") as data_file:  # pylint: disable=unspecified-encoding
             data = json.load(data_file)
+        try:
             list_view_actions.clear_stop_loading_input_media(main_window)
             list_view_actions.clear_stop_loading_target_media(main_window)
             main_window.target_videos = {}
@@ -227,12 +232,12 @@ def load_saved_workspace(
             card_actions.clear_merged_embeddings(main_window)
 
             # Load control (settings)
-            control = data["control"]
+            control = data.get("control", {})
             for control_name, control_value in control.items():
                 main_window.control[control_name] = control_value
 
             # Add target medias
-            target_medias_data = data["target_medias_data"]
+            target_medias_data = data.get("target_medias_data", [])
             target_medias_files_list = []
             target_media_ids = []
             for media_data in target_medias_data:
@@ -262,7 +267,7 @@ def load_saved_workspace(
 
             # Add input faces (imgs)
             input_media_paths, input_face_ids = [], []
-            for face_id, input_face_data in data["input_faces_data"].items():
+            for face_id, input_face_data in data.get("input_faces_data", {}).items():
                 input_media_paths.append(input_face_data["media_path"])
                 input_face_ids.append(face_id)
             main_window.input_faces_loader_worker = ui_workers.InputFacesLoaderWorker(
@@ -283,7 +288,7 @@ def load_saved_workspace(
             # Use run() instead of start(), as we dont want it running in a different thread as it could create synchronisation issues in the steps below
             main_window.input_faces_loader_worker.run()
 
-            for face_id, input_face_data in data["input_faces_data"].items():
+            for face_id, input_face_data in data.get("input_faces_data", {}).items():
                 if face_id in main_window.input_faces:
                     input_face_button = main_window.input_faces[face_id]
                     kv_map_path = input_face_data.get("kv_map")
@@ -300,7 +305,7 @@ def load_saved_workspace(
                             )
 
             # Add embeddings
-            embeddings_data = data["embeddings_data"]
+            embeddings_data = data.get("embeddings_data", {})
             for embedding_id, embedding_data in embeddings_data.items():
                 embedding_store_loaded = {
                     embed_model: np.array(embedding)
@@ -317,7 +322,7 @@ def load_saved_workspace(
                 )
 
             # Add target_faces
-            for face_id, target_face_data in data["target_faces_data"].items():
+            for face_id, target_face_data in data.get("target_faces_data", {}).items():
                 cropped_face = np.array(target_face_data["cropped_face"]).astype(
                     "uint8"
                 )
@@ -392,7 +397,7 @@ def load_saved_workspace(
 
             # Convert params to ParametersDict
             data["markers"] = convert_markers_to_supported_type(
-                main_window, data["markers"], misc_helpers.ParametersDict
+                main_window, data.get("markers", {}), misc_helpers.ParametersDict
             )
 
             for marker_position, marker_data in data["markers"].items():
@@ -524,6 +529,11 @@ def load_saved_workspace(
             )
             filter_actions.filter_target_videos(main_window)
             list_view_actions.load_target_webcams(main_window)
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            QtWidgets.QMessageBox.critical(
+                main_window, "Error", f"Failed to load workspace: {e}"
+            )
+            return
 
             # restore dock layout if it was saved
             dock_state_str = window_state.get("dock_state", data.get("dock_state", ""))
@@ -596,7 +606,7 @@ def save_current_workspace(
     for face_id, input_face in main_window.input_faces.items():
         kv_map_path = None
         if is_denoiser_enabled and hasattr(input_face, "kv_map") and input_face.kv_map:
-            kv_data_dir = os.path.join("model_assets", "reference_kv_data")
+            kv_data_dir = str(main_window.project_root_path / "model_assets" / "reference_kv_data")
             os.makedirs(kv_data_dir, exist_ok=True)
             kv_map_path = os.path.join(kv_data_dir, f"input_{input_face.face_id}.pt")
             try:
@@ -706,7 +716,7 @@ def save_current_workspace(
             with open(data_filename, "w") as data_file:  # pylint: disable=unspecified-encoding
                 data_as_json = json.dumps(
                     data, indent=4
-                )  # Salva con indentazione per leggibilità
+                )  # Save with indentation for readability
                 data_file.write(data_as_json)
             if isinstance(data_filename, str) and data_filename.endswith(
                 "last_workspace.json"
@@ -782,7 +792,7 @@ def save_current_job(main_window: "MainWindow"):
     for face_id, input_face in main_window.input_faces.items():
         kv_map_path = None
         if is_denoiser_enabled and hasattr(input_face, "kv_map") and input_face.kv_map:
-            kv_data_dir = os.path.join("model_assets", "reference_kv_data")
+            kv_data_dir = str(main_window.project_root_path / "model_assets" / "reference_kv_data")
             os.makedirs(kv_data_dir, exist_ok=True)
             kv_map_path = os.path.join(kv_data_dir, f"input_{input_face.face_id}.pt")
             try:
@@ -852,7 +862,7 @@ def save_current_job(main_window: "MainWindow"):
         }
 
     # Define save path
-    jobs_dir = os.path.join(os.getcwd(), ".jobs")
+    jobs_dir = str(main_window.project_root_path / ".jobs")
     os.makedirs(jobs_dir, exist_ok=True)
     save_path = os.path.join(jobs_dir, f"{job_name}.json")
 

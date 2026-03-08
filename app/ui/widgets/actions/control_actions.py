@@ -1,4 +1,5 @@
 from typing import TYPE_CHECKING
+from pathlib import Path
 import torch
 import qdarkstyle
 from PySide6 import QtWidgets
@@ -42,7 +43,8 @@ def change_threads_number(main_window: "MainWindow", new_threads_number):
 def change_theme(main_window: "MainWindow", new_theme):
     def get_style_data(filename, theme="dark", custom_colors=None):
         custom_colors = custom_colors or {"primary": "#4090a3"}
-        with open(f"app/ui/styles/{filename}", "r") as f:  # pylint: disable=unspecified-encoding
+        styles_dir = Path(__file__).resolve().parent.parent.parent / "styles"
+        with open(styles_dir / filename, "r") as f:  # pylint: disable=unspecified-encoding
             _style = f.read()
             _style = (
                 qdarktheme.load_stylesheet(theme=theme, custom_colors=custom_colors)

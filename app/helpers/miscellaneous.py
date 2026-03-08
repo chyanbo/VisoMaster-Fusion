@@ -76,6 +76,7 @@ class ThumbnailManager:
                                  created in the current working directory.
         """
         self.thumbnail_dir = os.path.join(os.getcwd(), thumbnail_dir)
+        self._lock = threading.Lock()
         self._ensure_directory()
 
     def _ensure_directory(self) -> None:
@@ -126,10 +127,11 @@ class ThumbnailManager:
             str | None: The path to the existing thumbnail, or None if it doesn't exist.
         """
         png_path, jpg_path = self.get_thumbnail_path(file_path)
-        if os.path.exists(png_path):
-            return png_path
-        if os.path.exists(jpg_path):
-            return jpg_path
+        with self._lock:
+            if os.path.exists(png_path):
+                return png_path
+            if os.path.exists(jpg_path):
+                return jpg_path
         return None
 
     def create_thumbnail(self, frame: np.ndarray, file_path: str) -> None:
@@ -161,7 +163,8 @@ class ThumbnailManager:
         )
 
         try:
-            cv2.imwrite(png_path, resized_frame)
+            with self._lock:
+                cv2.imwrite(png_path, resized_frame)
             if os.path.getsize(png_path) > 30 * 1024:  # If PNG is > 30KB
                 os.remove(png_path)
                 raise Exception("PNG file too large, falling back to JPEG.")
@@ -174,7 +177,8 @@ class ThumbnailManager:
                 cv2.IMWRITE_JPEG_PROGRESSIVE,
                 1,
             ]
-            cv2.imwrite(jpg_path, resized_frame, jpeg_params)
+            with self._lock:
+                cv2.imwrite(jpg_path, resized_frame, jpeg_params)
 
 
 class DFMModelManager:

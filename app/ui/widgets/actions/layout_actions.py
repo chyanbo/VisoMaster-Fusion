@@ -596,7 +596,7 @@ def set_up_menu_actions(main_window: "MainWindow"):
         partial(save_load_actions.save_embeddings_to_file, main_window)
     )
     main_window.actionSave_Embeddings_As.triggered.connect(
-        partial(save_load_actions.save_embeddings_to_file, main_window)
+        partial(save_load_actions.save_embeddings_to_file, main_window, True)
     )
     main_window.actionView_Fullscreen_F11.triggered.connect(
         partial(video_control_actions.view_fullscreen, main_window)
@@ -609,91 +609,56 @@ def set_up_menu_actions(main_window: "MainWindow"):
     )
 
 
-def disable_all_parameters_and_control_widget(main_window: "MainWindow"):
-    # Disable all bottom buttons
-    main_window.saveImageButton.setDisabled(True)
-    main_window.batchImageButton.setDisabled(True)
-    main_window.batchallImageButton.setDisabled(True)
-    main_window.findTargetFacesButton.setDisabled(True)
-    main_window.clearTargetFacesButton.setDisabled(True)
-    main_window.swapfacesButton.setDisabled(True)
-    main_window.editFacesButton.setDisabled(True)
-    main_window.openEmbeddingButton.setDisabled(True)
-    main_window.saveEmbeddingButton.setDisabled(True)
-    main_window.saveEmbeddingAsButton.setDisabled(True)
+def set_all_parameters_and_control_widgets_enabled(main_window: "MainWindow", enabled: bool):
+    disabled = not enabled
 
-    # Disable all video control buttons
-    main_window.videoSeekSlider.setDisabled(True)
-    main_window.addMarkerButton.setDisabled(True)
-    main_window.removeMarkerButton.setDisabled(True)
-    main_window.nextMarkerButton.setDisabled(True)
-    main_window.previousMarkerButton.setDisabled(True)
-    main_window.frameAdvanceButton.setDisabled(True)
-    main_window.frameRewindButton.setDisabled(True)
+    # Bottom buttons
+    main_window.saveImageButton.setDisabled(disabled)
+    main_window.batchImageButton.setDisabled(disabled)
+    main_window.batchallImageButton.setDisabled(disabled)
+    main_window.findTargetFacesButton.setDisabled(disabled)
+    main_window.clearTargetFacesButton.setDisabled(disabled)
+    main_window.swapfacesButton.setDisabled(disabled)
+    main_window.editFacesButton.setDisabled(disabled)
+    main_window.openEmbeddingButton.setDisabled(disabled)
+    main_window.saveEmbeddingButton.setDisabled(disabled)
+    main_window.saveEmbeddingAsButton.setDisabled(disabled)
 
-    # Enable compare checkboxes
-    main_window.faceCompareCheckBox.setDisabled(True)
-    main_window.faceMaskCheckBox.setDisabled(True)
+    # Video control buttons
+    main_window.videoSeekSlider.setDisabled(disabled)
+    main_window.addMarkerButton.setDisabled(disabled)
+    main_window.removeMarkerButton.setDisabled(disabled)
+    main_window.nextMarkerButton.setDisabled(disabled)
+    main_window.previousMarkerButton.setDisabled(disabled)
+    main_window.frameAdvanceButton.setDisabled(disabled)
+    main_window.frameRewindButton.setDisabled(disabled)
 
-    # Disable list items
+    # Compare checkboxes
+    main_window.faceCompareCheckBox.setDisabled(disabled)
+    main_window.faceMaskCheckBox.setDisabled(disabled)
+
+    # List items
     for _, embed_button in main_window.merged_embeddings.items():
-        embed_button.setDisabled(True)
+        embed_button.setDisabled(disabled)
     for _, target_media_button in main_window.target_videos.items():
-        target_media_button.setDisabled(True)
+        target_media_button.setDisabled(disabled)
     for _, input_face_button in main_window.input_faces.items():
-        input_face_button.setDisabled(True)
+        input_face_button.setDisabled(disabled)
     for _, target_face_button in main_window.target_faces.items():
-        target_face_button.setDisabled(True)
+        target_face_button.setDisabled(disabled)
 
-    # Disable parameters and controls dict widgets
+    # Parameters and controls dict widgets
     for _, widget in main_window.parameter_widgets.items():
-        widget.setDisabled(True)
-        widget.reset_default_button.setDisabled(True)
-        widget.label_widget.setDisabled(True)
+        widget.setDisabled(disabled)
+        widget.reset_default_button.setDisabled(disabled)
+        widget.label_widget.setDisabled(disabled)
         if widget.line_edit:
-            widget.line_edit.setDisabled(True)
+            widget.line_edit.setDisabled(disabled)
+
+
+def disable_all_parameters_and_control_widget(main_window: "MainWindow"):
+    set_all_parameters_and_control_widgets_enabled(main_window, False)
 
 
 def enable_all_parameters_and_control_widget(main_window: "MainWindow"):
-    # Enable all bottom buttons
-    main_window.saveImageButton.setDisabled(False)
-    main_window.batchImageButton.setDisabled(False)
-    main_window.batchallImageButton.setDisabled(False)
-    main_window.findTargetFacesButton.setDisabled(False)
-    main_window.clearTargetFacesButton.setDisabled(False)
-    main_window.swapfacesButton.setDisabled(False)
-    main_window.editFacesButton.setDisabled(False)
-    main_window.openEmbeddingButton.setDisabled(False)
-    main_window.saveEmbeddingButton.setDisabled(False)
-    main_window.saveEmbeddingAsButton.setDisabled(False)
-
-    # Enable all video control buttons
-    main_window.videoSeekSlider.setDisabled(False)
-    main_window.addMarkerButton.setDisabled(False)
-    main_window.removeMarkerButton.setDisabled(False)
-    main_window.nextMarkerButton.setDisabled(False)
-    main_window.previousMarkerButton.setDisabled(False)
-    main_window.frameAdvanceButton.setDisabled(False)
-    main_window.frameRewindButton.setDisabled(False)
-
-    # Enable compare checkboxes
-    main_window.faceCompareCheckBox.setDisabled(False)
-    main_window.faceMaskCheckBox.setDisabled(False)
-
-    # Enable list items
-    for _, embed_button in main_window.merged_embeddings.items():
-        embed_button.setDisabled(False)
-    for _, target_media_button in main_window.target_videos.items():
-        target_media_button.setDisabled(False)
-    for _, input_face_button in main_window.input_faces.items():
-        input_face_button.setDisabled(False)
-    for _, target_face_button in main_window.target_faces.items():
-        target_face_button.setDisabled(False)
-
-    # Enable parameters and controls dict widgets
-    for _, widget in main_window.parameter_widgets.items():
-        widget.setDisabled(False)
-        widget.reset_default_button.setDisabled(False)
-        widget.label_widget.setDisabled(False)
-        if widget.line_edit:
-            widget.line_edit.setDisabled(False)
+    set_all_parameters_and_control_widgets_enabled(main_window, True)

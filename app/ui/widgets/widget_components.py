@@ -196,7 +196,7 @@ class TargetMediaCardButton(CardButton):
         main_window.video_processor.current_frame_number = 0
         main_window.video_processor.media_path = self.media_path
         main_window.parameters = {}
-        main_window.selected_target_face_id = False
+        main_window.selected_target_face_id = None
         main_window.video_processor.current_frame = []
 
         # Release the previous media_capture if it exists
@@ -312,7 +312,7 @@ class TargetMediaCardButton(CardButton):
             main_window.video_processor.current_frame_number = 0
             main_window.video_processor.media_path = False
             main_window.parameters = {}
-            main_window.selected_target_face_id = False
+            main_window.selected_target_face_id = None
 
             main_window.video_processor.media_capture = False
             main_window.video_processor.current_frame = []
@@ -825,7 +825,7 @@ class TargetFaceCardButton(CardButton):
             common_widget_actions.set_widgets_values_using_face_id_parameters(
                 main_window, face_id=False
             )
-            main_window.selected_target_face_id = False
+            main_window.selected_target_face_id = None
 
         video_control_actions.remove_face_parameters_and_control_from_markers(
             main_window, self.face_id

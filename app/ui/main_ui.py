@@ -57,6 +57,10 @@ ParametersWidgetTypes = Dict[
     | widget_components.ParameterLineEdit,
 ]
 
+_FACE_STRIP_MAX_HEIGHT = 120
+_FACE_STRIP_LIST_HEIGHT = 80
+_FACE_STRIP_BUTTONS_HEIGHT = 32
+
 
 class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     placeholder_update_signal = QtCore.Signal(QtWidgets.QListWidget, bool)
@@ -66,8 +70,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     display_messagebox_signal = QtCore.Signal(str, str, QtWidgets.QWidget)
 
     def initialize_variables(self):
-        self.video_loader_worker: ui_workers.TargetMediaLoaderWorker | bool = False
-        self.input_faces_loader_worker: ui_workers.InputFacesLoaderWorker | bool = False
+        self.video_loader_worker: ui_workers.TargetMediaLoaderWorker | None = None
+        self.input_faces_loader_worker: ui_workers.InputFacesLoaderWorker | None = None
         self.target_videos_filter_worker = ui_workers.FilterWorker(
             main_window=self, search_text="", filter_list="target_videos"
         )
@@ -99,7 +103,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.selected_video_button: widget_components.TargetMediaCardButton | None = (
             None
         )
-        self.selected_target_face_id = False
+        self.selected_target_face_id = None
         self._rightFacesStrip = None  # Container-Widget
         self._rightFacesButtonsRow = None  # HLayout für Buttons
         self._faceButtonsOriginalTexts = {}  # zum Wiederherstellen
@@ -169,6 +173,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.inputFacesList.setFlow(QtWidgets.QListWidget.LeftToRight)
         self.inputFacesList.setWrapping(True)
         self.inputFacesList.setResizeMode(QtWidgets.QListWidget.Adjust)
+
+        # Initialize list widgets with consistent sizing and layout configuration
+        list_view_actions.initialize_media_list_widgets(self)
+        list_view_actions.initialize_embeddings_list_widget(self)
 
         # Set up Menu Actions
         layout_actions.set_up_menu_actions(self)
@@ -487,7 +495,6 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         flags &= ~QtCore.Qt.WindowCloseButtonHint
         self.build_progress_dialog.setWindowFlags(flags)
         self.build_progress_dialog.setCancelButton(None)
-        self.build_progress_dialog.setCancelButton(None)
         self.build_progress_dialog.setWindowModality(
             QtCore.Qt.WindowModality.WindowModal
         )
@@ -539,117 +546,83 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         set_widget_visibility(ddim_steps_widget, is_full_restore_mode)
         set_widget_visibility(cfg_scale_widget, is_full_restore_mode)
 
-    def _populate_denoiser_unet_models(self):
-        unet_model_files = []
-        # default_unet_model = "ref_ldm_unet_real_refs_n1.onnx" # Prioritize based on existence and sorting later
+    def _populate_model_file_selection_widget(self, widget_name: str, scan_dir: str, prefix: str, ext: str):
+        """Helper that scans scan_dir for files matching prefix+ext, populates a SelectionBox widget."""
+        model_files = []
+        if os.path.exists(scan_dir):
+            for f_name in os.listdir(scan_dir):
+                if (not prefix or f_name.startswith(prefix)) and f_name.endswith(ext):
+                    model_files.append(f_name)
+        model_files.sort()
 
-        if os.path.exists(global_models_dir):
-            for f_name in os.listdir(global_models_dir):
-                if f_name.startswith("ref_ldm_unet_") and f_name.endswith(".onnx"):
-                    unet_model_files.append(f_name)
-
-        # Ensure the default model is in the list if it exists, and prioritize it
-        unet_model_files.sort()  # Sort alphabetically for consistent order
-
-        denoiser_model_widget = self.parameter_widgets.get("DenoiserUNetModelSelection")
-        if denoiser_model_widget and isinstance(
-            denoiser_model_widget, widget_components.SelectionBox
-        ):
-            current_selection_in_control = self.control.get(
-                "DenoiserUNetModelSelection"
-            )
-            denoiser_model_widget.clear()
-
-            if unet_model_files:
-                denoiser_model_widget.addItems(unet_model_files)
-
-                # If a previous selection exists and is still valid, keep it. Otherwise, pick the first.
-                if (
-                    not current_selection_in_control
-                    or current_selection_in_control not in unet_model_files
-                ):
-                    new_selection = unet_model_files[0]
-                    self.control["DenoiserUNetModelSelection"] = new_selection
-                    denoiser_model_widget.setCurrentText(new_selection)
+        selection_widget = self.parameter_widgets.get(widget_name)
+        if selection_widget and isinstance(selection_widget, widget_components.SelectionBox):
+            current_selection = self.control.get(widget_name)
+            selection_widget.clear()
+            if model_files:
+                selection_widget.addItems(model_files)
+                if not current_selection or current_selection not in model_files:
+                    new_selection = model_files[0]
+                    self.control[widget_name] = new_selection
+                    selection_widget.setCurrentText(new_selection)
                 else:
-                    denoiser_model_widget.setCurrentText(current_selection_in_control)
+                    selection_widget.setCurrentText(current_selection)
             else:
-                denoiser_model_widget.addItem("No UNet models found")
-                self.control["DenoiserUNetModelSelection"] = ""  # No model selected
-                denoiser_model_widget.setCurrentText("No UNet models found")
+                placeholder = f"No {ext.lstrip('.')} models found"
+                selection_widget.addItem(placeholder)
+                self.control[widget_name] = ""
+                selection_widget.setCurrentText(placeholder)
+
+    def _populate_denoiser_unet_models(self):
+        self._populate_model_file_selection_widget(
+            widget_name="DenoiserUNetModelSelection",
+            scan_dir=global_models_dir,
+            prefix="ref_ldm_unet_",
+            ext=".onnx",
+        )
 
     def _populate_reference_kv_tensors(self):
-        kv_tensor_files = []
         kv_tensors_dir = os.path.join(global_models_dir, "reference_kv_data")
-
-        if os.path.exists(kv_tensors_dir):
-            for f_name in os.listdir(kv_tensors_dir):
-                if f_name.endswith(".pt"):
-                    kv_tensor_files.append(f_name)
-
-        kv_tensor_files.sort()
-
-        kv_tensor_widget = self.parameter_widgets.get("ReferenceKVTensorsSelection")
-        if kv_tensor_widget and isinstance(
-            kv_tensor_widget, widget_components.SelectionBox
-        ):
-            current_selection_in_control = self.control.get(
-                "ReferenceKVTensorsSelection"
-            )
-            kv_tensor_widget.clear()
-
-            if kv_tensor_files:
-                kv_tensor_widget.addItems(kv_tensor_files)
-
-                if (
-                    not current_selection_in_control
-                    or current_selection_in_control not in kv_tensor_files
-                ):
-                    new_selection = kv_tensor_files[0]
-                    self.control["ReferenceKVTensorsSelection"] = new_selection
-                    kv_tensor_widget.setCurrentText(new_selection)
-                else:
-                    kv_tensor_widget.setCurrentText(current_selection_in_control)
-            else:
-                kv_tensor_widget.addItem("No K/V Tensors found")
-                self.control["ReferenceKVTensorsSelection"] = ""
-                kv_tensor_widget.setCurrentText("No K/V Tensors found")
+        self._populate_model_file_selection_widget(
+            widget_name="ReferenceKVTensorsSelection",
+            scan_dir=kv_tensors_dir,
+            prefix="",
+            ext=".pt",
+        )
 
     def handle_reference_kv_file_change(self, new_kv_file_name: str):
-        with self.models_processor.model_lock:
-            self.current_kv_tensors_map = None
-            self.control["ReferenceKVTensorsSelection"] = new_kv_file_name
-            self.previous_kv_file_selection = new_kv_file_name
-            if new_kv_file_name and new_kv_file_name != "No K/V tensor files found":
-                kv_file_path = (
-                    self.actual_models_dir_path / "reference_kv_data" / new_kv_file_name
-                )
-                if kv_file_path.exists():
-                    try:
-                        self.model_loading_signal.emit()
-                        kv_payload = torch.load(
-                            kv_file_path, map_location="cpu", weights_only=True
-                        )
-                        self.current_kv_tensors_map = kv_payload.get("kv_map")
-                        if self.current_kv_tensors_map:
-                            print(
-                                f"[INFO] Successfully loaded K/V map from {new_kv_file_name} for {len(self.current_kv_tensors_map)} layers."
-                            )
-                        else:
-                            print(f"[WARN] 'kv_map' not found in {new_kv_file_name}.")
-                            self.current_kv_tensors_map = None
-                        self.model_loaded_signal.emit()
-                    except Exception as e:
+        self.control["ReferenceKVTensorsSelection"] = new_kv_file_name
+        self.previous_kv_file_selection = new_kv_file_name
+        new_kv_tensors_map = None
+        if new_kv_file_name and new_kv_file_name != "No K/V tensor files found":
+            kv_file_path = (
+                self.actual_models_dir_path / "reference_kv_data" / new_kv_file_name
+            )
+            if kv_file_path.exists():
+                try:
+                    self.model_loading_signal.emit()
+                    kv_payload = torch.load(
+                        kv_file_path, map_location="cpu", weights_only=True
+                    )
+                    new_kv_tensors_map = kv_payload.get("kv_map")
+                    if new_kv_tensors_map:
                         print(
-                            f"[ERROR] Error loading K/V tensor file {kv_file_path}: {e}"
+                            f"[INFO] Successfully loaded K/V map from {new_kv_file_name} for {len(new_kv_tensors_map)} layers."
                         )
-                        self.current_kv_tensors_map = None
-                        self.model_loaded_signal.emit()
-                else:
-                    print(f"[ERROR] K/V tensor file not found: {kv_file_path}")
-                    self.current_kv_tensors_map = None
+                    else:
+                        print(f"[WARN] 'kv_map' not found in {new_kv_file_name}.")
+                        new_kv_tensors_map = None
+                    self.model_loaded_signal.emit()
+                except Exception as e:
+                    print(
+                        f"[ERROR] Error loading K/V tensor file {kv_file_path}: {e}"
+                    )
+                    new_kv_tensors_map = None
+                    self.model_loaded_signal.emit()
             else:
-                self.current_kv_tensors_map = None
+                print(f"[ERROR] K/V tensor file not found: {kv_file_path}")
+        with self.models_processor.model_lock:
+            self.current_kv_tensors_map = new_kv_tensors_map
 
         denoiser_enabled_before = self.control.get(
             "DenoiserUNetEnableBeforeRestorersToggle", False
@@ -722,8 +695,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # print("[INFO] Called resizeEvent()")
         super().resizeEvent(event)
         # Call the method to fit the image to the view whenever the window resizes
-        if self.scene.items():
-            pixmap_item = self.scene.items()[0]
+        items = self.scene.items()
+        pixmap_item = next((item for item in items if isinstance(item, QtWidgets.QGraphicsPixmapItem)), None)
+        if pixmap_item:
             # Set the scene rectangle to the bounding rectangle of the pixmap
             scene_rect = pixmap_item.boundingRect()
             self.graphicsViewFrame.setSceneRect(scene_rect)
@@ -766,21 +740,22 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         list_view_actions.clear_stop_loading_input_media(self)
         list_view_actions.clear_stop_loading_target_media(self)
 
-        save_load_actions.save_current_workspace(self, "last_workspace.json")
+        save_load_actions.save_current_workspace(self, str(self.project_root_path / "last_workspace.json"))
         self.video_processor.join_and_clear_threads()
         # Optionally handle the event if needed
         event.accept()
 
     def load_last_workspace(self):
         # Show the load workspace dialog if the file exists
-        if Path("last_workspace.json").is_file():
+        last_workspace_path = self.project_root_path / "last_workspace.json"
+        if last_workspace_path.is_file():
             auto_load_workspace_toggle = (
                 save_load_actions.get_auto_load_workspace_toggle(
-                    self, "last_workspace.json"
+                    self, str(last_workspace_path)
                 )
             )
             if auto_load_workspace_toggle:
-                save_load_actions.load_saved_workspace(self, "last_workspace.json")
+                save_load_actions.load_saved_workspace(self, str(last_workspace_path))
             else:
                 load_dialog = widget_components.LoadLastWorkspaceDialog(self)
                 load_dialog.exec_()
@@ -837,9 +812,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Max-Höhen: Liste + Buttons zusammen ~170px
         # -> Liste (Thumbnails)
         try:
-            self.targetFacesList.setMaximumHeight(80)  # kompakte Thumbnail-Zeile
-        except Exception:
-            pass
+            self.targetFacesList.setMaximumHeight(_FACE_STRIP_LIST_HEIGHT)  # kompakte Thumbnail-Zeile
+        except Exception as e:
+            print(f"[WARN] Layout operation failed: {e}")
 
         # Buttons-Reihe: optional per Container fixieren
         self._rightFacesButtonsRowContainer = getattr(
@@ -864,10 +839,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             parent_v.addWidget(self._rightFacesButtonsRowContainer)
             self._rightFacesButtonsRow = lay
 
-        self._rightFacesButtonsRowContainer.setFixedHeight(32)
+        self._rightFacesButtonsRowContainer.setFixedHeight(_FACE_STRIP_BUTTONS_HEIGHT)
 
         # Gesamthöhe des Strips hart deckeln
-        self._rightFacesStrip.setMaximumHeight(120)
+        self._rightFacesStrip.setMaximumHeight(_FACE_STRIP_MAX_HEIGHT)
 
         # ---- Layout-Gewichte: Tabs (Zeile 1) kriegen alles, Strip (Zeile 2) nichts ----
         self.gridLayout_5.setRowStretch(1, 1)  # Tabs
@@ -877,8 +852,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # targetFacesList aus Faces-Panel lösen
         try:
             self.gridLayout_2.removeWidget(self.targetFacesList)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Layout operation failed: {e}")
 
         self.targetFacesList.setParent(self._rightFacesStrip)
         sp = self.targetFacesList.sizePolicy()
@@ -904,8 +879,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             for b in btns:
                 self.controlButtonsLayout.removeWidget(b)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Layout operation failed: {e}")
 
         # Kurzlabels setzen und unten nebeneinander einsetzen
         short_map = {
@@ -926,14 +901,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.targetFacesList.setWrapping(True)
         self.targetFacesList.setSpacing(4)
         self.targetFacesList.setMinimumHeight(60)
-        self.targetFacesList.setMaximumHeight(80)  # wichtig
+        self.targetFacesList.setMaximumHeight(_FACE_STRIP_LIST_HEIGHT)  # wichtig
 
     def _restore_faces_strip_to_panel(self):
         # Liste zurück ins Faces-Panel (Originalzelle 1,1,1,1 – wie in deiner .ui)
         try:
             self._rightFacesFacesHolder.removeWidget(self.targetFacesList)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Layout operation failed: {e}")
 
         self.targetFacesList.setParent(self.facesPanelGroupBox)
         self.gridLayout_2.addWidget(self.targetFacesList, 1, 1, 1, 1)
@@ -949,8 +924,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         try:
             for b in btns:
                 self._rightFacesButtonsRow.removeWidget(b)
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"[WARN] Layout operation failed: {e}")
 
         for b in btns:
             b.setParent(self.facesButtonsWidget)
