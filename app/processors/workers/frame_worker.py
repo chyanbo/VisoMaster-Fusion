@@ -4719,15 +4719,17 @@ class FrameWorker(threading.Thread):
         frac = torch.frac(h * 0.5 + 0.5)
 
         # derive two independent offsets from hash
-        # FW-BUG-13: removed erroneous `/ 4` that silently quartered the slider effect
-        dx_base = ((frac) * 2.0 - 1.0) * float(max_amount_pixels)
+        # The / 4 scales the slider range to produce subtle MPEG-like block artifacts
+        # rather than extreme pixel shifts (slider values of 40-100 become 10-25 px).
+        _scaled_max = float(max_amount_pixels) / 4.0
+        dx_base = ((frac) * 2.0 - 1.0) * _scaled_max
 
         # second "source": just another linear combo
         h2 = torch.sin(
             (bx_grid * 96.233 + by_grid * 15.987 + (float(seed) + 101)) * 12345.6789
         )
         frac2 = torch.frac(h2 * 0.5 + 0.5)
-        dy_base = ((frac2) * 2.0 - 1.0) * float(max_amount_pixels)
+        dy_base = ((frac2) * 2.0 - 1.0) * _scaled_max
 
         # upsample to pixel grid by tiling each block offset BxB
         dx = torch.repeat_interleave(
