@@ -77,6 +77,13 @@ class FrameWorker(threading.Thread):
         self.t256_face = None
         self.interpolation_expression_faceeditor_back = None
         self.interpolation_block_shift = None
+        # FW-PERF-5: promote frequently-used inline Resize objects to instance
+        # attributes so they are not reconstructed on every swap_core call
+        self.t512_mask = None
+        self.t128_mask = None
+        self.t256_near = None
+        # Cache for Gabor kernels (FW-QUAL-3)
+        self._gabor_kernels_cache: dict = {}  # keyed by (kernel_size,sigma,lambd,gamma,psi,N,device_str)
 
         # --- Architecture References ---
         self.main_window = main_window
@@ -142,6 +149,17 @@ class FrameWorker(threading.Thread):
         # Pass relevant transforms to FrameEdits helper
         self.frame_edits.set_transforms(
             self.t256_face, self.interpolation_expression_faceeditor_back
+        )
+
+        # FW-PERF-5: initialize promoted inline transforms once here
+        self.t512_mask = v2.Resize(
+            (512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=True
+        )
+        self.t128_mask = v2.Resize(
+            (128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=True
+        )
+        self.t256_near = v2.Resize(
+            (256, 256), interpolation=v2.InterpolationMode.NEAREST, antialias=False
         )
 
     def run(self):
@@ -356,13 +374,8 @@ class FrameWorker(threading.Thread):
         ):
             face_specific_params_dict = self.parameters.get(target_id, {})
 
-            default_params_dict = (
-                dict(self.main_window.default_parameters.data)
-                if isinstance(self.main_window.default_parameters, ParametersDict)
-                else dict(
-                    self.main_window.default_parameters.data
-                )  # Assume .data is always the target
-            )
+            # FW-ROBUST-3: both branches were identical; use the expression directly
+            default_params_dict = dict(self.main_window.default_parameters.data)
 
             current_params_pd = ParametersDict(
                 dict(face_specific_params_dict), cast(dict, default_params_dict)
@@ -489,10 +502,8 @@ class FrameWorker(threading.Thread):
                 parameters_for_face["SwapModelSelection"], kps_5_on_crop_param
             )
 
-            # Define the 512x512 resizer for masks
-            t512_mask = v2.Resize(
-                (512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
-            )
+            # FW-PERF-5: use promoted instance-attribute transform for masks
+            t512_mask = self.t512_mask
 
             if (
                 comprehensive_mask_1x512x512_from_swap_core is None
@@ -918,7 +929,8 @@ class FrameWorker(threading.Thread):
             processed_perspective_crops_details,
             analyzed_faces_for_vr,
         )
-        torch.cuda.empty_cache()
+        # FW-MEM-1: removed torch.cuda.empty_cache() — calling it per-frame
+        # defeats the CUDA caching allocator and causes unnecessary overhead.
 
         return processed_tensor_rgb_uint8
 
@@ -949,7 +961,13 @@ class FrameWorker(threading.Thread):
                 new_h, new_w = int(512 * img_y / img_x), 512
             else:
                 new_h, new_w = 512, int(512 * img_x / img_y)
-            img = v2.Resize((new_h, new_w), antialias=False)(img)
+            # FW-ROBUST-2: respect the user's interpolation setting rather than
+            # always using the default (NEAREST / BILINEAR depending on build)
+            img = v2.Resize(
+                (new_h, new_w),
+                interpolation=self.interpolation_scaleback,
+                antialias=False,
+            )(img)
             scale_applied = True
 
         # Manual Rotation
@@ -1477,13 +1495,19 @@ class FrameWorker(threading.Thread):
 
         # --- Inswapper128 Logic ---
         if swapper_model == "Inswapper128":
+            # FS-ROBUST-01: calc_inswapper_latent may return None on emap failure
+            _s_latent_np = self.models_processor.calc_inswapper_latent(s_e)
+            _t_latent_np = self.models_processor.calc_inswapper_latent(t_e)
+            if _s_latent_np is None or _t_latent_np is None:
+                print("[ERROR] calc_inswapper_latent returned None (emap unavailable). Skipping swap.")
+                return input_face_affined, dfm_model_instance, dim, latent
             latent = (
-                torch.from_numpy(self.models_processor.calc_inswapper_latent(s_e))
+                torch.from_numpy(_s_latent_np)
                 .float()
                 .to(self.models_processor.device)
             )
             dst_latent = (
-                torch.from_numpy(self.models_processor.calc_inswapper_latent(t_e))
+                torch.from_numpy(_t_latent_np)
                 .float()
                 .to(self.models_processor.device)
             )
@@ -1662,6 +1686,8 @@ class FrameWorker(threading.Thread):
             )
             input_face_affined = input_face_affined.permute(1, 2, 0)
 
+        # FW-MEM-2: clone once here (before the loop) rather than on every
+        # loop iteration; only the final value is used after the loop exits.
         prev_face = input_face_affined.clone()
 
         if swapper_model == "Inswapper128":
@@ -1704,7 +1730,7 @@ class FrameWorker(threading.Thread):
                     output[j::dim, i::dim] = res_hwc
 
                 # 5. STATE UPDATE
-                prev_face = input_face_affined.clone()
+                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = output.clone()
                 output = torch.mul(output, 255)
                 output = torch.clamp(output, 0, 255)
@@ -1750,7 +1776,7 @@ class FrameWorker(threading.Thread):
                     res_hwc = res.squeeze(0).permute(1, 2, 0)
                     output[j::dim_res, i::dim_res] = res_hwc
 
-                prev_face = input_face_affined.clone()
+                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = output.clone()
                 output = torch.mul(output, 255)
                 output = torch.clamp(output, 0, 255)
@@ -1781,7 +1807,7 @@ class FrameWorker(threading.Thread):
                 swapper_output = torch.squeeze(swapper_output)
                 swapper_output = swapper_output.permute(1, 2, 0)
 
-                prev_face = input_face_affined.clone()
+                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = swapper_output.clone()
 
                 output = swapper_output.clone()
@@ -1816,12 +1842,18 @@ class FrameWorker(threading.Thread):
 
                 swapper_output = swapper_output[0]
                 if swapper_output.sum() < 1.0:
-                    pass
+                    # FW-BUG-11: use the input face as fallback instead of
+                    # silently continuing with an essentially-zero tensor.
+                    # input_face_affined is [H,W,3] in [0,1]; convert to the
+                    # GhostFace [-1,1] CHW range that swapper_output uses.
+                    swapper_output = (
+                        input_face_affined.permute(2, 0, 1) * 2.0 - 1.0
+                    )
                 swapper_output = swapper_output.permute(1, 2, 0)
                 swapper_output = torch.mul(swapper_output, 127.5)
                 swapper_output = torch.add(swapper_output, 127.5)
 
-                prev_face = input_face_affined.clone()
+                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = swapper_output.clone()
                 input_face_affined = torch.div(input_face_affined, 255)
 
@@ -1855,7 +1887,7 @@ class FrameWorker(threading.Thread):
                 swapper_output = torch.add(torch.mul(swapper_output, 0.5), 0.5)
                 swapper_output = swapper_output.permute(1, 2, 0)
 
-                prev_face = input_face_affined.clone()
+                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = swapper_output.clone()
 
                 output = swapper_output.clone()
@@ -1868,7 +1900,7 @@ class FrameWorker(threading.Thread):
                 parameters["DFMAmpMorphSlider"] / 100,
                 rct=parameters["DFMRCTColorToggle"],
             )
-            prev_face = input_face_affined.clone()
+            # FW-MEM-2: prev_face already set before any branching; no extra clone
             input_face_affined = out_celeb.clone()
             output = out_celeb.clone()
 
@@ -1992,19 +2024,21 @@ class FrameWorker(threading.Thread):
         parameters = parameters if parameters is not None else {}
         control = control if control is not None else {}
         swapper_model = parameters["SwapModelSelection"]
-        self.set_scaling_transforms(control)
+        itex = 1  # FW-BUG-10: default before any branching to prevent NameError
+
+        # FW-PERF-4: set_scaling_transforms is already called in process_frame;
+        # calling it again here per-face-per-frame rebuilds 12 transform objects
+        # unnecessarily. Removed.
 
         debug = control.get("CommandLineDebugEnableToggle", False)
         debug_info: dict[str, str] = {}
 
         tform = self.get_face_similarity_tform(swapper_model, kps_5)
 
-        t512_mask = v2.Resize(
-            (512, 512), interpolation=v2.InterpolationMode.BILINEAR, antialias=True
-        )
-        t128_mask = v2.Resize(
-            (128, 128), interpolation=v2.InterpolationMode.BILINEAR, antialias=True
-        )
+        # FW-PERF-5: use promoted instance-attribute transforms (initialized in
+        # set_scaling_transforms) instead of constructing new objects each call
+        t512_mask = self.t512_mask
+        t128_mask = self.t128_mask
 
         original_face_512, original_face_384, original_face_256, original_face_128 = (
             self.get_transformed_and_scaled_faces(tform, img)
@@ -2373,9 +2407,8 @@ class FrameWorker(threading.Thread):
             swap_mask = swap_mask * mask_resized
 
         # --- DFL XSeg ---
-        t256_near = v2.Resize(
-            (256, 256), interpolation=v2.InterpolationMode.NEAREST, antialias=False
-        )
+        # FW-PERF-5: use promoted instance-attribute transform
+        t256_near = self.t256_near
 
         if parameters.get("DFLXSegEnableToggle", False):
             img_xseg_256 = t256_near(original_face_512)
@@ -3150,7 +3183,7 @@ class FrameWorker(threading.Thread):
             )
 
             block_shift_blend = parameters["BlockShiftBlendAmountSlider"] / 100.0
-            swap = swap2 * block_shift_blend + swap * (1.0 - block_shift_blend)
+            # FW-BUG-14: removed duplicate standalone blend; keep only torch.add version
             swap = torch.add(
                 torch.mul(swap2, block_shift_blend),
                 torch.mul(swap, 1 - block_shift_blend),
@@ -3422,7 +3455,24 @@ class FrameWorker(threading.Thread):
     ):
         """
         Returns: Tensor [N, 1, k, k]
+
+        FW-QUAL-3: Kernels are cached by parameter tuple so they are only
+        rebuilt when the parameters actually change.
         """
+        N = theta_values.shape[0]
+        cache_key = (
+            int(kernel_size),
+            float(sigma),
+            float(lambd),
+            float(gamma),
+            float(psi),
+            int(N),
+            str(device),
+        )
+        cached = self._gabor_kernels_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         half = kernel_size // 2
         y, x = torch.meshgrid(
             torch.linspace(-half, half, kernel_size, device=device),
@@ -3439,7 +3489,9 @@ class FrameWorker(threading.Thread):
             gb *= torch.cos(2 * math.pi * x_theta / lambd + psi)
             kernels.append(gb)
 
-        return torch.stack(kernels).unsqueeze(1)  # → [N, 1, k, k]
+        result = torch.stack(kernels).unsqueeze(1)  # → [N, 1, k, k]
+        self._gabor_kernels_cache[cache_key] = result
+        return result
 
     def face_restorer_auto(
         self,
@@ -3792,7 +3844,7 @@ class FrameWorker(threading.Thread):
         frac = torch.frac(h * 0.5 + 0.5)
 
         # derive two independent offsets from hash
-        max_amount_pixels = max_amount_pixels / 4
+        # FW-BUG-13: removed erroneous `/ 4` that silently quartered the slider effect
         dx_base = ((frac) * 2.0 - 1.0) * float(max_amount_pixels)
 
         # second "source": just another linear combo

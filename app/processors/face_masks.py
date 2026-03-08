@@ -32,6 +32,15 @@ class FaceMasks:
 
         self.clip_model_loaded = False
         self.active_models: set[str] = set()
+        # FM-05: cache the CLIP transform as a class attribute (Resize must come before Normalize)
+        self._clip_transform = transforms.Compose(
+            [
+                transforms.Resize((352, 352)),
+                transforms.Normalize(
+                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
+                ),
+            ]
+        )
 
     def unload_models(self):
         """Unloads all models managed by this class via the processor."""
@@ -124,6 +133,10 @@ class FaceMasks:
         lips_swap = (labels_swap == 12) | (labels_swap == 13)
 
         if inner_swap.sum() == 0:
+            return None, None
+
+        # FM-16: guard against empty mouth_swap before calling max()/min() on it
+        if mouth_swap.sum() == 0:
             return None, None
 
         enhanced_swap_img = swap_img.clone()
@@ -371,13 +384,13 @@ class FaceMasks:
         labels_swap = self._faceparser_labels(swap_img)
 
         if parameters.get("MouthParserStretchOriginalToggle", False):
-            # L'utilisateur veut la bouche ORIGINALE (avec Alignement et Zoom)
+            # The user wants the ORIGINAL mouth (with Alignment and Zoom)
             labels_orig = self._faceparser_labels(original_img)
             return self._enhance_and_align_original_mouth(
                 original_img, labels_orig, labels_swap, parameters
             )
         else:
-            # L'utilisateur veut la bouche SWAPPÉE (avec Upscale et Zoom)
+            # The user wants the SWAPPED mouth (with Upscale and Zoom)
             return self._enhance_and_align_swapped_mouth(
                 swap_img, labels_swap, parameters
             )
@@ -458,23 +471,23 @@ class FaceMasks:
         if should_get_orig_labels:
             labels_orig = self._faceparser_labels(original_face_512)
 
-        """ # ---------- 1. MOUTH FIT & ALIGN LOGIC ----------
-        if need_mouth_stretch and labels_swap is not None:
-            overlay, overlay_mask = self._enhance_swapped_mouth(
-                swap_restorecalc, labels_swap, parameters
-            )
-
-            if overlay is not None:
-                if overlay.shape[1] != target_h:
-                    overlay = resize_to_target(overlay)
-                    overlay_mask = v2.Resize(
-                        (target_h, target_w), interpolation=v2.InterpolationMode.NEAREST
-                    )(overlay_mask.unsqueeze(0)).squeeze(0)
-
-                result["mouth_overlay_info"] = (overlay, overlay_mask)
-                if control.get("CommandLineDebugEnableToggle", False):
-                    print("[INFO] Mouth Align: Applied Enhanced Swapped Mouth.")
-        """
+        # FM-12: removed dead code (was triple-quoted string acting as a comment)
+        # ---------- 1. MOUTH FIT & ALIGN LOGIC ----------
+        # if need_mouth_stretch and labels_swap is not None:
+        #     overlay, overlay_mask = self._enhance_swapped_mouth(
+        #         swap_restorecalc, labels_swap, parameters
+        #     )
+        #
+        #     if overlay is not None:
+        #         if overlay.shape[1] != target_h:
+        #             overlay = resize_to_target(overlay)
+        #             overlay_mask = v2.Resize(
+        #                 (target_h, target_w), interpolation=v2.InterpolationMode.NEAREST
+        #             )(overlay_mask.unsqueeze(0)).squeeze(0)
+        #
+        #         result["mouth_overlay_info"] = (overlay, overlay_mask)
+        #         if control.get("CommandLineDebugEnableToggle", False):
+        #             print("[INFO] Mouth Align: Applied Enhanced Swapped Mouth.")
         # ---------- 1.5 XSEG MOUTH PROTECTION (NEW) ----------
         if need_xseg_mouth_protection and labels_swap is not None:
             # Class 11: Inner Mouth, 12: Upper Lip, 13: Lower Lip
@@ -700,7 +713,9 @@ class FaceMasks:
         lut = torch.zeros(19, device=labels.device, dtype=torch.float32)
         if classes:
             lut[torch.tensor(classes, device=labels.device, dtype=torch.long)] = 1.0
-        return lut[labels]
+        # FM-08: clamp labels to valid LUT range to prevent out-of-bounds indexing
+        labels_safe = labels.clamp(0, 18)
+        return lut[labels_safe]
 
     # --- Occluder & XSeg ---
 
@@ -798,6 +813,10 @@ class FaceMasks:
             if ort_session:
                 self.active_models.add(model_name)
 
+        # FM-01: guard against None model
+        if not ort_session:
+            return
+
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="img",
@@ -871,8 +890,9 @@ class FaceMasks:
             print("[ERROR] FaceParser model not found or failed to load.")
 
     def apply_dfl_xseg(self, img, amount, mouth, parameters, inner_mouth_mask=None):
-        amount2 = -parameters["DFLXSeg2SizeSlider"]
-        amount_calc = -parameters["BackgroundParserTextureSlider"]
+        # FM-07: use .get() for all parameter accesses to avoid KeyError
+        amount2 = -parameters.get("DFLXSeg2SizeSlider", 0)
+        amount_calc = -parameters.get("BackgroundParserTextureSlider", 0)
 
         img = img.type(torch.float32)
         img = torch.div(img, 255)
@@ -913,7 +933,7 @@ class FaceMasks:
             outpred = 1 - outpred
             outpred = outpred.clamp(0, 1)
 
-        blur_amount = parameters["OccluderXSegBlurSlider"]
+        blur_amount = parameters.get("OccluderXSegBlurSlider", 0)
         if blur_amount > 0:
             blur_key = (blur_amount, (blur_amount + 1) * 0.2)
             if blur_key not in self._blur_cache:
@@ -939,7 +959,7 @@ class FaceMasks:
                 outpred2 = 1 - outpred2
                 outpred2 = outpred2.clamp(0, 1)
 
-            blur_amount2 = parameters["XSeg2BlurSlider"]
+            blur_amount2 = parameters.get("XSeg2BlurSlider", 0)
             if blur_amount2 > 0:
                 blur_key2 = (blur_amount2, (blur_amount2 + 1) * 0.2)
                 if blur_key2 not in self._blur_cache:
@@ -962,7 +982,8 @@ class FaceMasks:
                 outpred_noFP = outpred_noFP.unsqueeze(0)
             outpred_noFP = outpred_noFP * (1.0 - inner_mouth_mask)
 
-        if parameters["BgExcludeEnableToggle"] and amount_calc != 0:
+        # FM-07: use .get() for BgExcludeEnableToggle and BGExcludeBlurAmountSlider
+        if parameters.get("BgExcludeEnableToggle", False) and amount_calc != 0:
             if amount_calc > 0:
                 r2 = int(amount_calc)
                 k2 = 2 * r2 + 1
@@ -970,12 +991,17 @@ class FaceMasks:
                     outpred_calc_dill, kernel_size=k2, stride=1, padding=r2
                 )
                 outpred_calc_dill = outpred_calc_dill.clamp(0, 1)
-                if parameters["BGExcludeBlurAmountSlider"] > 0:
-                    gauss = transforms.GaussianBlur(
-                        parameters["BGExcludeBlurAmountSlider"] * 2 + 1,
-                        (parameters["BGExcludeBlurAmountSlider"] + 1) * 0.2,
+                bg_blur = parameters.get("BGExcludeBlurAmountSlider", 0)
+                if bg_blur > 0:
+                    # FM-10: use _blur_cache instead of creating new GaussianBlur per call
+                    bg_blur_key = (bg_blur, (bg_blur + 1) * 0.2)
+                    if bg_blur_key not in self._blur_cache:
+                        self._blur_cache[bg_blur_key] = transforms.GaussianBlur(
+                            bg_blur * 2 + 1, (bg_blur + 1) * 0.2
+                        )
+                    outpred_calc_dill = self._blur_cache[bg_blur_key](
+                        outpred_calc_dill.type(torch.float32)
                     )
-                    outpred_calc_dill = gauss(outpred_calc_dill.type(torch.float32))
                 outpred_calc_dill = outpred_calc_dill.clamp(0, 1)
             elif amount_calc < 0:
                 r2 = int(-amount_calc)
@@ -985,13 +1011,18 @@ class FaceMasks:
                     outpred_calc_dill, kernel_size=k2, stride=1, padding=r2
                 )
                 outpred_calc_dill = 1 - outpred_calc_dill
-                if parameters["BGExcludeBlurAmountSlider"] > 0:
+                bg_blur = parameters.get("BGExcludeBlurAmountSlider", 0)
+                if bg_blur > 0:
                     orig = outpred_calc_dill.clone()
-                    gauss = transforms.GaussianBlur(
-                        parameters["BGExcludeBlurAmountSlider"] * 2 + 1,
-                        (parameters["BGExcludeBlurAmountSlider"] + 1) * 0.2,
+                    # FM-10: use _blur_cache instead of creating new GaussianBlur per call
+                    bg_blur_key = (bg_blur, (bg_blur + 1) * 0.2)
+                    if bg_blur_key not in self._blur_cache:
+                        self._blur_cache[bg_blur_key] = transforms.GaussianBlur(
+                            bg_blur * 2 + 1, (bg_blur + 1) * 0.2
+                        )
+                    outpred_calc_dill = self._blur_cache[bg_blur_key](
+                        outpred_calc_dill.type(torch.float32)
                     )
-                    outpred_calc_dill = gauss(outpred_calc_dill.type(torch.float32))
                     outpred_calc_dill = torch.max(outpred_calc_dill, orig)
                 outpred_calc_dill = outpred_calc_dill.clamp(0, 1)
         return outpred, outpred_calc, outpred_calc_dill, outpred_noFP
@@ -1045,11 +1076,19 @@ class FaceMasks:
         if sess is None:
             sess = self.models_processor.load_model(model_key)
 
+        # FM-02: guard against None model
+        if sess is None:
+            return output_tensor
+
         image_tensor = image_tensor.contiguous()
         io_binding = sess.io_binding()
 
+        # FM-02: use dynamic node names instead of hardcoded "input" / "features"
+        input_name = sess.get_inputs()[0].name
+        output_name = sess.get_outputs()[0].name
+
         io_binding.bind_input(
-            name="input",
+            name=input_name,
             device_type=self.models_processor.device,
             device_id=0,
             element_type=np.float32,
@@ -1057,7 +1096,7 @@ class FaceMasks:
             buffer_ptr=image_tensor.data_ptr(),
         )
         io_binding.bind_output(
-            name="features",
+            name=output_name,
             device_type=self.models_processor.device,
             device_id=0,
             element_type=np.float32,
@@ -1100,15 +1139,8 @@ class FaceMasks:
 
         clip_mask = torch.ones((352, 352), device=device)
         img = img.float() / 255.0
-        transform = transforms.Compose(
-            [
-                transforms.Normalize(
-                    mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
-                ),
-                transforms.Resize((352, 352)),
-            ]
-        )
-        CLIPimg = transform(img).unsqueeze(0).contiguous().to(device)
+        # FM-05: use cached transform (correct order: Resize then Normalize)
+        CLIPimg = self._clip_transform(img).unsqueeze(0).contiguous().to(device)
 
         if CLIPText != "":
             prompts = CLIPText.split(",")
@@ -1129,17 +1161,21 @@ class FaceMasks:
     # --- Restoration Helpers (Eyes/Mouth) ---
 
     def soft_oval_mask(
-        self, height, width, center, radius_x, radius_y, feather_radius=None
+        self, height, width, center, radius_x, radius_y, feather_radius=None, device=None
     ):
         if feather_radius is None:
             feather_radius = max(radius_x, radius_y) // 2
 
-        cache_key = (height, width)
+        # FM-09: include device in the cache key and create tensors on the correct device
+        _device = device if device is not None else self.models_processor.device
+        cache_key = (height, width, str(_device))
         if cache_key in self._meshgrid_cache:
             y, x = self._meshgrid_cache[cache_key]
         else:
             y, x = torch.meshgrid(
-                torch.arange(height), torch.arange(width), indexing="ij"
+                torch.arange(height, device=_device),
+                torch.arange(width, device=_device),
+                indexing="ij",
             )
             self._meshgrid_cache[cache_key] = (y, x)
 
@@ -1322,14 +1358,16 @@ class FaceMasks:
 
         diff_min = diff.min()
         diff_max = diff.max()
-        diff_norm = (diff - diff_min) / (diff_max - diff_min)
+        # FM-03: guard against division by zero when diff_min == diff_max
+        diff_norm = (diff - diff_min) / (diff_max - diff_min + 1e-6)
 
         diff_mean = diff_norm.mean(dim=0)
         scale = diff_mean / lower_thresh
         result = torch.where(
             diff_mean < lower_thresh,
             lower_value + scale * (middle_value - lower_value),
-            torch.empty_like(diff_mean),
+            # FM-04: use zeros_like instead of empty_like to avoid uninitialized memory
+            torch.zeros_like(diff_mean),
         )
 
         middle_scale = (diff_mean - lower_thresh) / (upper_thresh - lower_thresh)

@@ -1,3 +1,4 @@
+import threading
 from typing import TYPE_CHECKING, Dict, Any
 
 import torch
@@ -39,6 +40,7 @@ class FaceDetectors:
         # Tracking State
         self.tracker = None
         self.track_history = {}  # {track_id: {'cum_score': float, 'last_seen': int}}
+        self._track_history_lock = threading.Lock()
         self.lambda_s = 0.3  # Smoothing factor for cumulative scores
 
         # This map links a detector name (from the UI) to its model file and processing function.
@@ -96,7 +98,7 @@ class FaceDetectors:
         # Ensure resized_img is compatible with canvas dtype before assignment
         if canvas_dtype == torch.uint8 and resized_img.dtype != torch.uint8:
             # Assuming resized_img might be float [0, 255] after resize
-            resized_img_casted = resized_img.byte()
+            resized_img_casted = resized_img.clamp(0, 255).byte()
         elif canvas_dtype == torch.float32 and resized_img.dtype == torch.uint8:
             resized_img_casted = resized_img.float()  # Keep range [0, 255] for now
         else:
@@ -244,6 +246,9 @@ class FaceDetectors:
                 bindex = torch.arange(
                     det_boxes.shape[0], device=self.models_processor.device
                 )[:max_num]
+                det_boxes = det_boxes[bindex]
+                det_kpss = det_kpss[bindex]
+                det_scores = det_scores[bindex]
 
         # Transfer final results back to CPU and scale them to the original image dimensions.
         det_scale_val = det_scale.cpu().item()
@@ -496,24 +501,19 @@ class FaceDetectors:
         # If no previous detections or tracking failed, run the heavy model
         detector = self.detector_map.get(detect_mode)
         if not detector:
-            return [], [], []
+            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2))
 
         model_name = detector["model_name"]
         if self.current_detector_model and self.current_detector_model != model_name:
             self.models_processor.unload_model(self.current_detector_model)
         self.current_detector_model = model_name
 
-        if not self.models_processor.models.get(model_name):
-            self.models_processor.models[model_name] = self.models_processor.load_model(
-                model_name
-            )
-
-        ort_session = self.models_processor.models.get(model_name)
+        ort_session = self.models_processor.load_model(model_name)
         if not ort_session:
             print(
                 f"[ERROR] {model_name} model failed to load or is not available. Skipping detection."
             )
-            return [], [], []
+            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2))
 
         detection_function = detector["function"]
 
@@ -539,6 +539,10 @@ class FaceDetectors:
 
         # Run the detector — returns (det, kpss_5, kpss, det_scores)
         det, kpss_5, kpss, det_scores = detection_function(**args)
+
+        # Initialize score_values so it is always bound before the ByteTrack block
+        # (det_scores from detection_function may not be assigned in all paths).
+        score_values = np.array([])
 
         # ByteTrack Advanced Tracking
         if use_bytetrack and BYTETracker is not None:
@@ -583,28 +587,22 @@ class FaceDetectors:
                 best_iou = 0
                 match_idx = -1
                 for i, d in enumerate(det):
-                    xA, yA = max(t_bbox[0], d[0]), max(t_bbox[1], d[1])
-                    xB, yB = min(t_bbox[2], d[2]), min(t_bbox[3], d[3])
-                    interArea = max(0, xB - xA) * max(0, yB - yA)
-                    if interArea > 0:
-                        bAArea = (t_bbox[2] - t_bbox[0]) * (t_bbox[3] - t_bbox[1])
-                        bBArea = (d[2] - d[0]) * (d[3] - d[1])
-                        iou = interArea / float(bAArea + bBArea - interArea)
-                        if iou > best_iou:
-                            best_iou = iou
-                            match_idx = i
+                    iou = self._calculate_iou(t_bbox, d)
+                    if iou > best_iou:
+                        best_iou = iou
+                        match_idx = i
 
                 if match_idx != -1:
                     # Update Cumulative Similarity Score for UI stability
-                    if tid in self.track_history:
-                        prev_score = self.track_history[tid]["cum_score"]
-                        cum_score = (
-                            self.lambda_s * t.score + (1 - self.lambda_s) * prev_score
-                        )
-                    else:
-                        cum_score = t.score
-
-                    self.track_history[tid] = {"cum_score": cum_score}
+                    with self._track_history_lock:
+                        if tid in self.track_history:
+                            prev_score = self.track_history[tid]["cum_score"]
+                            cum_score = (
+                                self.lambda_s * t.score + (1 - self.lambda_s) * prev_score
+                            )
+                        else:
+                            cum_score = t.score
+                        self.track_history[tid] = {"cum_score": cum_score}
 
                     tracked_det.append(t_bbox)
                     tracked_kpss_5.append(kpss_5[match_idx])
@@ -681,7 +679,7 @@ class FaceDetectors:
 
         for angle in rotation_angles:
             if angle != 0:
-                aimg, M = faceutil.transform(det_img, (cx, cy), 640, 1.0, angle)
+                aimg, M = faceutil.transform(det_img, (cx, cy), max(final_input_size), 1.0, angle)
                 IM = faceutil.invertAffineTransform(M)
                 aimg = torch.unsqueeze(aimg, 0).contiguous()
             else:
@@ -825,7 +823,7 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return [], [], [], np.array([])
+            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
 
         # Optionally refine landmarks with a secondary model
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)
@@ -855,7 +853,7 @@ class FaceDetectors:
 
         for angle in rotation_angles:
             if angle != 0:
-                aimg, M = faceutil.transform(det_img, (cx, cy), 640, 1.0, angle)
+                aimg, M = faceutil.transform(det_img, (cx, cy), max(final_input_size), 1.0, angle)
                 IM = faceutil.invertAffineTransform(M)
                 aimg = torch.unsqueeze(aimg, 0).contiguous()
             else:
@@ -998,7 +996,7 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return [], [], [], np.array([])
+            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
 
         # Optionally refine landmarks with a secondary model
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)
@@ -1161,7 +1159,7 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return [], [], [], np.array([])
+            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
 
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)
 
@@ -1262,7 +1260,7 @@ class FaceDetectors:
                 bbox_cxy = (
                     reg_pred[pos_inds, :2] * stride + anchor_centers[pos_inds, :]
                 )  # Filter anchor_centers too
-                bbox_wh = np.exp(reg_pred[pos_inds, 2:]) * stride
+                bbox_wh = np.exp(np.clip(reg_pred[pos_inds, 2:], -10.0, 10.0)) * stride
 
                 bboxes = np.stack(
                     [
@@ -1370,6 +1368,6 @@ class FaceDetectors:
             kwargs.get("max_num"),
         )
         if det is None:
-            return [], [], [], np.array([])
+            return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2)), np.empty((0,))
 
         return self._refine_landmarks(img_landmark, det, kpss, score_values, **kwargs)

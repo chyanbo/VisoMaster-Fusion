@@ -38,6 +38,7 @@ try:
 except ModuleNotFoundError:
     print("[WARN] No TensorRT Found")
     TENSORRT_AVAILABLE = False
+    trt = None
 
 # --- Internal Project Imports ---
 
@@ -66,7 +67,6 @@ if TYPE_CHECKING:
 
 onnxruntime.set_default_logger_severity(4)
 onnxruntime.log_verbosity_level = -1
-lock = threading.Lock()
 
 SRGB_GAMMA = (
     2.2  # More precise sRGB gamma handling is complex, this is an approximation
@@ -118,21 +118,20 @@ def _probe_onnx_model_worker(
     an ONNX model, especially for the TensorRT provider.
     This triggers the engine cache build without freezing the main thread.
     """
-    try:
-        # Re-import dependencies
-        import os
-        import sys
-        import traceback
-        import onnxruntime
+    # Move all imports to top of function so sys.exit(1) is always available
+    import os
+    import sys
+    import traceback
+    import onnxruntime
+    import torch
 
+    try:
         # Create the SessionOptions object *inside* the worker process.
         session_options = onnxruntime.SessionOptions()
         if session_options_dict:
             for key, value in session_options_dict.items():
                 # Use setattr to configure the SessionOptions object
                 setattr(session_options, key, value)
-
-        import torch
 
         # Reconstruct the providers tuple
         providers = []
@@ -314,7 +313,11 @@ class ModelsProcessor(QtCore.QObject):
         self.alphas_cumprod_torch = (
             torch.from_numpy(self.alphas_cumprod_np).float().to(self.device)
         )
+        # NOTE: vae_scale_factor=1.0 is intentional for this model's specific VAE configuration
         self.vae_scale_factor = 1.0
+
+        # Cache for DDIM schedule tensors, keyed by (ddim_steps, ddim_eta)
+        self._ddim_schedule_cache: dict = {}
 
         self.clip_session: list = []
 
@@ -579,7 +582,7 @@ class ModelsProcessor(QtCore.QObject):
                             f"[WARN] Failed to load/build TRT engine for '{model_name}'. Falling back to ONNX Runtime."
                         )
 
-            build_was_triggered = False
+            build_was_triggered = False  # MP-05: flag to track if build dialog was shown
             is_tensorrt_load = any(
                 (p[0] if isinstance(p, tuple) else p) == "TensorrtExecutionProvider"
                 for p in self.providers
@@ -591,9 +594,8 @@ class ModelsProcessor(QtCore.QObject):
                     # Check if engine config file exists...
                     cache_is_valid = self._check_tensorrt_cache(model_name, onnx_path)
 
-                    # If no engine config file or cache file exists run the prob
+                    # If no engine config file or cache file exists run the probe
                     if not cache_is_valid:
-                        build_was_triggered = True  # Mark that a build was attempted
                         print(
                             f"[INFO] TensorRT load detected for {model_name}. Running isolated probe..."
                         )
@@ -640,12 +642,25 @@ class ModelsProcessor(QtCore.QObject):
                                         sess_options_dict,
                                     ),
                                 )
-                                probe_process.start()
 
-                                # Run a local event loop to keep the GUI responsive.
-                                while probe_process.is_alive():
-                                    QtCore.QCoreApplication.processEvents()
-                                    time.sleep(0.02)  # Yield to other threads/processes
+                                # MP-01: Release model_lock before starting the probe subprocess
+                                # so other threads are not blocked during the potentially long build.
+                                self.model_lock.release()
+                                try:
+                                    probe_process.start()
+                                    # MP-19: set build_was_triggered only after start() succeeds
+                                    build_was_triggered = True
+
+                                    # Run a local event loop to keep the GUI responsive.
+                                    while probe_process.is_alive():
+                                        QtCore.QCoreApplication.processEvents()
+                                        time.sleep(0.02)  # Yield to other threads/processes
+
+                                    # MP-24: join the probe process after the spin loop
+                                    probe_process.join()
+                                finally:
+                                    # MP-01: Re-acquire model_lock after probe finishes
+                                    self.model_lock.acquire()
 
                                 # Process finished, get exit code
                                 exitcode = probe_process.exitcode
@@ -676,8 +691,9 @@ class ModelsProcessor(QtCore.QObject):
                                 )
 
                         except Exception:
-                            # Ask the main thread to hide the dialog on failure
-                            self.hide_build_dialog.emit()
+                            # MP-05: only emit hide_build_dialog when build was triggered
+                            if build_was_triggered:
+                                self.hide_build_dialog.emit()
 
                             print(f"[ERROR] Isolated probe failed for {model_name}.")
                             print(
@@ -691,6 +707,14 @@ class ModelsProcessor(QtCore.QObject):
 
             # Now, proceed with the *actual* load in the main thread.
             try:
+                # MP-01: Double-checked load after re-acquiring the lock.
+                # Another thread may have loaded this model while we were in the probe.
+                if self.models.get(model_name):
+                    print(
+                        f"[INFO] Skipped loading: {model_name} is already loaded in memory (post-probe check)."
+                    )
+                    return self.models.get(model_name)
+
                 if session_options is None:
                     model_instance = onnxruntime.InferenceSession(
                         self.models_path[model_name],
@@ -718,15 +742,6 @@ class ModelsProcessor(QtCore.QObject):
                         )
                         self.models_pending_build.add(model_name)
 
-                # Race condition check: Did another thread load it while we were building?
-                if self.models.get(model_name):
-                    del model_instance
-                    gc.collect()
-                    print(
-                        f"[INFO] Skipped loading: {model_name} is already loaded in memory."
-                    )
-                    return self.models.get(model_name)
-
                 self.models[model_name] = model_instance
                 print(
                     f"[INFO] Loading model: {model_name} with provider: {self.provider_name}"
@@ -743,6 +758,9 @@ class ModelsProcessor(QtCore.QObject):
                         self.emap = onnx.numpy_helper.to_array(emap_initializer)
                     else:
                         self.emap = onnx.numpy_helper.to_array(graph.initializer[-1])
+                    # MP-17: release large ONNX graph object after emap extraction
+                    del graph
+                    gc.collect()
                 return model_instance
 
             except Exception:
@@ -756,21 +774,23 @@ class ModelsProcessor(QtCore.QObject):
                 return None
 
             finally:
-                # Always hide the dialog at the very end,
-                # covering both the probe and the actual load.
-                self.hide_build_dialog.emit()
+                # MP-05: Only emit hide_build_dialog when a build was triggered.
+                if build_was_triggered:
+                    self.hide_build_dialog.emit()
 
     def check_and_clear_pending_build(self, model_name: str) -> bool:
         """
         Checks if a model is pending its first-run lazy build.
         If it is, it clears the flag and returns True.
         """
-        if model_name in self.models_pending_build:
-            print(
-                f"[INFO] Model '{model_name}' is triggering its first-run lazy build."
-            )
-            self.models_pending_build.remove(model_name)
-            return True
+        with self.model_lock:
+            if model_name in self.models_pending_build:
+                print(
+                    f"[INFO] Model '{model_name}' is triggering its first-run lazy build."
+                )
+                # MP-08: use discard for atomic, safe removal (no KeyError)
+                self.models_pending_build.discard(model_name)
+                return True
         return False
 
     def load_dfm_model(self, dfm_model):
@@ -858,6 +878,10 @@ class ModelsProcessor(QtCore.QObject):
                         )
 
                         build_process.start()
+                        # MP-27: non-blocking join to keep GUI responsive during build
+                        while build_process.is_alive():
+                            QtCore.QCoreApplication.processEvents()
+                            time.sleep(0.02)
                         build_process.join()
 
                         if build_process.exitcode != 0:
@@ -914,7 +938,6 @@ class ModelsProcessor(QtCore.QObject):
         model_names_to_unload = list(self.dfm_models.keys())
         for model_name in model_names_to_unload:
             self.unload_dfm_model(model_name)
-        self.clip_session = []
 
     def unload_dfm_model(self, model_name_to_unload):
         # Check if unloading should be skipped
@@ -949,11 +972,13 @@ class ModelsProcessor(QtCore.QObject):
 
                 if model_instance is not None:
                     print(f"[INFO] Unloading ONNX model: {model_name_to_unload}")
+                    # MP-06: set dict entry to None first, then del the instance
+                    self.models[model_name_to_unload] = None
                     # Explicitly delete the object to trigger its __del__ method
                     del model_instance
                     unloaded = True
-
-                self.models[model_name_to_unload] = None
+                else:
+                    self.models[model_name_to_unload] = None
 
             # Handle TRT-Engine models (for the dedicated .trt file provider)
             if (
@@ -989,6 +1014,9 @@ class ModelsProcessor(QtCore.QObject):
     def switch_providers_priority(self, provider_name):
         match provider_name:
             case "TensorRT" | "TensorRT-Engine":
+                # MP-04: guard against TensorRT not being installed
+                if not TENSORRT_AVAILABLE or trt is None:
+                    raise RuntimeError("TensorRT is not installed.")
                 providers = [
                     ("TensorrtExecutionProvider", self.trt_ep_options),
                     ("CUDAExecutionProvider"),
@@ -1010,6 +1038,9 @@ class ModelsProcessor(QtCore.QObject):
             case "CUDA":
                 providers = [("CUDAExecutionProvider"), ("CPUExecutionProvider")]
                 self.device = "cuda"
+            case _:
+                # MP-22: raise on unknown provider name
+                raise ValueError(f"Unknown provider: {provider_name}")
 
         self.providers = providers
         self.provider_name = provider_name
@@ -1022,21 +1053,28 @@ class ModelsProcessor(QtCore.QObject):
         self.delete_models_trt()
 
     def get_gpu_memory(self):
-        command = "nvidia-smi --query-gpu=memory.total --format=csv"
-        memory_total_info = (
-            sp.check_output(command.split()).decode("ascii").split("\n")[:-1][1:]
-        )
-        memory_total = [int(x.split()[0]) for i, x in enumerate(memory_total_info)]
-
-        command = "nvidia-smi --query-gpu=memory.free --format=csv"
-        memory_free_info = (
-            sp.check_output(command.split()).decode("ascii").split("\n")[:-1][1:]
-        )
-        memory_free = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
-
-        memory_used = memory_total[0] - memory_free[0]
-
-        return memory_used, memory_total[0]
+        # MP-13: use a single nvidia-smi call for both total and free memory
+        try:
+            command = "nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits"
+            output = sp.check_output(command.split()).decode("ascii").strip()
+            # Output format: "total, free" (one line per GPU)
+            first_line = output.split("\n")[0]
+            parts = first_line.split(",")
+            memory_total_val = int(parts[0].strip())
+            memory_free_val = int(parts[1].strip())
+            memory_used = memory_total_val - memory_free_val
+            return memory_used, memory_total_val
+        except Exception:
+            # Fallback to torch.cuda if nvidia-smi is unavailable
+            if torch.cuda.is_available():
+                props = torch.cuda.get_device_properties(0)
+                memory_total_val = props.total_memory // (1024 * 1024)
+                memory_free_val = (
+                    props.total_memory - torch.cuda.memory_reserved(0)
+                ) // (1024 * 1024)
+                memory_used = memory_total_val - memory_free_val
+                return memory_used, memory_total_val
+            return 0, 0
 
     def clear_gpu_memory(self):
         print("[INFO] Clearing GPU Memory: Unloading all models...")
@@ -1082,78 +1120,78 @@ class ModelsProcessor(QtCore.QObject):
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Loads the KV Extractor, extracts K/V maps, and unloads.
-        The caller MUST wrap this function in the 'kv_extraction_lock'.
+        MP-09: This method acquires/releases kv_extraction_lock internally;
+        callers do NOT need to hold that lock.
         """
         kv_map = {}
-        try:
-            # 1. Load the extractor
-            self.ensure_kv_extractor_loaded()
+        with self.kv_extraction_lock:
+            try:
+                # 1. Load the extractor
+                self.ensure_kv_extractor_loaded()
 
-            if self.kv_extractor is None:
-                raise RuntimeError("KV Extractor model failed to load.")
+                if self.kv_extractor is None:
+                    raise RuntimeError("KV Extractor model failed to load.")
 
-            # 2. Perform the extraction
-            print("[INFO] Extracting K/V from reference image...")
-            kv_map = self.kv_extractor.extract_kv(input_face_image_pil)
-            print(
-                f"[INFO] Successfully extracted K/V for {len(kv_map)} attention layers."
-            )
+                # 2. Perform the extraction
+                print("[INFO] Extracting K/V from reference image...")
+                kv_map = self.kv_extractor.extract_kv(input_face_image_pil)
+                print(
+                    f"[INFO] Successfully extracted K/V for {len(kv_map)} attention layers."
+                )
 
-        except Exception as e:
-            print(f"[ERROR] Failed the K/V extraction: {e}")
-            traceback.print_exc()
-            kv_map = {}  # Return empty map if failed
+            except Exception as e:
+                print(f"[ERROR] Failed the K/V extraction: {e}")
+                traceback.print_exc()
+                kv_map = {}  # Return empty map if failed
 
-        finally:
-            # 3. Unload the extractor
-            self.unload_kv_extractor()
+            finally:
+                # 3. Unload the extractor
+                self.unload_kv_extractor()
 
         return kv_map
 
     def ensure_kv_extractor_loaded(self):
-        # This lock is critical to prevent a race condition where multiple
-        # FrameWorkers might try to load the KV Extractor simultaneously.
+        # MP-25: Check file existence and download outside lock to avoid blocking
+        # other threads during potentially slow network I/O.
+        base_path = "model_assets/ref-ldm_embedding"
+        configs_path = os.path.join(base_path, "configs")
+        ckpts_path = os.path.join(base_path, "ckpts")
+        os.makedirs(configs_path, exist_ok=True)
+        os.makedirs(ckpts_path, exist_ok=True)
+
+        ref_ldm_files = {
+            "configs/ldm.yaml": "https://raw.githubusercontent.com/Glat0s/ref-ldm-onnx/slim-fast/configs/ldm.yaml",
+            "configs/refldm.yaml": "https://raw.githubusercontent.com/Glat0s/ref-ldm-onnx/slim-fast/configs/refldm.yaml",
+            "configs/vqgan.yaml": "https://raw.githubusercontent.com/Glat0s/ref-ldm-onnx/slim-fast/configs/vqgan.yaml",
+            "ckpts/refldm.ckpt": "https://github.com/ChiWeiHsiao/ref-ldm/releases/download/1.0.0/refldm.ckpt",
+            "ckpts/vqgan.ckpt": "https://github.com/ChiWeiHsiao/ref-ldm/releases/download/1.0.0/vqgan.ckpt",
+        }
+
+        for rel_path, url in ref_ldm_files.items():
+            full_path = os.path.join(base_path, rel_path)
+            if not is_file_exists(full_path):
+                print(
+                    f"[INFO] Downloading ReF-LDM file: {os.path.basename(full_path)}..."
+                )
+                download_file(os.path.basename(full_path), full_path, None, url)
+
+        config_path = os.path.join(configs_path, "refldm.yaml")
+        model_path = os.path.join(ckpts_path, "refldm.ckpt")
+        vae_path = os.path.join(ckpts_path, "vqgan.ckpt")
+
+        if not all(os.path.exists(p) for p in [config_path, model_path, vae_path]):
+            print(
+                "[ERROR] ReF-LDM model files not found even after download attempt. Cannot load KV Extractor."
+            )
+            return
+
+        # MP-25: Only lock during the final KVExtractor instantiation.
         with self.model_lock:
             if self.kv_extractor is not None:
-                return  # Already loaded
+                return  # Already loaded (another thread may have loaded it)
 
             try:
                 print("[INFO] Loading KV Extractor...")
-
-                base_path = "model_assets/ref-ldm_embedding"
-                configs_path = os.path.join(base_path, "configs")
-                ckpts_path = os.path.join(base_path, "ckpts")
-                os.makedirs(configs_path, exist_ok=True)
-                os.makedirs(ckpts_path, exist_ok=True)
-
-                ref_ldm_files = {
-                    "configs/ldm.yaml": "https://raw.githubusercontent.com/Glat0s/ref-ldm-onnx/slim-fast/configs/ldm.yaml",
-                    "configs/refldm.yaml": "https://raw.githubusercontent.com/Glat0s/ref-ldm-onnx/slim-fast/configs/refldm.yaml",
-                    "configs/vqgan.yaml": "https://raw.githubusercontent.com/Glat0s/ref-ldm-onnx/slim-fast/configs/vqgan.yaml",
-                    "ckpts/refldm.ckpt": "https://github.com/ChiWeiHsiao/ref-ldm/releases/download/1.0.0/refldm.ckpt",
-                    "ckpts/vqgan.ckpt": "https://github.com/ChiWeiHsiao/ref-ldm/releases/download/1.0.0/vqgan.ckpt",
-                }
-
-                for rel_path, url in ref_ldm_files.items():
-                    full_path = os.path.join(base_path, rel_path)
-                    if not is_file_exists(full_path):
-                        print(
-                            f"[INFO] Downloading ReF-LDM file: {os.path.basename(full_path)}..."
-                        )
-                        download_file(os.path.basename(full_path), full_path, None, url)
-
-                config_path = os.path.join(configs_path, "refldm.yaml")
-                model_path = os.path.join(ckpts_path, "refldm.ckpt")
-                vae_path = os.path.join(ckpts_path, "vqgan.ckpt")
-
-                if not all(
-                    os.path.exists(p) for p in [config_path, model_path, vae_path]
-                ):
-                    print(
-                        "[ERROR] ReF-LDM model files not found even after download attempt. Cannot load KV Extractor."
-                    )
-                    return
-
                 self.kv_extractor = KVExtractor(
                     model_config_path=config_path,
                     model_ckpt_path=model_path,
@@ -1871,6 +1909,9 @@ class ModelsProcessor(QtCore.QObject):
             lq_latent_x0_scaled_for_unet = (
                 encoded_latent_direct_vae_out_bchw * self.vae_scale_factor
             )
+            # MP-16: del encoded latent buffer and input image float as soon as done
+            del encoded_latent_direct_vae_out_bchw
+            del image_srgb_float_minus1_1_batched
             final_denoised_latent_x0_scaled = None
 
             is_ref_flag_tensor_for_unet = torch.tensor(
@@ -1940,32 +1981,55 @@ class ModelsProcessor(QtCore.QObject):
             elif denoiser_mode == "Full Restore (DDIM)":
                 with torch.cuda.stream(torch.cuda.current_stream()):
                     num_ddpm_timesteps = self.alphas_cumprod_np.shape[0]
-                    _ddim_raw_ddpm_timesteps_np = ModelsProcessor.make_ddim_timesteps(
-                        ddim_discr_method="uniform",
-                        num_ddim_timesteps=denoiser_ddim_steps,
-                        num_ddpm_timesteps=num_ddpm_timesteps,
-                        verbose=DEBUG_DENOISER,
-                    )
-                    _ddim_sigmas_np, _ddim_alphas_np, _ddim_alphas_prev_np = (
-                        ModelsProcessor.make_ddim_sampling_parameters(
-                            alphacums=self.alphas_cumprod_np,
-                            ddim_timesteps=_ddim_raw_ddpm_timesteps_np,
-                            eta=denoiser_ddim_eta,
-                            verbose=DEBUG_DENOISER,
+
+                    # MP-11: Cache the DDIM schedule to avoid recomputing on every call.
+                    _ddim_cache_key = (denoiser_ddim_steps, denoiser_ddim_eta)
+                    if _ddim_cache_key not in self._ddim_schedule_cache:
+                        _ddim_raw_ddpm_timesteps_np = (
+                            ModelsProcessor.make_ddim_timesteps(
+                                ddim_discr_method="uniform",
+                                num_ddim_timesteps=denoiser_ddim_steps,
+                                num_ddpm_timesteps=num_ddpm_timesteps,
+                                verbose=DEBUG_DENOISER,
+                            )
                         )
-                    )
-                    ddim_sigmas = (
-                        torch.from_numpy(_ddim_sigmas_np).float().to(self.device)
-                    )
-                    ddim_alphas = (
-                        torch.from_numpy(_ddim_alphas_np).float().to(self.device)
-                    )
-                    ddim_alphas_prev = (
-                        torch.from_numpy(_ddim_alphas_prev_np).float().to(self.device)
-                    )
-                    ddim_sqrt_one_minus_alphas = torch.sqrt(
-                        torch.clamp(1.0 - ddim_alphas, min=0.0)
-                    )
+                        _ddim_sigmas_np, _ddim_alphas_np, _ddim_alphas_prev_np = (
+                            ModelsProcessor.make_ddim_sampling_parameters(
+                                alphacums=self.alphas_cumprod_np,
+                                ddim_timesteps=_ddim_raw_ddpm_timesteps_np,
+                                eta=denoiser_ddim_eta,
+                                verbose=DEBUG_DENOISER,
+                            )
+                        )
+                        _ddim_sigmas = (
+                            torch.from_numpy(_ddim_sigmas_np).float().to(self.device)
+                        )
+                        _ddim_alphas = (
+                            torch.from_numpy(_ddim_alphas_np).float().to(self.device)
+                        )
+                        _ddim_alphas_prev = (
+                            torch.from_numpy(_ddim_alphas_prev_np)
+                            .float()
+                            .to(self.device)
+                        )
+                        _ddim_sqrt_one_minus_alphas = torch.sqrt(
+                            torch.clamp(1.0 - _ddim_alphas, min=0.0)
+                        )
+                        self._ddim_schedule_cache[_ddim_cache_key] = (
+                            _ddim_raw_ddpm_timesteps_np,
+                            _ddim_sigmas,
+                            _ddim_alphas,
+                            _ddim_alphas_prev,
+                            _ddim_sqrt_one_minus_alphas,
+                        )
+
+                    (
+                        _ddim_raw_ddpm_timesteps_np,
+                        ddim_sigmas,
+                        ddim_alphas,
+                        ddim_alphas_prev,
+                        ddim_sqrt_one_minus_alphas,
+                    ) = self._ddim_schedule_cache[_ddim_cache_key]
 
                     current_latent_xt_scaled = torch.randn(
                         lq_latent_x0_scaled_for_unet.shape,
@@ -1975,20 +2039,38 @@ class ModelsProcessor(QtCore.QObject):
                     )
                     time_range_ddpm_indices = np.flip(_ddim_raw_ddpm_timesteps_np)
                     total_steps = len(time_range_ddpm_indices)
-                    pred_x0_scaled_current_step = torch.empty_like(
-                        lq_latent_x0_scaled_for_unet
+
+                    # MP-10: Pre-allocate loop-invariant-shape buffers outside the loop
+                    latent_shape = lq_latent_x0_scaled_for_unet.shape
+                    e_t_cond = torch.empty(latent_shape, dtype=torch.float32, device=self.device)
+                    unet_input_cond = torch.empty(
+                        (latent_shape[0], latent_shape[1] * 2, latent_shape[2], latent_shape[3]),
+                        dtype=torch.float32,
+                        device=self.device,
                     )
+                    pred_x0_scaled_current_step = torch.empty(
+                        latent_shape, dtype=torch.float32, device=self.device
+                    )
+                    # Pre-allocate CFG buffers only if needed
+                    if denoiser_cfg_scale != 1.0:
+                        e_t_uncond = torch.empty(latent_shape, dtype=torch.float32, device=self.device)
+                        unet_input_uncond = torch.empty_like(unet_input_cond)
+                        uncond_flag_tensor = torch.tensor(
+                            [False], dtype=torch.bool, device=self.device
+                        ).contiguous()
+                    else:
+                        e_t_uncond = None
+                        unet_input_uncond = None
+                        uncond_flag_tensor = None
 
                     for i, step_ddpm_idx in enumerate(time_range_ddpm_indices):
                         index_for_schedules = total_steps - 1 - i
                         ts_unet = torch.full(
                             (1,), step_ddpm_idx, device=self.device, dtype=torch.int64
                         )
-                        unet_input_cond = torch.cat(
-                            [current_latent_xt_scaled, lq_latent_x0_scaled_for_unet],
-                            dim=1,
-                        )
-                        e_t_cond = torch.empty_like(lq_latent_x0_scaled_for_unet)
+                        # MP-10: reuse pre-allocated buffer via in-place cat equivalent
+                        unet_input_cond[:, :latent_shape[1]] = current_latent_xt_scaled
+                        unet_input_cond[:, latent_shape[1]:] = lq_latent_x0_scaled_for_unet
 
                         self.face_restorers.run_ref_ldm_unet(
                             x_noisy_plus_lq_latent=unet_input_cond,
@@ -2001,21 +2083,14 @@ class ModelsProcessor(QtCore.QObject):
                         e_t = e_t_cond
 
                         if denoiser_cfg_scale != 1.0:
-                            unet_input_uncond = torch.cat(
-                                [
-                                    current_latent_xt_scaled,
-                                    lq_latent_x0_scaled_for_unet,
-                                ],
-                                dim=1,
-                            )
-                            e_t_uncond = torch.empty_like(lq_latent_x0_scaled_for_unet)
+                            # MP-10: reuse pre-allocated uncond buffer
+                            unet_input_uncond[:, :latent_shape[1]] = current_latent_xt_scaled
+                            unet_input_uncond[:, latent_shape[1]:] = lq_latent_x0_scaled_for_unet
                             self.face_restorers.run_ref_ldm_unet(
                                 x_noisy_plus_lq_latent=unet_input_uncond,
                                 timesteps_tensor=ts_unet,
                                 is_ref_flag_tensor=is_ref_flag_tensor_for_unet,
-                                use_reference_exclusive_path_globally_tensor=torch.tensor(
-                                    [False], dtype=torch.bool, device=self.device
-                                ).contiguous(),
+                                use_reference_exclusive_path_globally_tensor=uncond_flag_tensor,
                                 kv_tensor_map=None,
                                 output_unet_tensor=e_t_uncond,
                             )
@@ -2047,9 +2122,11 @@ class ModelsProcessor(QtCore.QObject):
                             current_latent_xt_scaled.shape,
                         )
 
-                        pred_x0_scaled_current_step = (
-                            current_latent_xt_scaled - sqrt_one_minus_a_t * e_t
-                        ) / torch.sqrt(a_t).clamp(min=1e-8)
+                        # MP-10: reuse pre-allocated pred_x0 buffer in-place
+                        pred_x0_scaled_current_step.copy_(
+                            (current_latent_xt_scaled - sqrt_one_minus_a_t * e_t)
+                            / torch.sqrt(a_t).clamp(min=1e-8)
+                        )
                         dir_xt = (
                             torch.sqrt(torch.clamp(1.0 - a_prev - sigma_t**2, min=1e-8))
                             * e_t
@@ -2065,8 +2142,14 @@ class ModelsProcessor(QtCore.QObject):
                             + dir_xt
                             + noise_ddim
                         )
+                        # MP-16: del intermediate tensors each iteration to free memory
+                        del dir_xt, noise_ddim, a_t, a_prev, sigma_t, sqrt_one_minus_a_t, schedule_idx_tensor
 
-                    final_denoised_latent_x0_scaled = pred_x0_scaled_current_step
+                    final_denoised_latent_x0_scaled = pred_x0_scaled_current_step.clone()
+                    # MP-16: del DDIM loop buffers after loop ends
+                    del current_latent_xt_scaled, e_t_cond, unet_input_cond, pred_x0_scaled_current_step
+                    if e_t_uncond is not None:
+                        del e_t_uncond, unet_input_uncond
             else:
                 print(
                     f"[ERROR] Denoiser: Unknown mode '{denoiser_mode}'. Skipping denoiser pass."
@@ -2079,6 +2162,8 @@ class ModelsProcessor(QtCore.QObject):
             latent_for_vae_decoder = (
                 final_denoised_latent_x0_scaled / self.vae_scale_factor
             )
+            # MP-16: del denoised latent once VAE decoder input is computed
+            del final_denoised_latent_x0_scaled
             decoded_image_normalized_bchw = torch.empty(
                 (1, 3, h_proc, w_proc), dtype=torch.float32, device=self.device
             ).contiguous()
@@ -2086,8 +2171,12 @@ class ModelsProcessor(QtCore.QObject):
             self.face_restorers.run_vae_decoder(
                 latent_for_vae_decoder, decoded_image_normalized_bchw
             )
+            # MP-16: del VAE decoder input latent after use
+            del latent_for_vae_decoder
 
             decoded_image_soft_clamped_bchw = torch.tanh(decoded_image_normalized_bchw)
+            # MP-16: del raw decoder output after soft-clamping
+            del decoded_image_normalized_bchw
             image_after_postproc_float_0_1 = (
                 decoded_image_soft_clamped_bchw.squeeze(0) + 1.0
             ) / 2.0

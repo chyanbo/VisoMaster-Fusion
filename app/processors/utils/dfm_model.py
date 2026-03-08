@@ -15,9 +15,13 @@ class DFMModel:
         self.device = device
         self.syncvec = torch.empty((1, 1), dtype=torch.float32, device=device)
 
-        sess = self._sess = onnxruntime.InferenceSession(
-            str(model_path), providers=self.providers
-        )
+        # D-05: wrap session creation with descriptive error context
+        try:
+            sess = self._sess = onnxruntime.InferenceSession(
+                str(model_path), providers=self.providers
+            )
+        except Exception as e:
+            raise RuntimeError(f"Failed to load DFM model: {e}") from e
         inputs = sess.get_inputs()
 
         if len(inputs) == 0 or "in_face" not in inputs[0].name:
@@ -147,12 +151,12 @@ class DFMModel:
                 buffer_ptr=binding_outputs[idx].data_ptr(),
             )
 
-        # Run the model
+        # D-02: run inference first, then synchronize (sync before was a no-op barrier, not a correctness gate)
+        self._sess.run_with_iobinding(io_binding)
         if self.device == "cuda":
             torch.cuda.synchronize()
         elif self.device != "cpu":
             self.syncvec.cpu()
-        self._sess.run_with_iobinding(io_binding)
 
         # Process outputs (resize, clip channels, and convert back to original dtype)
         out_face_mask = self.to_dtype(

@@ -117,6 +117,7 @@ cache_kv_module = CacheKVModule()
 
 
 def checkpoint(func, inputs, params, flag):
+    # R-06: NOTE: gradient checkpointing intentionally disabled in this inference-only build
     return func(*inputs)
 
 
@@ -707,7 +708,8 @@ class VQModelInterface(nn.Module):
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys or [])
 
     def init_from_ckpt(self, path, ignore_keys=None):
-        sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
+        # R-03: use weights_only=True for safe standard weight loading
+        sd = torch.load(path, map_location="cpu", weights_only=True)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:
@@ -1322,8 +1324,9 @@ class KVExtractor:
         self.model: LatentDiffusion = instantiate_from_config(model_config_full.model)
 
         print(f"[INFO] Loading ReF-LDM UNet weights from: {model_ckpt_path}")
+        # R-03: use weights_only=True for safe standard weight loading
         state_dict_container = torch.load(
-            model_ckpt_path, map_location="cpu", weights_only=False
+            model_ckpt_path, map_location="cpu", weights_only=True
         )
         ldm_state_dict = (
             state_dict_container["state_dict"]
@@ -1349,6 +1352,15 @@ class KVExtractor:
 
     @staticmethod
     def _normalize_image(image) -> torch.Tensor:
+        """Normalize an image to the [-1, 1] range expected by the ReF-LDM model.
+
+        Accepts a PIL Image or a torch.Tensor. PIL images are read as uint8 [0,255]
+        and scaled to [-1, 1]. Tensor inputs are assumed to be already in [0, 1]
+        float range; passing values outside this range will raise an assertion error.
+
+        Returns:
+            torch.Tensor: shape (1, C, H, W), float32, values in [-1, 1].
+        """
         if isinstance(image, Image.Image):
             if image.size != (512, 512):
                 image = image.resize((512, 512), Image.Resampling.LANCZOS)
@@ -1361,6 +1373,12 @@ class KVExtractor:
                 img_tensor = v2.Resize((512, 512), antialias=True)(image)
             else:
                 img_tensor = image.float()
+            # R-02: tensor inputs must be in [0, 1]; values in [0, 255] will produce
+            # wildly out-of-range latents. Assert here to catch callers that forget to normalize.
+            assert img_tensor.max() <= 1.0 + 1e-5, (
+                f"_normalize_image expects [0,1] input for Tensor, got max={img_tensor.max().item():.4f}. "
+                "Divide by 255.0 before passing a float tensor."
+            )
         else:
             raise TypeError(f"Unsupported image type: {type(image)}")
 
@@ -1438,9 +1456,15 @@ class KVExtractor:
                     final_k = k_list[0].clone().detach() * scale_factor
                     final_v = v_list[0].clone().detach() * scale_factor
 
-                    extracted_kv_map[name] = {"k": final_k.cpu(), "v": final_v.cpu()}
+                    # R-05: copy to CPU then immediately release the GPU tensor
+                    k_cpu = final_k.cpu()
+                    del final_k  # free GPU memory
+                    v_cpu = final_v.cpu()
+                    del final_v  # free GPU memory
 
-        cache_kv_module.clear_cache()
+                    extracted_kv_map[name] = {"k": k_cpu, "v": v_cpu}
+
+        cache_kv_module.clear_cache()  # R-05: release any remaining GPU caches
         cache_kv_module.mode = None
 
         print(

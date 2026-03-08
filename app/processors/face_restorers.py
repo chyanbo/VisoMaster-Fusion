@@ -134,10 +134,6 @@ class FaceRestorers:
                     return swapped_face_upscaled
                 dst = target_kps
 
-            # Return non-enhanced face if keypoints are empty
-            if not isinstance(dst, np.ndarray) or len(dst) == 0:
-                return swapped_face_upscaled
-
             try:
                 # Use from_estimate constructor instead of .estimate()
                 if hasattr(trans.SimilarityTransform, "from_estimate"):
@@ -160,6 +156,9 @@ class FaceRestorers:
             )
             temp = v2.functional.crop(temp, 0, 0, 512, 512)
 
+        # FR-BUG-06: ensure float32 before dividing by 255 to prevent integer division truncation
+        if temp.dtype == torch.uint8:
+            temp = temp.to(torch.float32)
         temp = torch.div(temp, 255)
         temp = v2.functional.normalize(
             temp, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
@@ -171,11 +170,13 @@ class FaceRestorers:
         temp = torch.unsqueeze(temp, 0).contiguous()
 
         # Bindings
-        outpred = torch.empty(
-            (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
-        ).contiguous()
+        # FR-ROBUST-04: removed default 512x512 pre-allocation; each branch allocates at correct size
+        outpred = None
 
         if restorer_type == "GFPGAN-v1.4":
+            outpred = torch.empty(
+                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+            ).contiguous()
             self.run_GFPGAN(temp, outpred)
 
         elif restorer_type == "GFPGAN-1024":
@@ -187,6 +188,9 @@ class FaceRestorers:
             self.run_GFPGAN1024(temp, outpred)
 
         elif restorer_type == "CodeFormer":
+            outpred = torch.empty(
+                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+            ).contiguous()
             self.run_codeformer(temp, outpred, fidelity_weight)
 
         elif restorer_type == "GPEN-256":
@@ -198,6 +202,9 @@ class FaceRestorers:
             self.run_GPEN_256(temp, outpred)
 
         elif restorer_type == "GPEN-512":
+            outpred = torch.empty(
+                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+            ).contiguous()
             self.run_GPEN_512(temp, outpred)
 
         elif restorer_type == "GPEN-1024":
@@ -219,10 +226,19 @@ class FaceRestorers:
             self.run_GPEN_2048(temp, outpred)
 
         elif restorer_type == "RestoreFormer++":
+            outpred = torch.empty(
+                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+            ).contiguous()
             self.run_RestoreFormerPlusPlus(temp, outpred)
 
         elif restorer_type == "VQFR-v2":
+            outpred = torch.empty(
+                (1, 3, 512, 512), dtype=torch.float32, device=self.models_processor.device
+            ).contiguous()
             self.run_VQFR_v2(temp, outpred, fidelity_weight)
+
+        if outpred is None:
+            return swapped_face_upscaled
 
         # Format back to cxHxW @ 255
         outpred = torch.squeeze(outpred)
@@ -266,13 +282,12 @@ class FaceRestorers:
         output_latent_tensor: Placeholder for Batch x 8 x LatentH x LatentW, float32
         """
         model_name = "RefLDMVAEEncoder"
-        ort_session = self.models_processor.models[model_name]
-        if not ort_session:
+        # FR-BUG-04: use .get() to avoid KeyError when model is not yet loaded
+        ort_session = self.models_processor.models.get(model_name)
+        if ort_session is None:
             error_msg = f"[ERROR] VAE Encoder model '{model_name}' not loaded when run_vae_encoder was called. This model should be loaded by ModelsProcessor.ensure_denoiser_models_loaded()."
             print(error_msg)
-            raise RuntimeError(
-                error_msg
-            )  # Or handle more gracefully depending on desired behavior
+            raise RuntimeError(error_msg)
 
         input_name = (
             ort_session.get_inputs()[0].name
@@ -315,8 +330,9 @@ class FaceRestorers:
         output_image_tensor: Placeholder for Batch x 3 x H x W, float32, normalized to [-1, 1]
         """
         model_name = "RefLDMVAEDecoder"
-        ort_session = self.models_processor.models[model_name]
-        if not ort_session:
+        # FR-BUG-04: use .get() to avoid KeyError when model is not yet loaded
+        ort_session = self.models_processor.models.get(model_name)
+        if ort_session is None:
             error_msg = f"[ERROR] VAE Decoder model '{model_name}' not loaded when run_vae_decoder was called. This model should be loaded by ModelsProcessor.ensure_denoiser_models_loaded()."
             print(error_msg)
             raise RuntimeError(error_msg)
@@ -461,6 +477,8 @@ class FaceRestorers:
 
         # IMPORTANT: Keep references to temporary zero tensors to prevent GC
         keep_alive_tensors = []
+        # FS-MEM-01: also keep actual KV tensors alive to prevent premature GC
+        keep_alive_tensors.extend(actual_kv_tensors_for_binding.values())
 
         for onnx_kv_name, expected_shape in onnx_kv_input_names_to_shape.items():
             tensor_to_bind = actual_kv_tensors_for_binding.get(onnx_kv_name)
@@ -672,7 +690,8 @@ class FaceRestorers:
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
         )
-        w = np.array([fidelity_weight_value], dtype=np.double)
+        # FS-ROBUST-03: use float32 to match ONNX model expected dtype
+        w = np.array([fidelity_weight_value], dtype=np.float32)
         io_binding.bind_cpu_input("w", w)
         io_binding.bind_output(
             name="y",
@@ -692,9 +711,9 @@ class FaceRestorers:
         if not ort_session:
             return  # Silently skip
 
-        assert fidelity_ratio_value >= 0.0 and fidelity_ratio_value <= 1.0, (
-            "fidelity_ratio must in range[0,1]"
-        )
+        # FR-ROBUST-05: replace assert with an explicit ValueError so it is never silenced by -O flag
+        if not (0.0 <= fidelity_ratio_value <= 1.0):
+            raise ValueError(f"fidelity_ratio_value must be in [0,1], got {fidelity_ratio_value}")
         fidelity_ratio = torch.tensor(fidelity_ratio_value).to(
             self.models_processor.device
         )

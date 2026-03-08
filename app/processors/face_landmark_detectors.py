@@ -1,3 +1,4 @@
+import threading
 from itertools import product as product
 from typing import TYPE_CHECKING, List, Dict, Optional
 import pickle
@@ -40,9 +41,9 @@ class FaceLandmarkDetectors:
             if model_name in self.active_landmark_models:
                 self.active_landmark_models.remove(model_name)
 
-        if not keep_essential:
-            # If we are not keeping essentials, we clear everything
-            self.active_landmark_models.clear()
+        # If keep_essential is False, active_landmark_models has already been fully
+        # emptied by the per-model remove() calls in the loop above; no extra
+        # .clear() is needed here.
 
     def __init__(self, models_processor: "ModelsProcessor"):
         """
@@ -59,6 +60,7 @@ class FaceLandmarkDetectors:
         self.landmark_5_anchors: list = []
         self.landmark_5_scale1_cache: Dict[tuple, torch.Tensor] = {}
         self.landmark_5_priors = None
+        self._anchor_lock = threading.Lock()
 
         # A dictionary to map a string identifier (e.g., '68') to the corresponding
         # model name and the specific function that processes its output.
@@ -168,34 +170,41 @@ class FaceLandmarkDetectors:
         """
         Initializes the anchors for the FaceLandmark5 model.
         This complex calculation is performed only once and the result is cached for efficiency.
+        Uses double-checked locking to ensure thread-safe initialization.
         """
         if self.landmark_5_priors is not None:
             return
 
-        feature_maps, min_sizes, steps, image_size = (
-            [[64, 64], [32, 32], [16, 16]],
-            [[16, 32], [64, 128], [256, 512]],
-            [8, 16, 32],
-            512,
-        )
-        anchors = []
-        for k, f in enumerate(feature_maps):
-            for i, j in product(range(f[0]), range(f[1])):
-                for min_size in min_sizes[k]:
-                    s_kx, s_ky = min_size / image_size, min_size / image_size
-                    dense_cx, dense_cy = (
-                        [x * steps[k] / image_size for x in [j + 0.5]],
-                        [y * steps[k] / image_size for y in [i + 0.5]],
-                    )
-                    for cy, cx in product(dense_cy, dense_cx):
-                        anchors.extend([cx, cy, s_kx, s_ky])
+        with self._anchor_lock:
+            # Second check inside the lock to prevent redundant initialization
+            # by another thread that acquired the lock first.
+            if self.landmark_5_priors is not None:
+                return
 
-        self.landmark_5_anchors = anchors
-        self.landmark_5_priors = (
-            torch.tensor(self.landmark_5_anchors)
-            .view(-1, 4)
-            .to(self.models_processor.device)
-        )
+            feature_maps, min_sizes, steps, image_size = (
+                [[64, 64], [32, 32], [16, 16]],
+                [[16, 32], [64, 128], [256, 512]],
+                [8, 16, 32],
+                512,
+            )
+            anchors = []
+            for k, f in enumerate(feature_maps):
+                for i, j in product(range(f[0]), range(f[1])):
+                    for min_size in min_sizes[k]:
+                        s_kx, s_ky = min_size / image_size, min_size / image_size
+                        dense_cx, dense_cy = (
+                            [x * steps[k] / image_size for x in [j + 0.5]],
+                            [y * steps[k] / image_size for y in [i + 0.5]],
+                        )
+                        for cy, cx in product(dense_cy, dense_cx):
+                            anchors.extend([cx, cy, s_kx, s_ky])
+
+            self.landmark_5_anchors = anchors
+            self.landmark_5_priors = (
+                torch.tensor(self.landmark_5_anchors)
+                .view(-1, 4)
+                .to(self.models_processor.device)
+            )
 
     def _prepare_crop(
         self,
@@ -266,11 +275,13 @@ class FaceLandmarkDetectors:
         Returns:
             List[np.ndarray]: A list of numpy arrays containing the model's output.
         """
-        # We must use load_model (which is thread-safe) instead of direct
-        # dictionary access (self.models_processor.models[model_name]).
-        # This prevents a KeyError if another thread unloads the model
-        # between the check in run_detect_landmark and the execution here.
-        model = self.models_processor.load_model(model_name)
+        # Check the model cache first to avoid the overhead of load_model when
+        # the model is already loaded. Fall back to load_model (which is thread-safe)
+        # only when the model is not yet present, preventing a KeyError if another
+        # thread unloads the model between the check in run_detect_landmark and here.
+        model = self.models_processor.models.get(model_name)
+        if model is None:
+            model = self.models_processor.load_model(model_name)
 
         # Failsafe: If load_model fails (e.g., file not found, TRT build fail),
         # model will be None. We must abort to prevent a crash.
@@ -337,7 +348,7 @@ class FaceLandmarkDetectors:
             )
 
         # Pre-process: subtract mean and reshape for the model.
-        image = image.permute(1, 2, 0)
+        image = image.to(dtype=torch.float32).permute(1, 2, 0)
         mean = torch.tensor(
             [104, 117, 123], dtype=torch.float32, device=self.models_processor.device
         )
@@ -346,6 +357,8 @@ class FaceLandmarkDetectors:
         # Prepare scaling factor for post-processing.
         height, width = 512, 512
         if (width, height) not in self.landmark_5_scale1_cache:
+            if len(self.landmark_5_scale1_cache) > 10:
+                self.landmark_5_scale1_cache.clear()
             self.landmark_5_scale1_cache[(width, height)] = torch.tensor(
                 [width, height] * 5,
                 dtype=torch.float32,
@@ -357,6 +370,8 @@ class FaceLandmarkDetectors:
         net_outs = self._run_onnx_binding(
             "FaceLandmark5", {"input": image}, ["conf", "landmarks"]
         )
+        if not net_outs or len(net_outs) < 2:
+            return [], [], []
         conf, landmarks = (
             torch.from_numpy(net_outs[0]).to(self.models_processor.device),
             torch.from_numpy(net_outs[1]).to(self.models_processor.device),
@@ -421,6 +436,8 @@ class FaceLandmarkDetectors:
         net_outs = self._run_onnx_binding(
             "FaceLandmark68", {"input": crop_image}, ["landmarks_xyscore", "heatmaps"]
         )
+        if not net_outs or len(net_outs) < 2:
+            return [], [], []
         face_landmark_68, face_heatmap = net_outs[0], net_outs[1]
 
         # Post-process: scale, transform, and reshape landmarks.
@@ -465,10 +482,14 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-        pred = self._run_onnx_binding("FaceLandmark3d68", {"data": aimg}, ["fc1"])[0][0]
+        net_outs_3d68 = self._run_onnx_binding("FaceLandmark3d68", {"data": aimg}, ["fc1"])
+        if not net_outs_3d68 or len(net_outs_3d68) < 1:
+            return [], [], []
+        pred = net_outs_3d68[0][0]
 
         # Post-process the 1D prediction array into 3D/2D coordinates.
-        pred = pred.reshape((-1, 3)) if pred.shape[0] >= 3000 else pred.reshape((-1, 2))
+        # 68 * 3 = 204 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
+        pred = pred.reshape((-1, 3)) if pred.shape[0] == 68 * 3 else pred.reshape((-1, 2))
         if 68 < pred.shape[0]:
             pred = pred[-68:]
         pred[:, 0:2] = (pred[:, 0:2] + 1) * 96.0  # Scale to image size (192/2)
@@ -507,9 +528,12 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-        landmarks_xyscore = self._run_onnx_binding(
+        net_outs_98 = self._run_onnx_binding(
             "FaceLandmark98", {"input": crop_image}, ["landmarks_xyscore"]
-        )[0]
+        )
+        if not net_outs_98 or len(net_outs_98) < 1:
+            return [], [], []
+        landmarks_xyscore = net_outs_98[0]
 
         if len(landmarks_xyscore) > 0:
             one_face_landmarks = landmarks_xyscore[0]
@@ -549,9 +573,13 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-        pred = self._run_onnx_binding("FaceLandmark106", {"data": aimg}, ["fc1"])[0][0]
+        net_outs_106 = self._run_onnx_binding("FaceLandmark106", {"data": aimg}, ["fc1"])
+        if not net_outs_106 or len(net_outs_106) < 1:
+            return [], [], []
+        pred = net_outs_106[0][0]
 
-        pred = pred.reshape((-1, 3)) if pred.shape[0] >= 3000 else pred.reshape((-1, 2))
+        # 106 * 3 = 318 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
+        pred = pred.reshape((-1, 3)) if pred.shape[0] == 106 * 3 else pred.reshape((-1, 2))
         if 106 < pred.shape[0]:
             pred = pred[-106:]
 
@@ -597,6 +625,8 @@ class FaceLandmarkDetectors:
         out_lst = self._run_onnx_binding(
             "FaceLandmark203", {"input": aimg}, ["output", "853", "856"]
         )
+        if not out_lst or len(out_lst) < 3:
+            return [], [], []
         out_pts = (
             out_lst[2].reshape((-1, 2)) * 224.0
         )  # The third output contains the landmarks.
@@ -646,6 +676,8 @@ class FaceLandmarkDetectors:
             {"input_12": aimg},
             ["Identity", "Identity_1", "Identity_2"],
         )
+        if not net_outs or len(net_outs) < 1:
+            return [], [], []
         landmarks = net_outs[0].reshape((1, 478, 3))
 
         if len(landmarks) > 0:
