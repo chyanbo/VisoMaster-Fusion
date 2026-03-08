@@ -223,6 +223,8 @@ class TargetMediaCardButton(CardButton):
             self.media_capture = media_capture
             main_window.video_processor.fps = media_capture.get(cv2.CAP_PROP_FPS)
             main_window.video_processor.max_frame_number = max_frames_number
+            main_window.video_processor.current_frame_number = 0
+            main_window.video_processor.next_frame_to_display = 0
 
         elif self.file_type == "image":
             frame = misc_helpers.read_image_file(self.media_path)

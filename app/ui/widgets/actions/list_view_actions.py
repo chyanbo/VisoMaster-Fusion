@@ -247,7 +247,9 @@ def clear_stop_loading_target_media(main_window: "MainWindow"):
         worker = main_window.video_loader_worker
         worker._running = False
         worker.quit()
-        worker.wait(_WORKER_STOP_TIMEOUT_MS)
+        if not worker.wait(_WORKER_STOP_TIMEOUT_MS):
+            worker.terminate()
+            worker.wait()
         main_window.video_loader_worker = None
         main_window.targetVideosList.clear()
 
@@ -335,7 +337,9 @@ def clear_stop_loading_input_media(main_window: "MainWindow"):
         worker = main_window.input_faces_loader_worker
         worker._running = False
         worker.quit()
-        worker.wait(_WORKER_STOP_TIMEOUT_MS)
+        if not worker.wait(_WORKER_STOP_TIMEOUT_MS):
+            worker.terminate()
+            worker.wait()
         main_window.input_faces_loader_worker = None
         main_window.inputFacesList.clear()
 

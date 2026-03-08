@@ -76,10 +76,16 @@ def update_filtered_list(
     main_window: "MainWindow",
     filter_list_widget: QtWidgets.QListWidget,
     visible_indices: list,
+    snapshot_size: int = 0,
 ):
-    for i in range(filter_list_widget.count()):
+    # Only manage items that existed at snapshot time; items added after the
+    # snapshot was captured (index >= snapshot_size) are left visible so they
+    # are not accidentally hidden by a stale filter result.
+    limit = snapshot_size if snapshot_size > 0 else filter_list_widget.count()
+    for i in range(min(limit, filter_list_widget.count())):
         filter_list_widget.item(i).setHidden(True)
 
     # Show only the items in the visible_indices list
     for i in visible_indices:
-        filter_list_widget.item(i).setHidden(False)
+        if i < filter_list_widget.count():
+            filter_list_widget.item(i).setHidden(False)

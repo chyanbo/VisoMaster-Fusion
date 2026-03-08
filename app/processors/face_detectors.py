@@ -17,6 +17,18 @@ except ImportError:
     BYTETracker = None  # type: ignore[assignment,misc]
 
 
+class _BYTETRACK_ARGS:
+    """BYTETracker parameters — populated from UI control values when available."""
+
+    def __init__(self, control: dict | None = None):
+        """Initialises BYTETracker parameters from the given UI control dict."""
+        c = control or {}
+        self.track_thresh = c.get("ByteTrackTrackThreshSlider", 40) / 100.0
+        self.match_thresh = c.get("ByteTrackMatchThreshSlider", 80) / 100.0
+        self.track_buffer = int(c.get("ByteTrackTrackBufferSlider", 30))
+        self.mot20 = False
+
+
 class FaceDetectors:
     """
     Manages and executes various face detection models.
@@ -33,6 +45,13 @@ class FaceDetectors:
             self.current_detector_model = None
 
     def __init__(self, models_processor: "ModelsProcessor"):
+        """
+        Initialises the FaceDetectors instance.
+
+        Args:
+            models_processor: The parent ModelsProcessor that owns this helper.
+                              Provides access to model sessions, device, and signals.
+        """
         self.models_processor = models_processor
         self.center_cache: Dict[tuple, np.ndarray] = {}
         self.current_detector_model = None
@@ -566,14 +585,7 @@ class FaceDetectors:
             # prevent concurrent pool workers from corrupting Kalman filter state
             with self._tracker_lock:
                 if self.tracker is None:
-                    # Initialize ByteTrack default parameters
-                    class TrackerArgs:
-                        track_thresh = 0.4
-                        track_buffer = 30
-                        match_thresh = 0.8
-                        mot20 = False
-
-                    self.tracker = BYTETracker(TrackerArgs())
+                    self.tracker = BYTETracker(_BYTETRACK_ARGS(control))
 
                 # Prepare detections for ByteTrack [x1, y1, x2, y2, score]
                 img_hw = (int(img.shape[1]), int(img.shape[2]))
@@ -596,15 +608,10 @@ class FaceDetectors:
                 active_before = len(self.tracker.tracked_stracks)
                 matched_count = len(online_targets)
                 if active_before > 0 and matched_count / active_before < 0.3:
-                    print("[ByteTrack] Scene cut detected — resetting tracker")
-
-                    class TrackerArgs:  # noqa: F811 — local redefinition is intentional
-                        track_thresh = 0.4
-                        track_buffer = 30
-                        match_thresh = 0.8
-                        mot20 = False
-
-                    self.tracker = BYTETracker(TrackerArgs())
+                    # print("[ByteTrack] Scene cut detected — resetting tracker")
+                    self.tracker = (
+                        None  # will be re-created with frame_id=0 on next call
+                    )
                     with self._track_history_lock:
                         self.track_history.clear()
                     online_targets = []
@@ -690,11 +697,22 @@ class FaceDetectors:
                 kpss = np.array(tracked_kpss_all, dtype=object)
                 score_values = np.array(tracked_scores, dtype=np.float32).flatten()
             else:
-                # BT-12: return consistently-typed empty arrays (not mixed list/array)
-                det = np.empty((0, 4), dtype=np.float32)
-                kpss_5 = np.empty((0, 5, 2), dtype=np.float32)
-                kpss = np.empty((0,), dtype=object)
-                score_values = np.empty((0,), dtype=np.float32)
+                # BT-12 / BT-14: no confirmed tracks yet (first frame, scene cut, or
+                # tracker reset after seek).  Fall back to raw detector output so that
+                # swap/edit is applied immediately instead of waiting for ByteTrack to
+                # confirm tracks on a subsequent frame.
+                if len(det) > 0:
+                    score_values = (
+                        det_scores
+                        if len(det_scores) == len(det)
+                        else np.full(len(det), 0.9, dtype=np.float32)
+                    )
+                    # det, kpss_5, kpss already hold the raw detector output — keep them
+                else:
+                    det = np.empty((0, 4), dtype=np.float32)
+                    kpss_5 = np.empty((0, 5, 2), dtype=np.float32)
+                    kpss = np.empty((0,), dtype=object)
+                    score_values = np.empty((0,), dtype=np.float32)
 
         # Optionally refine landmarks (if the user wants detailed landmarks)
         bytetrack_active = use_bytetrack and BYTETracker is not None
@@ -717,7 +735,32 @@ class FaceDetectors:
 
         return det, kpss_5, kpss
 
+    def reset_tracker(self):
+        """Reset the ByteTracker and its history (call on video seek or toggle to discard stale state)."""
+        with self._tracker_lock:
+            self.tracker = None
+        with self._track_history_lock:
+            self.track_history.clear()
+        # Reset the global track-ID counter so new sessions start from ID 1
+        try:
+            from app.processors.external.yolox.tracker.basetrack import BaseTrack
+
+            BaseTrack._count = 0
+        except ImportError:
+            pass
+
     def _calculate_iou(self, boxA, boxB):
+        """
+        Computes the Intersection-over-Union (IoU) between two axis-aligned bounding boxes.
+
+        Args:
+            boxA: Sequence [x1, y1, x2, y2] for the first box.
+            boxB: Sequence [x1, y1, x2, y2] for the second box.
+
+        Returns:
+            float: IoU in [0, 1]. Returns 0.0 when either box has zero area
+                   (BT-01: guards against degenerate Kalman predictions).
+        """
         # BT-01: guard against division by zero when Kalman prediction produces
         # a degenerate (zero-area) bounding box
         xA = max(boxA[0], boxB[0])

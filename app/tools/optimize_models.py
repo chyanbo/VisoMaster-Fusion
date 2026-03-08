@@ -191,7 +191,9 @@ def main() -> None:
             # Step 3: Backup original and replace with optimized version
             logging.info("Step 3: Backing up original and replacing with optimized.")
             shutil.move(str(original_path), str(final_backup_path))
-            logging.info(f"  -> Backed up '{original_path.name}' to '{final_backup_path}'")
+            logging.info(
+                f"  -> Backed up '{original_path.name}' to '{final_backup_path}'"
+            )
             shutil.move(str(opt_sym_path), str(original_path))
             logging.info(f"  -> Placed optimized model at '{original_path.name}'")
             logging.info(f"Successfully optimized: {model_file}")
@@ -207,7 +209,9 @@ def main() -> None:
                         temp_file.unlink()
                         logging.info(f"Cleaned up temp file: {temp_file.name}")
                     except OSError as err:
-                        logging.error(f"Error removing temp file {temp_file.name}: {err}")
+                        logging.error(
+                            f"Error removing temp file {temp_file.name}: {err}"
+                        )
 
     logging.info("-" * 60)
     logging.info("Optimization process finished.")

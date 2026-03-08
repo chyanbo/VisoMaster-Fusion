@@ -300,7 +300,7 @@ class InputFacesLoaderWorker(qtc.QThread):
 
 
 class FilterWorker(qtc.QThread):
-    filtered_results = qtc.Signal(list)
+    filtered_results = qtc.Signal(list, int)  # (visible_indices, snapshot_size)
 
     def __init__(
         self, main_window: "MainWindow", search_text="", filter_list="target_videos"
@@ -356,7 +356,7 @@ class FilterWorker(qtc.QThread):
             ):
                 visible_indices.append(index)
 
-        self.filtered_results.emit(visible_indices)
+        self.filtered_results.emit(visible_indices, len(self.items_snapshot))
 
     def filter_input_faces(self):
         # Operates only on pre-captured plain Python data — no Qt widget access.
@@ -367,7 +367,7 @@ class FilterWorker(qtc.QThread):
             if not search_text or search_text in media_path.lower():
                 visible_indices.append(index)
 
-        self.filtered_results.emit(visible_indices)
+        self.filtered_results.emit(visible_indices, len(self.items_snapshot))
 
     def filter_merged_embeddings(self):
         # Operates only on pre-captured plain Python data — no Qt widget access.
@@ -378,7 +378,7 @@ class FilterWorker(qtc.QThread):
             if not search_text or search_text in embedding_name.lower():
                 visible_indices.append(index)
 
-        self.filtered_results.emit(visible_indices)
+        self.filtered_results.emit(visible_indices, len(self.items_snapshot))
 
     def stop_thread(self):
         self.quit()

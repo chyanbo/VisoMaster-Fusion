@@ -204,6 +204,16 @@ class ModelsProcessor(QtCore.QObject):
     hide_build_dialog = QtCore.Signal()
 
     def __init__(self, main_window: "MainWindow", device="cuda"):
+        """
+        Initialises the ModelsProcessor.
+
+        Sets up all model dictionaries, TensorRT options, provider lists, sub-processors
+        (face detectors, masks, restorers, etc.), and helper state (locks, sync vectors).
+
+        Args:
+            main_window: The application's MainWindow, used to access UI controls and signals.
+            device: Torch/ONNX device string — ``"cuda"`` or ``"cpu"``.
+        """
         super().__init__()
         self.main_window = main_window
         self.K = K  # Assign the module-level K to an instance attribute
@@ -944,6 +954,12 @@ class ModelsProcessor(QtCore.QObject):
             self.unload_dfm_model(model_name)
 
     def unload_dfm_model(self, model_name_to_unload):
+        """
+        Unloads a single DFM model instance from memory.
+
+        Respects the KeepModelsAliveToggle control unless a force-unload is in progress.
+        Frees the Python object, runs gc.collect(), and clears the CUDA cache.
+        """
         # Check if unloading should be skipped
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
@@ -963,6 +979,14 @@ class ModelsProcessor(QtCore.QObject):
                     torch.cuda.empty_cache()
 
     def unload_model(self, model_name_to_unload):
+        """
+        Unloads a single ONNX or TensorRT-Engine model from memory.
+
+        Handles both the ``self.models`` (ONNX) and ``self.models_trt`` (TRT-Engine)
+        dictionaries.  Respects the KeepModelsAliveToggle control unless a force-unload
+        is in progress.  Frees the Python object, runs gc.collect(), and clears the
+        CUDA cache when something was actually unloaded.
+        """
         # Check if unloading should be skipped
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
@@ -1009,13 +1033,26 @@ class ModelsProcessor(QtCore.QObject):
                     torch.cuda.empty_cache()
 
     def showModelLoadingProgressBar(self):
+        """Shows the model-loading progress dialog in the UI."""
         self.main_window.model_load_dialog.show()
 
     def hideModelLoadProgressBar(self):
+        """Closes the model-loading progress dialog if it is open."""
         if self.main_window.model_load_dialog:
             self.main_window.model_load_dialog.close()
 
     def switch_providers_priority(self, provider_name):
+        """
+        Reconfigures the ONNX Runtime provider list and the active device.
+
+        Supported values for *provider_name*: ``"TensorRT"``, ``"TensorRT-Engine"``,
+        ``"CUDA"``, ``"CPU"``.  Raises ``RuntimeError`` if TensorRT is requested but
+        not installed, and ``ValueError`` for any unknown provider name.
+
+        Returns:
+            str: The resolved provider name (may differ from the input when TensorRT
+                 is downgraded due to a version constraint).
+        """
         match provider_name:
             case "TensorRT" | "TensorRT-Engine":
                 # MP-04: guard against TensorRT not being installed
@@ -1053,10 +1090,17 @@ class ModelsProcessor(QtCore.QObject):
         return self.provider_name
 
     def set_number_of_threads(self, value):
+        """Sets the ONNX thread count and unloads all TRT-Engine models so they rebuild with the new setting."""
         self.nThreads = value
         self.delete_models_trt()
 
     def get_gpu_memory(self):
+        """
+        Returns GPU memory usage as ``(used_MB, total_MB)``.
+
+        Queries nvidia-smi for accuracy; falls back to ``torch.cuda`` device properties
+        if nvidia-smi is unavailable.  Returns ``(0, 0)`` when no GPU is detected.
+        """
         # MP-13: use a single nvidia-smi call for both total and free memory
         try:
             command = "nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits"
@@ -1081,6 +1125,14 @@ class ModelsProcessor(QtCore.QObject):
             return 0, 0
 
     def clear_gpu_memory(self):
+        """
+        Force-unloads every loaded model (ONNX, TRT, DFM, KV Extractor, CLIP) and
+        releases all GPU memory.
+
+        Bypasses the KeepModelsAliveToggle by temporarily setting
+        ``force_unload_in_progress = True``.  Stops any active video processing first
+        to ensure no worker threads are using the models during unload.
+        """
         print("[INFO] Clearing GPU Memory: Unloading all models...")
         self.main_window.video_processor.stop_processing()  # Ensure no workers are active
 
@@ -1124,37 +1176,42 @@ class ModelsProcessor(QtCore.QObject):
     ) -> Dict[str, Dict[str, torch.Tensor]]:
         """
         Loads the KV Extractor, extracts K/V maps, and unloads.
-        MP-09: This method acquires/releases kv_extraction_lock internally;
-        callers do NOT need to hold that lock.
+        Callers are responsible for holding kv_extraction_lock around this call.
         """
         kv_map = {}
-        with self.kv_extraction_lock:
-            try:
-                # 1. Load the extractor
-                self.ensure_kv_extractor_loaded()
+        try:
+            # 1. Load the extractor
+            self.ensure_kv_extractor_loaded()
 
-                if self.kv_extractor is None:
-                    raise RuntimeError("KV Extractor model failed to load.")
+            if self.kv_extractor is None:
+                raise RuntimeError("KV Extractor model failed to load.")
 
-                # 2. Perform the extraction
-                print("[INFO] Extracting K/V from reference image...")
-                kv_map = self.kv_extractor.extract_kv(input_face_image_pil)
-                print(
-                    f"[INFO] Successfully extracted K/V for {len(kv_map)} attention layers."
-                )
+            # 2. Perform the extraction
+            print("[INFO] Extracting K/V from reference image...")
+            kv_map = self.kv_extractor.extract_kv(input_face_image_pil)
+            print(
+                f"[INFO] Successfully extracted K/V for {len(kv_map)} attention layers."
+            )
 
-            except Exception as e:
-                print(f"[ERROR] Failed the K/V extraction: {e}")
-                traceback.print_exc()
-                kv_map = {}  # Return empty map if failed
+        except Exception as e:
+            print(f"[ERROR] Failed the K/V extraction: {e}")
+            traceback.print_exc()
+            kv_map = {}  # Return empty map if failed
 
-            finally:
-                # 3. Unload the extractor
-                self.unload_kv_extractor()
+        finally:
+            # 3. Unload the extractor
+            self.unload_kv_extractor()
 
         return kv_map
 
     def ensure_kv_extractor_loaded(self):
+        """
+        Guarantees that the KVExtractor (Ref-LDM) model is loaded and ready.
+
+        Downloads the required config and checkpoint files on first use, then
+        instantiates ``KVExtractor`` inside the model lock.  Safe to call multiple
+        times; no-ops when the extractor is already loaded.
+        """
         # MP-25: Check file existence and download outside lock to avoid blocking
         # other threads during potentially slow network I/O.
         base_path = "model_assets/ref-ldm_embedding"
@@ -1246,26 +1303,32 @@ class ModelsProcessor(QtCore.QObject):
     # --- Wrapper Unloaders ---
 
     def unload_face_detector_models(self):
+        """Unloads the active face detector model under the model lock."""
         with self.model_lock:
             self.face_detectors.unload_models()
 
     def unload_face_landmark_detector_models(self):
+        """Unloads the active face landmark detector model under the model lock."""
         with self.model_lock:
             self.face_landmark_detectors.unload_models()
 
     def unload_face_editor_models(self):
+        """Unloads all loaded face editor models under the model lock."""
         with self.model_lock:
             self.face_editors.unload_models()
 
     def unload_face_mask_models(self):
+        """Unloads all loaded face mask models under the model lock."""
         with self.model_lock:
             self.face_masks.unload_models()
 
     def unload_frame_enhancer_models(self):
+        """Unloads all loaded frame enhancer models under the model lock."""
         with self.model_lock:
             self.frame_enhancers.unload_models()
 
     def unload_face_restorer_models(self):
+        """Unloads all loaded face restorer models under the model lock."""
         with self.model_lock:
             self.face_restorers.unload_models()
 

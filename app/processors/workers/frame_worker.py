@@ -63,6 +63,24 @@ class FrameWorker(threading.Thread):
         frame_number: int = -1,
         is_single_frame: bool = False,
     ):
+        """
+        Initialises a FrameWorker thread.
+
+        The worker operates in one of two modes:
+          - **Pool mode** (frame_queue is not None, worker_id >= 0): runs continuously,
+            pulling (frame_number, frame, params, control) tasks from the shared queue.
+          - **Single-frame mode** (frame_queue is None): processes one frame supplied at
+            construction time and then exits.
+
+        Args:
+            main_window:    Application MainWindow — provides access to models, parameters,
+                            target faces, and control settings.
+            frame_queue:    Shared task queue for pool-mode workers; ``None`` in single-frame mode.
+            worker_id:      Integer identifier used to name the thread; ``-1`` in single-frame mode.
+            frame:          Pre-read frame (RGB ndarray) for single-frame mode; ``None`` in pool mode.
+            frame_number:   Frame index corresponding to *frame*; ``-1`` in pool mode.
+            is_single_frame: ``True`` when this is a one-shot single-frame worker.
+        """
         super().__init__()
         # This event will be used to signal the thread to stop
         self.stop_event = threading.Event()
@@ -311,6 +329,8 @@ class FrameWorker(threading.Thread):
                 or local_control_state.get(
                     "ModeEnableToggle", False
                 )  # Always processes in this mode
+                or is_view_face_compare
+                or is_view_face_mask
             )
 
             if needs_processing:
@@ -848,14 +868,17 @@ class FrameWorker(threading.Thread):
         # geometrically invalid spherical coordinates.
         vr_rotation_angles = [0]
 
-        # Detection on full equirectangular image
+        # Detection on full equirectangular image.
+        # Use the standard (512, 512) input size — TRT engines are compiled for this shape.
+        # A custom 2:1 size like (1024, 512) produces a (1, 3, 512, 1024) tensor that TRT
+        # has no profile for, causing "TensorRT EP failed to create engine from network".
+        # _prepare_detection_image letterboxes the 2:1 equirect into 512×256 within the
+        # 512×512 canvas, which still gives adequate resolution for face detection.
         bboxes_eq_np, _, _ = self.models_processor.run_detect(
             original_equirect_tensor_for_vr,
             control["DetectorModelSelection"],
             max_num=control["MaxFacesToDetectSlider"],
             score=control["DetectorScoreSlider"] / 100.0,
-            # VR-09: 2:1 aspect ratio matches equirectangular content
-            input_size=(1024, 512),
             use_landmark_detection=False,  # VR usually detects faces first, then landmarks on crops
             landmark_detect_mode=control["LandmarkDetectModelSelection"],
             landmark_score=control["LandmarkDetectScoreSlider"] / 100.0,
@@ -890,6 +913,9 @@ class FrameWorker(threading.Thread):
         # to avoid string allocation for each face and simplify downstream iteration
         processed_perspective_crops_details = []  # each entry: (eye_side, tensor, theta, phi, fov)
         analyzed_faces_for_vr = []
+        # Crops for detected faces that had no matching target — shown as-is in compare/mask mode
+        unmatched_compare_crops: list[torch.Tensor] = []
+        compare_mode_vr_early = self.is_view_face_mask or self.is_view_face_compare
 
         for bbox_eq_single in bboxes_eq_np:
             if stop_event.is_set():
@@ -1015,13 +1041,20 @@ class FrameWorker(threading.Thread):
                     }
                 )
             else:
-                del face_crop_tensor
+                if compare_mode_vr_early:
+                    # No target match — save the raw crop for compare display (shown as-is)
+                    unmatched_compare_crops.append(face_crop_tensor)
+                else:
+                    del face_crop_tensor
 
         # Process collected faces
         compare_mode_active_vr = self.is_view_face_mask or self.is_view_face_compare
         vr_compare_crops: list[
             tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]
         ] = []
+        # Include unmatched detected faces in compare view (original shown on both sides, no mask)
+        for _unmatched in unmatched_compare_crops:
+            vr_compare_crops.append((_unmatched, _unmatched, None))
 
         for item_data in analyzed_faces_for_vr:
             original_crop_for_compare = (
@@ -1072,7 +1105,17 @@ class FrameWorker(threading.Thread):
         # Stitch back
         # FW-PERF-12: skip PerspectiveConverter instantiation when there are no crops to stitch
         if not processed_perspective_crops_details:
-            return original_equirect_tensor_for_vr
+            _result_no_stitch = original_equirect_tensor_for_vr
+            _det_faces_eq = [{"bbox": row[:4]} for row in bboxes_eq_np]
+            if control.get("ShowAllDetectedFacesBBoxToggle", False) and _det_faces_eq:
+                _result_no_stitch = draw_bounding_boxes_on_detected_faces(
+                    _result_no_stitch, _det_faces_eq
+                )
+            if control.get("ShowByteTrackBBoxToggle", False) and _det_faces_eq:
+                _result_no_stitch = draw_bounding_boxes_on_detected_faces(
+                    _result_no_stitch, _det_faces_eq, color_rgb=[255, 165, 0]
+                )
+            return _result_no_stitch
 
         final_equirect_torch_cxhxw_rgb_uint8 = original_equirect_tensor_for_vr.clone()
         vr_single_eye_mode = (
@@ -1106,6 +1149,17 @@ class FrameWorker(threading.Thread):
 
         processed_tensor_rgb_uint8 = final_equirect_torch_cxhxw_rgb_uint8
 
+        # --- Bounding box overlays on the stitched equirectangular image ---
+        _det_faces_eq = [{"bbox": row[:4]} for row in bboxes_eq_np]
+        if control.get("ShowAllDetectedFacesBBoxToggle", False) and _det_faces_eq:
+            processed_tensor_rgb_uint8 = draw_bounding_boxes_on_detected_faces(
+                processed_tensor_rgb_uint8, _det_faces_eq
+            )
+        if control.get("ShowByteTrackBBoxToggle", False) and _det_faces_eq:
+            processed_tensor_rgb_uint8 = draw_bounding_boxes_on_detected_faces(
+                processed_tensor_rgb_uint8, _det_faces_eq, color_rgb=[255, 165, 0]
+            )
+
         # Cleanup
         # VR-08: equirect_converter is now self._vr_converter (cached); do not del it
         del (
@@ -1124,7 +1178,10 @@ class FrameWorker(threading.Thread):
                 imgs_to_cat: list[torch.Tensor] = []
                 if self.is_view_face_compare:
                     imgs_to_cat.append(original_chw)
-                imgs_to_cat.append(processed_chw)
+                    imgs_to_cat.append(processed_chw)
+                elif not self.is_view_face_mask:
+                    # Neither compare nor mask — shouldn't reach here, but show processed
+                    imgs_to_cat.append(processed_chw)
                 if self.is_view_face_mask and mask_1chw_float is not None:
                     mask_display = torch.sub(1, mask_1chw_float).repeat(3, 1, 1)
                     mask_display = torch.mul(mask_display, 255.0).type(torch.uint8)
@@ -1566,6 +1623,14 @@ class FrameWorker(threading.Thread):
     def get_compare_faces_image(
         self, img: torch.Tensor, det_faces_data: list, control: dict
     ) -> torch.Tensor:
+        """
+        Builds a side-by-side comparison image for all detected faces.
+
+        For each detected face that has a matched target, creates a horizontal strip
+        containing: [original_face | swapped_face | swap_mask (if available)].
+        All strips are vertically stacked and returned as a single CHW tensor.
+        Returns the original *img* unchanged if no matched faces are found.
+        """
         imgs_to_vstack = []
         for _, fface in enumerate(det_faces_data):
             # FW-BUG-09 / FW-PERF-01/02/03: use cached match result when available
@@ -1641,6 +1706,20 @@ class FrameWorker(threading.Thread):
     def get_cropped_face_using_kps(
         self, img: torch.Tensor, kps_5: np.ndarray, parameters: dict
     ) -> torch.Tensor:
+        """
+        Aligns and crops a 512×512 face patch from *img* using the 5-point keypoints.
+
+        The alignment transform is chosen based on the active SwapModelSelection so
+        the crop matches the template expected by each swapper architecture.
+
+        Args:
+            img:        Full-frame CHW uint8 tensor.
+            kps_5:      5-point facial keypoints (numpy array, shape [5, 2]).
+            parameters: Per-face parameter dict containing at least ``SwapModelSelection``.
+
+        Returns:
+            CHW uint8 tensor of shape [3, 512, 512].
+        """
         tform = self.get_face_similarity_tform(parameters["SwapModelSelection"], kps_5)
         face_512_aligned = v2.functional.affine(
             img,
@@ -1656,6 +1735,23 @@ class FrameWorker(threading.Thread):
     def get_face_similarity_tform(
         self, swapper_model: str, kps_5: np.ndarray
     ) -> trans.SimilarityTransform:
+        """
+        Computes the similarity transform that maps the detected 5-point keypoints
+        to the canonical face template for the given *swapper_model*.
+
+        Different swapper architectures use different alignment templates
+        (ArcFace 128 crop, ArcFace map crop, or FFHQ-aligned crop for CSCS/Ghost).
+
+        Args:
+            swapper_model: The name of the active swapper (e.g. ``"Inswapper128"``).
+            kps_5:         Detected 5-point keypoints, shape [5, 2].
+
+        Returns:
+            Fitted ``skimage.transform.SimilarityTransform``.
+
+        Raises:
+            ValueError: If the transform estimation fails (degenerate face geometry).
+        """
         # FW-QUAL-10: use GHOSTFACE_MODELS frozenset instead of chained != comparisons
         if swapper_model not in self.GHOSTFACE_MODELS and swapper_model != "CSCS":
             dst = faceutil.get_arcface_template(image_size=512, mode="arcface128")
@@ -1690,6 +1786,16 @@ class FrameWorker(threading.Thread):
         return tform
 
     def get_transformed_and_scaled_faces(self, tform, img):
+        """
+        Applies the similarity transform to extract aligned face crops at four resolutions.
+
+        Args:
+            tform: Fitted ``SimilarityTransform`` from ``get_face_similarity_tform``.
+            img:   Full-frame CHW uint8 tensor.
+
+        Returns:
+            Tuple ``(face_512, face_384, face_256, face_128)``, all CHW uint8 tensors.
+        """
         original_face_512 = v2.functional.affine(
             img,
             tform.rotation * 57.2958,
@@ -1776,6 +1882,25 @@ class FrameWorker(threading.Thread):
         cmddebug,
         tform,
     ):
+        """
+        Selects the correct input face resolution and computes the swapping latent vector
+        for the active swapper model.
+
+        Args:
+            original_faces: Tuple ``(face_512, face_384, face_256, face_128)`` of CHW tensors.
+            swapper_model:  Active swapper name (e.g. ``"Inswapper128"``).
+            dfm_model_name: DFM model filename; used only when swapper_model is ``"DeepFaceLive (DFM)"``.
+            s_e:            Source ArcFace embedding (numpy array) or ``None`` for DFM.
+            t_e:            Target ArcFace embedding (numpy array) or ``None``.
+            parameters:     Per-face parameter dict.
+            cmddebug:       Whether command-line debug output is enabled.
+            tform:          Similarity transform (used by Inswapper auto-resolution).
+
+        Returns:
+            Tuple ``(input_face_affined, dfm_model_instance, dim, latent)`` where
+            *input_face_affined* is ``None`` on failure, *dim* is the resolution multiplier
+            (1=128, 2=256, 3=384, 4=512), and *latent* is the model-specific embedding tensor.
+        """
         original_face_512, original_face_384, original_face_256, original_face_128 = (
             original_faces
         )
@@ -1959,6 +2084,27 @@ class FrameWorker(threading.Thread):
         dfm_model,
         parameters,
     ):
+        """
+        Runs the swapper model inference and returns the swapped face tensor.
+
+        Applies optional pre-swap sharpness, executes the swapper loop *itex* times
+        (strength slider), and delegates to the architecture-specific branch
+        (Inswapper, Ghost, SimSwap, InStyle, CSCS, or DFM).
+
+        Args:
+            output:             Pre-allocated output tensor (HWC float32, [0..1]).
+            input_face_affined: Aligned face CHW tensor at the chosen resolution.
+            original_face_512:  Unmodified 512-px face CHW uint8 tensor (used by DFM).
+            latent:             Swapping latent computed by ``get_affined_face_dim_and_swapping_latents``.
+            itex:               Number of inference iterations (from StrengthAmountSlider).
+            dim:                Resolution multiplier (1=128, 2=256, 3=384, 4=512).
+            swapper_model:      Active swapper name.
+            dfm_model:          Loaded ``DFMModel`` instance, or ``None`` for non-DFM swappers.
+            parameters:         Per-face parameter dict.
+
+        Returns:
+            Tuple ``(swap_chw_uint8, prev_face_hwc_float)``.
+        """
         if parameters["PreSwapSharpnessDecimalSlider"] != 1.0:
             input_face_affined = input_face_affined.permute(2, 0, 1)
             input_face_affined = v2.functional.adjust_sharpness(
@@ -1966,12 +2112,17 @@ class FrameWorker(threading.Thread):
             )
             input_face_affined = input_face_affined.permute(1, 2, 0)
 
-        # FW-MEM-2: clone once here (before the loop) rather than on every
-        # loop iteration; only the final value is used after the loop exits.
+        # prev_face is updated at the start of each iteration so that after
+        # N iterations it holds the N-1 result.  The alpha blend in swap_core
+        # then interpolates between pass N-1 and pass N for fractional slider values.
+        # Initialized here as a fallback for the DFM branch and itex=0 edge case.
         prev_face = input_face_affined.clone()
 
         if swapper_model == "Inswapper128":
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
+                prev_face = (
+                    input_face_affined.clone()
+                )  # save N-1 result before this pass
                 # Lists to hold independent memory buffers for this iteration
                 tile_inputs = []
                 tile_outputs = []
@@ -2010,7 +2161,6 @@ class FrameWorker(threading.Thread):
                     output[j::dim, i::dim] = res_hwc
 
                 # 5. STATE UPDATE
-                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = output.clone()
                 output = torch.mul(output, 255)
                 output = torch.clamp(output, 0, 255)
@@ -2024,6 +2174,9 @@ class FrameWorker(threading.Thread):
             dim_res = dim // 2
 
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
+                prev_face = (
+                    input_face_affined.clone()
+                )  # save N-1 result before this pass
                 tile_inputs = []
                 tile_outputs = []
                 tile_coords = []
@@ -2056,13 +2209,15 @@ class FrameWorker(threading.Thread):
                     res_hwc = res.squeeze(0).permute(1, 2, 0)
                     output[j::dim_res, i::dim_res] = res_hwc
 
-                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = output.clone()
                 output = torch.mul(output, 255)
                 output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "SimSwap512":
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
+                prev_face = (
+                    input_face_affined.clone()
+                )  # save N-1 result before this pass
                 input_face_disc = input_face_affined.permute(2, 0, 1)
                 input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
                 swapper_output = torch.empty(
@@ -2085,7 +2240,6 @@ class FrameWorker(threading.Thread):
                 swapper_output = torch.squeeze(swapper_output)
                 swapper_output = swapper_output.permute(1, 2, 0)
 
-                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = swapper_output.clone()
 
                 output = swapper_output.clone()
@@ -2095,6 +2249,9 @@ class FrameWorker(threading.Thread):
         # FW-QUAL-10: use GHOSTFACE_MODELS frozenset
         elif swapper_model in self.GHOSTFACE_MODELS:
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
+                prev_face = (
+                    input_face_affined.clone()
+                )  # save N-1 result before this pass
                 input_face_disc = torch.mul(input_face_affined, 255.0).permute(2, 0, 1)
                 input_face_disc = torch.div(input_face_disc.float(), 127.5)
                 input_face_disc = torch.sub(input_face_disc, 1)
@@ -2122,7 +2279,6 @@ class FrameWorker(threading.Thread):
                 swapper_output = torch.mul(swapper_output, 127.5)
                 swapper_output = torch.add(swapper_output, 127.5)
 
-                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = swapper_output.clone()
                 input_face_affined = torch.div(input_face_affined, 255)
 
@@ -2131,6 +2287,9 @@ class FrameWorker(threading.Thread):
 
         elif swapper_model == "CSCS":
             for _ in range(itex):  # FW-QUAL-06: renamed k -> _
+                prev_face = (
+                    input_face_affined.clone()
+                )  # save N-1 result before this pass
                 input_face_disc = input_face_affined.permute(2, 0, 1)
                 input_face_disc = v2.functional.normalize(
                     input_face_disc, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
@@ -2153,7 +2312,6 @@ class FrameWorker(threading.Thread):
                 swapper_output = torch.add(torch.mul(swapper_output, 0.5), 0.5)
                 swapper_output = swapper_output.permute(1, 2, 0)
 
-                # FW-MEM-2: prev_face set once before the loop; no clone here
                 input_face_affined = swapper_output.clone()
 
                 output = swapper_output.clone()
@@ -2161,20 +2319,16 @@ class FrameWorker(threading.Thread):
                 output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "DeepFaceLive (DFM)" and dfm_model:
-            # FW-BUG-05: convert original_face_512 from CHW uint8 to HWC float32 [0,1]
-            # before passing to DFM model, which expects HWC float32 [0,1] input.
-            dfm_input = original_face_512.permute(1, 2, 0).float() / 255.0
-            # DFM contract: dfm_model.convert() must return HWC float32 [0,1] tensor.
+            # convert() expects CHW uint8; returns HWC float32 [0,1]
             out_celeb, _, _ = dfm_model.convert(
-                dfm_input,
+                original_face_512,
                 parameters["DFMAmpMorphSlider"] / 100,
                 rct=parameters["DFMRCTColorToggle"],
             )
-            # FW-BUG-02: assert DFM output contract (HWC float32 [0,1])
             assert out_celeb.ndim == 3 and out_celeb.shape[2] == 3, (
                 f"DFM model must return HWC RGB tensor, got shape {out_celeb.shape}"
             )
-            # FW-MEM-2: prev_face already set before any branching; no extra clone
+            # DFM is a single pass — prev_face fallback set before the if/elif chain is used
             input_face_affined = out_celeb.clone()
             output = out_celeb.clone()
 
@@ -2429,7 +2583,11 @@ class FrameWorker(threading.Thread):
             original_face_128,
         )
         swap = original_face_512
-        prev_face = None
+        # Initialise prev_face to the normalised original face so that the
+        # StrengthEnableToggle blend at the end of swap_core always has a valid
+        # tensor, even when get_swapped_and_prev_face is skipped (e.g. DFM
+        # selected but no model file chosen, or input_face_affined is None).
+        prev_face = torch.div(original_face_512.float(), 255.0).permute(1, 2, 0)
 
         # --- SWAPPING INFERENCE ---
         if valid_s_e is not None or (
@@ -2467,9 +2625,7 @@ class FrameWorker(threading.Thread):
 
                 itex = 1
                 if parameters["StrengthEnableToggle"]:
-                    # FW-BUG-10: use round() instead of ceil() so slider value is
-                    # interpreted as a multiplier, not always rounded up
-                    itex = max(1, round(parameters["StrengthAmountSlider"] / 100.0))
+                    itex = ceil(parameters["StrengthAmountSlider"] / 100.0)
 
                 output_size = int(128 * dim)
                 output = torch.zeros(
@@ -2495,8 +2651,7 @@ class FrameWorker(threading.Thread):
         else:
             swap = original_face_512
             if parameters["StrengthEnableToggle"]:
-                # FW-BUG-10: use round() instead of ceil()
-                itex = max(1, round(parameters["StrengthAmountSlider"] / 100.0))
+                itex = ceil(parameters["StrengthAmountSlider"] / 100.0)
                 prev_face = torch.div(swap, 255.0)
                 prev_face = prev_face.permute(1, 2, 0)
 
@@ -4303,6 +4458,16 @@ class FrameWorker(threading.Thread):
         return warped
 
     def analyze_image(self, image):
+        """
+        Analyses a CHW uint8 image tensor and returns a dict of quality scores in [0, 1].
+
+        Computed metrics:
+          - ``jpeg_artifacts``: High-frequency energy (higher = more ringing/blocking).
+          - ``salt_pepper_noise``: Fraction of pixels with sharp local outliers.
+          - ``speckle_noise``: Mean local variance (higher = more speckle).
+          - ``blur``: Inverted Laplacian edge strength (higher = blurrier).
+          - ``low_contrast``: Inverted pixel standard deviation (higher = flatter).
+        """
         image = image.float() / 255.0
         C, H, W = image.shape
         grayscale = torch.mean(image, dim=0, keepdim=True)

@@ -708,8 +708,19 @@ class VQModelInterface(nn.Module):
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys or [])
 
     def init_from_ckpt(self, path, ignore_keys=None):
-        # R-03: use weights_only=True for safe standard weight loading
-        sd = torch.load(path, map_location="cpu", weights_only=True)["state_dict"]
+        # R-03: weights_only=True for safe loading; allowlist the pytorch_lightning
+        # ModelCheckpoint global that is embedded in this checkpoint's pickle data.
+        try:
+            from pytorch_lightning.callbacks.model_checkpoint import ModelCheckpoint
+
+            with torch.serialization.safe_globals([ModelCheckpoint]):
+                sd = torch.load(path, map_location="cpu", weights_only=True)[
+                    "state_dict"
+                ]
+        except (ImportError, AttributeError):
+            # pytorch_lightning not available or torch version lacks safe_globals —
+            # fall back to weights_only=False (file is a trusted local asset).
+            sd = torch.load(path, map_location="cpu", weights_only=False)["state_dict"]
         keys = list(sd.keys())
         for k in keys:
             for ik in ignore_keys:

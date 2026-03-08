@@ -17,14 +17,16 @@ from app.ui.widgets.actions import common_actions as common_widget_actions
 
 def handle_face_detector_tracking_reset(main_window: "MainWindow", value):
     """Resets the tracker instance when tracking is toggled or media changes."""
-    main_window.models_processor.face_detectors.tracker = None
-    main_window.models_processor.face_detectors.track_history = {}
-    try:
-        from app.processors.external.yolox.tracker.basetrack import BaseTrack
-
-        BaseTrack._count = 0
-    except ImportError:
-        pass
+    main_window.models_processor.face_detectors.reset_tracker()
+    # When ByteTrack is disabled, reset its child toggle so it doesn't stay True
+    # while hidden (parentToggle mechanism only hides the widget, it doesn't reset the value).
+    if not value:
+        main_window.control["ShowByteTrackBBoxToggle"] = False
+        widget = main_window.parameter_widgets.get("ShowByteTrackBBoxToggle")
+        if widget is not None:
+            widget.blockSignals(True)
+            widget.setChecked(False)
+            widget.blockSignals(False)
     common_widget_actions.refresh_frame(main_window)
 
 

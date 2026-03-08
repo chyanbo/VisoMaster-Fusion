@@ -26,6 +26,7 @@ from app.ui.widgets import widget_components
 
 
 def set_up_video_seek_line_edit(main_window: "MainWindow"):
+    """Configures the video seek line-edit widget: centres text and restricts input to valid frame numbers."""
     video_processor = main_window.video_processor
     videoSeekLineEdit = main_window.videoSeekLineEdit
     videoSeekLineEdit.setAlignment(QtCore.Qt.AlignCenter)
@@ -36,6 +37,11 @@ def set_up_video_seek_line_edit(main_window: "MainWindow"):
 
 
 def set_up_video_seek_slider(main_window: "MainWindow"):
+    """
+    Configures the video seek slider with custom painting, marker management, and
+    job-bracket rendering.  Attaches add_marker_and_paint, remove_marker_and_paint,
+    and a custom paintEvent directly to the slider instance.
+    """
     main_window.videoSeekSlider.markers = set()  # Store unique tick positions
     main_window.videoSeekSlider.markers_sorted = []  # Sorted list for iteration in paintEvent
     main_window.videoSeekSlider.setTickPosition(
@@ -64,6 +70,7 @@ def set_up_video_seek_slider(main_window: "MainWindow"):
             self.update()
 
     def paintEvent(self: QtWidgets.QSlider, event: QtGui.QPaintEvent):
+        """Custom paint: draws the groove, a thin white handle, coloured marker ticks, and job-bracket characters."""
         if self.maximum() == self.minimum():
             return super(QtWidgets.QSlider, self).paintEvent(event)
         # Do not draw the slider if the current media is a single image
@@ -178,6 +185,13 @@ def set_up_video_seek_slider(main_window: "MainWindow"):
 
 
 def add_video_slider_marker(main_window: "MainWindow"):
+    """
+    Adds a standard parameter marker at the current slider position.
+
+    Requires a video to be loaded and at least one target face to be present.
+    Shows an error message box if either precondition is not met, or if a marker
+    already exists at that position.
+    """
     if (
         not isinstance(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
@@ -322,6 +336,12 @@ def set_job_end_frame(main_window: "MainWindow"):
 
 
 def remove_video_slider_marker(main_window: "MainWindow"):
+    """
+    Removes the marker (standard or job-bracket) at the current slider position.
+
+    If the position belongs to a job marker pair, the entire pair is removed.
+    If no marker exists at the position, an error message box is shown.
+    """
     if (
         not isinstance(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
@@ -375,12 +395,14 @@ def add_marker(
     control,
     position,
 ):
+    """Stores a snapshot of the current parameters and control state at the given frame position."""
     main_window.videoSeekSlider.add_marker_and_paint(position)
     main_window.markers[position] = {"parameters": parameters, "control": control}
     print(f"[INFO] Marker Added for Frame: {position}")
 
 
 def remove_marker(main_window: "MainWindow", position):
+    """Removes the marker at the specified frame position, if one exists."""
     if main_window.markers.get(position):
         main_window.videoSeekSlider.remove_marker_and_paint(position)
         main_window.markers.pop(position)
@@ -427,14 +449,22 @@ def move_slider_to_nearest_marker(main_window: "MainWindow", direction: str):
 
 # Wrappers for specific directions
 def move_slider_to_next_nearest_marker(main_window: "MainWindow"):
+    """Moves the slider to the nearest marker that is after the current position."""
     move_slider_to_nearest_marker(main_window, "next")
 
 
 def move_slider_to_previous_nearest_marker(main_window: "MainWindow"):
+    """Moves the slider to the nearest marker that is before the current position."""
     move_slider_to_nearest_marker(main_window, "previous")
 
 
 def remove_face_parameters_and_control_from_markers(main_window: "MainWindow", face_id):
+    """
+    Removes all stored parameter entries for *face_id* from every marker.
+
+    If any marker's parameter dict becomes empty after the removal, all markers are
+    deleted because there is no longer any face data to track.
+    """
     for _, marker_data in main_window.markers.items():
         marker_data["parameters"].pop(
             face_id, None
@@ -446,6 +476,7 @@ def remove_face_parameters_and_control_from_markers(main_window: "MainWindow", f
 
 
 def remove_all_markers(main_window: "MainWindow"):
+    """Removes every standard marker and clears all job marker pairs."""
     standard_markers_positions = list(main_window.markers.keys())
     for marker_position in standard_markers_positions:
         remove_marker(main_window, marker_position)
@@ -456,6 +487,12 @@ def remove_all_markers(main_window: "MainWindow"):
 
 
 def advance_video_slider_by_n_frames(main_window: "MainWindow", n=30):
+    """
+    Advances the seek slider forward by *n* frames (clamped to the last frame).
+
+    For single-frame steps (n=1) the pipeline runs synchronously to prevent a
+    visible flash between the raw preview and the processed result.
+    """
     video_processor = main_window.video_processor
     if video_processor.media_capture:
         current_position = int(main_window.videoSeekSlider.value())
@@ -476,6 +513,12 @@ def advance_video_slider_by_n_frames(main_window: "MainWindow", n=30):
 
 
 def rewind_video_slider_by_n_frames(main_window: "MainWindow", n=30):
+    """
+    Rewinds the seek slider backward by *n* frames (clamped to frame 0).
+
+    For single-frame steps (n=1) the pipeline runs synchronously to prevent a
+    visible flash between the raw preview and the processed result.
+    """
     video_processor = main_window.video_processor
     if video_processor.media_capture:
         current_position = int(main_window.videoSeekSlider.value())
@@ -496,12 +539,14 @@ def rewind_video_slider_by_n_frames(main_window: "MainWindow", n=30):
 
 
 def delete_all_markers(main_window: "MainWindow"):
+    """Clears all marker positions from the slider and the markers dict without removing job pairs."""
     main_window.videoSeekSlider.markers = set()
     main_window.videoSeekSlider.update()
     main_window.markers.clear()
 
 
 def view_fullscreen(main_window: "MainWindow"):
+    """Toggles the main window between full-screen and normal mode, hiding/showing the menu bar."""
     if main_window.is_full_screen:
         main_window.showNormal()  # Exit full-screen mode
         main_window.menuBar().show()
@@ -513,6 +558,12 @@ def view_fullscreen(main_window: "MainWindow"):
 
 
 def enable_zoom_and_pan(view: QtWidgets.QGraphicsView):
+    """
+    Attaches mouse-wheel zoom and right-click pan behaviour to a QGraphicsView instance.
+
+    Monkey-patches zoom, reset_zoom, wheelEvent, mousePressEvent, mouseMoveEvent,
+    and mouseReleaseEvent directly onto the view object so no subclass is required.
+    """
     SCALE_FACTOR = 1.1
     view.zoom_value = 0  # Track zoom level
     view.last_scale_factor = 1.0  # Track the last scale factor (1.0 = no scaling)
@@ -537,8 +588,8 @@ def enable_zoom_and_pan(view: QtWidgets.QGraphicsView):
             zoom(self, delta // abs(delta))
 
     def reset_zoom(self: QtWidgets.QGraphicsView):
+        """Resets the view transform so the scene content fits the viewport exactly."""
         # print("Called reset_zoom()")
-        # Reset zoom level to fit the view.
         self.zoom_value = 0
         if not self.scene():
             return
@@ -615,6 +666,13 @@ def enable_zoom_and_pan(view: QtWidgets.QGraphicsView):
 
 
 def play_video(main_window: "MainWindow", checked: bool):
+    """
+    Starts or stops video/webcam playback in response to the Play button toggle.
+
+    When *checked* is True: starts playback (or webcam stream) if not already running
+    and the slider is not at the end of the video.
+    When *checked* is False: stops any active processing and resets button states.
+    """
     video_processor = main_window.video_processor
     if checked and video_processor.file_type == "webcam":
         if video_processor.processing:
@@ -651,6 +709,17 @@ def play_video(main_window: "MainWindow", checked: bool):
 
 
 def record_video(main_window: "MainWindow", checked: bool):
+    """
+    Starts or stops recording in response to the Record button toggle.
+
+    Supports three recording modes:
+      - Default style (no job markers): records from the current slider position.
+      - Multi-segment style (job markers set): records each marker-pair segment.
+      - Batch processing: forces recording from frame 0.
+
+    When *checked* is False: prompts the user to confirm stopping (unless triggered
+    programmatically by the Job Manager) and finalises the current recording.
+    """
     video_processor = main_window.video_processor
     # Determine if this record action was initiated by the Job Manager
     job_mgr_flag = getattr(main_window, "job_manager_initiated_record", False)
@@ -798,28 +867,17 @@ def record_video(main_window: "MainWindow", checked: bool):
                 )
 
     else:
-        # --- Stop confirmation (manual UI only) ---
-        # The record button is toggle-based, and many call sites do not check return
-        # values. Therefore, cancellation must be handled here without relying on
-        # callers.
-        #
-        # Do NOT prompt when this stop was initiated programmatically by Job Manager.
-        if (
-            video_processor.is_processing_segments or video_processor.recording
-        ) and not job_mgr_flag:
+        # --- Stop logic ---
+        # VP-34: Check for multi-segment recording first as it's more complex.
+        if video_processor.is_processing_segments and not job_mgr_flag:
             try:
                 box = QtWidgets.QMessageBox(main_window)
                 box.setIcon(QtWidgets.QMessageBox.Warning)
                 box.setWindowTitle("Confirm stop")
-                box.setText("Stop the current recording?")
-                if video_processor.is_processing_segments:
-                    box.setInformativeText(
-                        "Segment recording will stop immediately. Output may be incomplete."
-                    )
-                else:
-                    box.setInformativeText(
-                        "Recording will stop immediately and finalize the output."
-                    )
+                box.setText("Stop multi-segment recording?")
+                box.setInformativeText(
+                    "Segment recording will stop immediately. Output may be incomplete."
+                )
                 box.setStandardButtons(
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No
                 )
@@ -861,26 +919,34 @@ def record_video(main_window: "MainWindow", checked: bool):
 
 
 def set_record_button_icon_to_play(main_window: "MainWindow"):
+    """Sets the Record button icon and tooltip to the 'ready-to-record' (stopped) state."""
     main_window.buttonMediaRecord.setIcon(QtGui.QIcon(":/media/media/rec_off.png"))
     main_window.buttonMediaRecord.setToolTip("Start Recording")
 
 
 def set_record_button_icon_to_stop(main_window: "MainWindow"):
+    """Sets the Record button icon and tooltip to the 'recording active' (stop) state."""
     main_window.buttonMediaRecord.setIcon(QtGui.QIcon(":/media/media/rec_on.png"))
     main_window.buttonMediaRecord.setToolTip("Stop Recording")
 
 
 def set_play_button_icon_to_play(main_window: "MainWindow"):
+    """Sets the Play button icon and tooltip to the 'ready-to-play' (stopped) state."""
     main_window.buttonMediaPlay.setIcon(QtGui.QIcon(":/media/media/play_off.png"))
     main_window.buttonMediaPlay.setToolTip("Play")
 
 
 def set_play_button_icon_to_stop(main_window: "MainWindow"):
+    """Sets the Play button icon and tooltip to the 'playing active' (stop) state."""
     main_window.buttonMediaPlay.setIcon(QtGui.QIcon(":/media/media/play_on.png"))
     main_window.buttonMediaPlay.setToolTip("Stop")
 
 
 def reset_media_buttons(main_window: "MainWindow"):
+    """
+    Resets the Play and Record buttons to their unchecked, enabled state without
+    triggering their toggled/clicked signals.  Updates icons to match the new state.
+    """
     # Rest the state and icons of the buttons without triggering Onchange methods
     main_window.buttonMediaPlay.blockSignals(True)
     main_window.buttonMediaPlay.setChecked(False)
@@ -894,6 +960,7 @@ def reset_media_buttons(main_window: "MainWindow"):
 
 
 def set_play_button_icon(main_window: "MainWindow"):
+    """Updates the Play button icon and tooltip to reflect its current checked state."""
     if main_window.buttonMediaPlay.isChecked():
         main_window.buttonMediaPlay.setIcon(QtGui.QIcon(":/media/media/play_on.png"))
         main_window.buttonMediaPlay.setToolTip("Stop")
@@ -903,6 +970,7 @@ def set_play_button_icon(main_window: "MainWindow"):
 
 
 def set_record_button_icon(main_window: "MainWindow"):
+    """Updates the Record button icon and tooltip to reflect its current checked state."""
     if main_window.buttonMediaRecord.isChecked():
         main_window.buttonMediaRecord.setIcon(QtGui.QIcon(":/media/media/rec_on.png"))
         main_window.buttonMediaRecord.setToolTip("Stop Recording")
@@ -914,6 +982,13 @@ def set_record_button_icon(main_window: "MainWindow"):
 # @misc_helpers.benchmark
 @QtCore.Slot(int)
 def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
+    """
+    Slot connected to the slider's valueChanged signal.
+
+    Stops any active processing, seeks the capture to the new position, reads the
+    raw frame for immediate preview, and defers heavy post-seek work (marker
+    application, AutoSwap) until the slider is released.
+    """
     # print("Called on_change_video_seek_slider()")
     video_processor = main_window.video_processor
 
@@ -931,6 +1006,9 @@ def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
             video_processor.media_capture, video_processor.media_rotation
         )
         if ret:
+            # Cache the raw frame so process_current_frame() can use it as a
+            # fallback when the near-EOF re-read fails (OpenCV reliability issue).
+            video_processor._seek_cached_frame = (new_position, frame)
             # For preview, show the raw frame immediately.
             # The processed frame will be shown when the slider is released.
             pixmap = common_widget_actions.get_pixmap_from_frame(main_window, frame)
@@ -939,7 +1017,13 @@ def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
             )
 
         else:
+            # VP-34: Read failed. Trigger a stop/reopen cycle to recover from silent handle failures.
+            print(
+                f"[WARN] on_change_video_seek_slider: Read failed at frame {new_position}. Attempting recovery..."
+            )
+            video_processor._seek_cached_frame = None
             main_window.last_seek_read_failed = True
+            video_processor.stop_processing()
     # Only update parameters and widgets if the slider is NOT being actively dragged.
     # This ensures playback, clicks, and button presses update the UI,
     # but fast scrubbing does not cause lag or skip marker updates.
@@ -979,6 +1063,13 @@ def _get_marker_data_for_position(
 def update_parameters_and_control_from_marker(
     main_window: "MainWindow", new_position: int
 ):
+    """
+    Loads the parameters and control state stored in the nearest marker at or before
+    *new_position* into the live main_window state.
+
+    If no marker is found, the current state is left unchanged.  The global
+    TrackMarkersToggle value is always preserved after the load.
+    """
     # Find marker only at the *exact* new position
     marker_data = _get_marker_data_for_position(main_window, new_position)
     # Save the Global Marker Track toggle
@@ -1021,6 +1112,10 @@ def update_parameters_and_control_from_marker(
 
 
 def update_widget_values_from_markers(main_window: "MainWindow", new_position: int):
+    """
+    Refreshes all UI widgets to reflect the parameter and control state that was
+    loaded by update_parameters_and_control_from_marker for *new_position*.
+    """
     # 1. Update Parameter-based widgets (Face Swap, Editor, Restorers)
     if main_window.selected_target_face_id is not None:
         common_widget_actions.set_widgets_values_using_face_id_parameters(
@@ -1040,12 +1135,14 @@ def update_widget_values_from_markers(main_window: "MainWindow", new_position: i
 
 
 def on_slider_moved(main_window: "MainWindow"):
+    """Slot connected to sliderMoved; currently a no-op placeholder for future drag-time logic."""
     # print("Called on_slider_moved()")
     main_window.videoSeekSlider.value()
     # print(f"\nSlider Moved. position: {position}\n")
 
 
 def on_slider_pressed(main_window: "MainWindow"):
+    """Slot connected to sliderPressed; currently a no-op placeholder for future press-time logic."""
     main_window.videoSeekSlider.value()
     # print(f"\nSlider Pressed. position: {position}\n")
 
@@ -1055,6 +1152,10 @@ def run_post_seek_actions(main_window: "MainWindow", new_position: int):
     Executes heavy operations (markers, AutoSwap) after a seek.
     This function is called after a slider release or a jump via button/shortcut.
     """
+
+    # Reset ByteTracker state on every user-initiated seek so stale Kalman predictions
+    # from the previous position do not corrupt detection on the new position.
+    main_window.models_processor.face_detectors.reset_tracker()
 
     # Check if the user wants to update the UI based on markers when seeking
     track_markers_enabled = main_window.control.get("TrackMarkersToggle", False)
@@ -1103,21 +1204,30 @@ def on_slider_released(main_window: "MainWindow"):
 
 
 def process_swap_faces(main_window: "MainWindow"):
+    """Triggers a single-frame re-process after the Swap Faces button state changes."""
     video_processor = main_window.video_processor
     video_processor.process_current_frame()
 
 
 def process_edit_faces(main_window: "MainWindow"):
+    """Triggers a single-frame re-process after the Edit Faces button state changes."""
     video_processor = main_window.video_processor
     video_processor.process_current_frame()
 
 
 def process_compare_checkboxes(main_window: "MainWindow"):
+    """Triggers a single-frame re-process and view resize after a compare/mask checkbox changes."""
     main_window.video_processor.process_current_frame()
     layout_actions.fit_image_to_view_onchange(main_window)
 
 
 def save_current_frame_to_file(main_window: "MainWindow"):
+    """
+    Saves the currently displayed (processed) frame to an image file in the output folder.
+
+    The format (PNG or JPEG) is determined by the ImageFormatToggle control.
+    Shows an error message if no output folder is configured or no valid frame is available.
+    """
     if not main_window.outputFolderLineEdit.text():
         common_widget_actions.create_and_show_messagebox(
             main_window,
@@ -1588,6 +1698,12 @@ def process_batch_images(main_window: "MainWindow", process_all_faces: bool):
 
 
 def toggle_live_sound(main_window: "MainWindow", toggle_value: bool):
+    """
+    Enables or disables live audio playback during video preview.
+
+    If video was already playing, it is stopped and restarted so the audio
+    subprocess is created (or destroyed) with the new setting in effect.
+    """
     video_processor = main_window.video_processor
     was_processing = video_processor.processing
 

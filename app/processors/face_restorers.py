@@ -700,8 +700,7 @@ class FaceRestorers:
             shape=(1, 3, 512, 512),
             buffer_ptr=image.data_ptr(),
         )
-        # FS-ROBUST-03: use float32 to match ONNX model expected dtype
-        w = np.array([fidelity_weight_value], dtype=np.float32)
+        w = np.array([fidelity_weight_value], dtype=np.double)
         io_binding.bind_cpu_input("w", w)
         io_binding.bind_output(
             name="y",
