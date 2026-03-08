@@ -88,7 +88,7 @@ If your video has multiple scenes or the settings need to change partway through
 
 For a full explanation of every setting and what it does, see the [User Manual](./user_manual.md).
 
-For workflow tips, advanced settings, and community presets, join the Discord.
+For workflow tips, advanced settings, and community presets, join the [Discord](https://discord.gg/5rx4SQuDbp).
 
 ---
 
