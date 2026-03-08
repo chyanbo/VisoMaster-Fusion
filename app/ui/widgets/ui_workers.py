@@ -94,12 +94,17 @@ class TargetMediaLoaderWorker(qtc.QThread):
         self.main_window.placeholder_update_signal.emit(
             self.main_window.targetVideosList, True
         )
-        media_files = files_list
-        # Sorting the list
-        media_files.sort(key=lambda x: os.path.basename(str(x)).lower())
 
-        i = 0
-        for media_file_path in media_files:
+        # Associate ID and Paths before sorting
+        paired_files_ids = []
+        for idx, path in enumerate(files_list):
+            m_id = self.media_ids[idx] if self.media_ids else str(uuid.uuid1().int)
+            paired_files_ids.append((path, m_id))
+
+        # Alphabetical sorting on filename only
+        paired_files_ids.sort(key=lambda x: os.path.basename(str(x[0])).lower())
+
+        for media_file_path, media_id in paired_files_ids:
             if not self._running:  # Check if the thread is still running
                 break
             if not os.path.exists(media_file_path):
@@ -108,14 +113,10 @@ class TargetMediaLoaderWorker(qtc.QThread):
             pixmap = common_widget_actions.extract_frame_as_pixmap(
                 self.main_window, media_file_path, file_type=file_type
             )
-            if self.media_ids:
-                media_id = self.media_ids[i]
-            else:
-                media_id = str(uuid.uuid1().int)
             if pixmap:
                 # Emit the signal to update GUI
                 self.thumbnail_ready.emit(media_file_path, pixmap, file_type, media_id)
-            i += 1
+
         self.main_window.placeholder_update_signal.emit(
             self.main_window.targetVideosList, False
         )

@@ -281,11 +281,11 @@ def _load_job_target_media(main_window: "MainWindow", data: dict):
                 f"[WARN] Target media path not found, skipping: {m.get('media_path')}"
             )
 
-    target_medias_files_list, target_media_ids = (
-        zip(*[(m["media_path"], m["media_id"]) for m in valid_target_medias_data])
-        if valid_target_medias_data
-        else ([], [])
-    )
+    if valid_target_medias_data:
+        target_medias_files_list = [m["media_path"] for m in valid_target_medias_data]
+        target_media_ids = [m["media_id"] for m in valid_target_medias_data]
+    else:
+        target_medias_files_list, target_media_ids = [], []
 
     main_window.video_loader_worker = ui_workers.TargetMediaLoaderWorker(
         main_window=main_window,
@@ -320,16 +320,13 @@ def _load_job_input_faces(main_window: "MainWindow", data: dict):
                 f"[WARN] Input face media path not found, skipping: {f.get('media_path')}"
             )
 
-    input_media_paths, input_face_ids = (
-        zip(
-            *[
-                (f["media_path"], face_id)
-                for face_id, f in valid_input_faces_data.items()
-            ]
-        )
-        if valid_input_faces_data
-        else ([], [])
-    )
+    if valid_input_faces_data:
+        input_media_paths = [
+            f["media_path"] for face_id, f in valid_input_faces_data.items()
+        ]
+        input_face_ids = list(valid_input_faces_data.keys())
+    else:
+        input_media_paths, input_face_ids = [], []
 
     if not input_media_paths:
         main_window.input_faces_loader_worker = None
@@ -525,6 +522,51 @@ def _validate_job_files_exist(data: dict) -> tuple[bool, str | None]:
     """
     is_job_valid = True
     skip_reason = ""
+
+    # --- RETRO-COMPATIBILITY ---
+    # Convert old single-job format to unified batch format to prevent empty loads
+    if "target_medias_data" not in data and "target_media_path" in data:
+        data["target_medias_data"] = [
+            {
+                "media_path": data["target_media_path"],
+                "media_id": data.get("target_media_id", "default_id"),
+                "file_type": data.get("target_media_type", "video"),
+            }
+        ]
+    if "selected_media_id" not in data and "target_media_id" in data:
+        data["selected_media_id"] = data["target_media_id"]
+
+    # --- SMART PATH RESOLUTION ---
+    # Automatically rebuilds paths if folders or sub-folders were moved
+    def resolve_path(saved_path: str, is_target: bool) -> str:
+        if not saved_path or os.path.exists(saved_path):
+            return saved_path
+
+        root_folder = data.get(
+            "last_target_media_folder_path"
+            if is_target
+            else "last_input_media_folder_path",
+            "",
+        )
+        if root_folder and os.path.exists(root_folder):
+            from pathlib import Path
+
+            parts = Path(saved_path).parts
+            # Try to match the trailing folder structure against the active root folder
+            for i in range(1, len(parts)):
+                fallback = os.path.join(root_folder, *parts[-i:])
+                if os.path.exists(fallback):
+                    return fallback
+        return saved_path
+
+    # Apply smart resolution in-place to the data payload
+    for m in data.get("target_medias_data", []):
+        if "media_path" in m:
+            m["media_path"] = resolve_path(m["media_path"], is_target=True)
+
+    for f in data.get("input_faces_data", {}).values():
+        if "media_path" in f:
+            f["media_path"] = resolve_path(f["media_path"], is_target=False)
 
     # --- 1. Validate the SINGLE required target media ---
     job_selected_media_id = data.get("selected_media_id")
