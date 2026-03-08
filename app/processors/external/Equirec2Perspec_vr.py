@@ -1,8 +1,23 @@
 import cv2
+from collections import OrderedDict
 from typing import Dict, Any
 import numpy as np
 import torch
 import torch.nn.functional as F
+
+_PERSP_GRID_CACHE = OrderedDict()  # module-level cache — persists across frames
+_PERSP_GRID_CACHE_MAX = 256
+
+
+def _get_cached_grid(cache_key, compute_fn):
+    """Get or compute a perspective sampling grid, evicting oldest if cache is full."""
+    if cache_key in _PERSP_GRID_CACHE:
+        return _PERSP_GRID_CACHE[cache_key]
+    if len(_PERSP_GRID_CACHE) >= _PERSP_GRID_CACHE_MAX:
+        _PERSP_GRID_CACHE.popitem(last=False)  # evict oldest
+    grid = compute_fn()
+    _PERSP_GRID_CACHE[cache_key] = grid
+    return grid
 
 
 class Equirectangular:
@@ -19,7 +34,6 @@ class Equirectangular:
         self._img_tensor_cxhxw_rgb_float = img_tensor_cxhxw_rgb_uint8.float() / 255.0 # Normalize to [0,1]
         self.device = img_tensor_cxhxw_rgb_uint8.device
         self._channels, self._height, self._width = self._img_tensor_cxhxw_rgb_float.shape
-        self._persp_cache: Dict[Any, Any] = {}
 
     def GetPerspective(self, FOV: float, THETA: float, PHI: float, height: int, width: int) -> torch.Tensor:
         #
@@ -32,9 +46,9 @@ class Equirectangular:
         equ_cx = (equ_w - 1) / 2.0
         equ_cy = (equ_h - 1) / 2.0
 
-        cache_key = (FOV, height, width)
-        if cache_key in self._persp_cache:
-            persp_xx, persp_yy, w_len, h_len = self._persp_cache[cache_key]
+        cache_key = (FOV, height, width, THETA, PHI)
+        if cache_key in _PERSP_GRID_CACHE:
+            persp_xx, persp_yy, w_len, h_len = _PERSP_GRID_CACHE[cache_key]
         else:
             wFOV = FOV
             hFOV = float(height) / float(width) * wFOV
@@ -45,7 +59,9 @@ class Equirectangular:
             persp_x_coords = torch.linspace(-w_len, w_len, width, device=self.device, dtype=torch.float32)
             persp_y_coords = torch.linspace(-h_len, h_len, height, device=self.device, dtype=torch.float32)
             persp_yy, persp_xx = torch.meshgrid(persp_y_coords, persp_x_coords, indexing='ij')
-            self._persp_cache[cache_key] = (persp_xx, persp_yy, w_len, h_len)
+            if len(_PERSP_GRID_CACHE) >= _PERSP_GRID_CACHE_MAX:
+                _PERSP_GRID_CACHE.popitem(last=False)  # evict oldest
+            _PERSP_GRID_CACHE[cache_key] = (persp_xx, persp_yy, w_len, h_len)
 
         # Points in 3D space on the perspective image plane (camera looking along X-axis)
         x_3d = torch.ones_like(persp_xx)
@@ -91,13 +107,16 @@ class Equirectangular:
         # Normalize pixel coordinates for grid_sample
         grid_x = (lon_px / (equ_w - 1)) * 2.0 - 1.0
         grid_y = (lat_px / (equ_h - 1)) * 2.0 - 1.0
+        # Wrap grid_x to handle the 0/360° seam — prevents border color artifact
+        # grid_x is in normalized coords [-1, 1] corresponding to [0°, 360°] longitude
+        grid_x = (grid_x + 1.0) % 2.0 - 1.0  # wrap to [-1, 1]
         grid = torch.stack((grid_x, grid_y), dim=2).unsqueeze(0) # 1, H_out, W_out, 2
 
         # Sample from the equirectangular image
         # self._img_tensor_cxhxw_rgb_float is (C, H_in, W_in)
         # grid_sample expects input (N, C, H_in, W_in)
         persp_float = F.grid_sample(self._img_tensor_cxhxw_rgb_float.unsqueeze(0), grid,
-                                    mode='bilinear', padding_mode='border', align_corners=True)
+                                    mode='bilinear', padding_mode='zeros', align_corners=True)
 
         persp_uint8 = (torch.clamp(persp_float.squeeze(0) * 255.0, 0, 255)).byte()
         return persp_uint8

@@ -194,12 +194,23 @@ class PerspectiveConverter:
 
         # Balanced parameters for erosion and feathering
         feather_radius_val = 12
+        # VR-14: clamp erosion kernel so small masks are not completely eroded.
+        # A 25px erosion kernel can completely remove masks for distant/small faces.
+        _mask_h = eye_specific_mask_torch_original_shape.shape[-2]
+        _mask_w = eye_specific_mask_torch_original_shape.shape[-1]
+        _max_erosion = min(_mask_h, _mask_w) // 8
+        _erosion_k = min(2 * feather_radius_val + 1, _max_erosion)
+        _erosion_k = max(3, _erosion_k | 1)  # ensure odd and at least 3
         feathered_mask_torch_float_1hw = self._apply_feathering(
             eye_specific_mask_torch_original_shape,
             feather_radius=feather_radius_val,
             blur_sigma_factor=0.5,
-            erosion_kernel_size=(2 * feather_radius_val + 1),
+            erosion_kernel_size=_erosion_k,
         )
+
+        # VR-14: if the feathered mask is empty after erosion, skip blending entirely
+        if feathered_mask_torch_float_1hw.max() < 1e-4:
+            return
 
         # Memory-efficient blending
         # uses in-place operations to reduce peak memory usage.

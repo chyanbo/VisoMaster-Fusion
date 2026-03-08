@@ -49,6 +49,9 @@ class FrameWorker(threading.Thread):
     Handles the entire pipeline: Detection -> Swapping -> Enhancement -> Post-processing.
     """
 
+    # FW-QUAL-10: frozenset of GhostFace model names for cleaner membership tests
+    GHOSTFACE_MODELS = frozenset({'GhostFace-v1', 'GhostFace-v2', 'GhostFace-v3'})
+
     def __init__(
         self,
         main_window: "MainWindow",
@@ -82,8 +85,9 @@ class FrameWorker(threading.Thread):
         self.t512_mask = None
         self.t128_mask = None
         self.t256_near = None
-        # Cache for Gabor kernels (FW-QUAL-3)
-        self._gabor_kernels_cache: dict = {}  # keyed by (kernel_size,sigma,lambd,gamma,psi,N,device_str)
+        # FW-MEM-01: Gabor kernel cache as LRU-bounded OrderedDict
+        from collections import OrderedDict as _OrderedDict
+        self._gabor_kernels_cache: _OrderedDict = _OrderedDict()  # keyed by (kernel_size,sigma,lambd,gamma,psi,N,device_str)
 
         # --- Architecture References ---
         self.main_window = main_window
@@ -122,12 +126,30 @@ class FrameWorker(threading.Thread):
 
         # VR specific constants
         self.VR_PERSPECTIVE_RENDER_SIZE = 512  # Pixels, for rendering perspective crops
-        self.VR_DYNAMIC_FOV_PADDING_FACTOR = (
-            1.0  # Padding factor for dynamic FOV calculation
-        )
+        # VR-13: renamed from VR_DYNAMIC_FOV_PADDING_FACTOR and set to 1.5
+        self.VR_FOV_SCALE_FACTOR = 1.5  # Scale factor for dynamic FOV calculation
         self.is_view_face_compare: bool = False
         self.is_view_face_mask: bool = False
         self.lock = threading.Lock()
+        self._tracker_lock = threading.Lock()  # BT-06: guard self.tracker access
+
+        # FW-ROBUST-05: initialize feeder state dict so worker-thread reads never see NameError
+        self.local_control_state_from_feeder: dict = {}
+
+        # FW-PERF-04: promote kernel tensors to instance attributes (populated lazily on first use)
+        self._lap_kernel: torch.Tensor | None = None
+        self._sobel_x: torch.Tensor | None = None
+        self._sobel_y: torch.Tensor | None = None
+
+        # VR converter cache (VR-08)
+        self._vr_converter = None
+        self._vr_frame_size = None
+
+        # Dirty-check cache for set_scaling_transforms (FW-PERF-07)
+        self._last_scaling_control: dict | None = None
+
+        # Resize object cache (FW-PERF-08)
+        self._resize_cache: dict = {}
 
     def set_scaling_transforms(self, control_params):
         """Initializes the torchvision transforms based on user interpolation settings."""
@@ -258,14 +280,24 @@ class FrameWorker(threading.Thread):
         try:
             local_control_state = self.local_control_state_from_feeder
 
-            # Get UI state (safe reads)
-            self.is_view_face_compare = self.main_window.faceCompareCheckBox.isChecked()
-            self.is_view_face_mask = self.main_window.faceMaskCheckBox.isChecked()
+            # FW-RACE-04: use local variables instead of instance-level assignments
+            # to prevent cross-frame data races in the pool worker.
+            is_view_face_compare = self.main_window.faceCompareCheckBox.isChecked()
+            is_view_face_mask = self.main_window.faceMaskCheckBox.isChecked()
+            # Keep instance attrs consistent so downstream helpers that still reference
+            # them (e.g. swap_core) see the same values.
+            self.is_view_face_compare = is_view_face_compare
+            self.is_view_face_mask = is_view_face_mask
+
+            # FW-RACE-02: snapshot Qt button states into the feeder dict so worker
+            # threads never call .isChecked() concurrently on the same Qt object.
+            local_control_state['swap_enabled'] = self.main_window.swapfacesButton.isChecked()
+            local_control_state['edit_enabled'] = self.main_window.editFacesButton.isChecked()
 
             # Determine if processing is needed
             needs_processing = (
-                self.main_window.swapfacesButton.isChecked()
-                or self.main_window.editFacesButton.isChecked()
+                local_control_state.get('swap_enabled', True)
+                or local_control_state.get('edit_enabled', True)
                 or local_control_state.get("FrameEnhancerEnableToggle", False)
                 or local_control_state.get(
                     "ModeEnableToggle", False
@@ -323,7 +355,13 @@ class FrameWorker(threading.Thread):
         pass_suffix: str,
         kv_map: Dict | None,
     ) -> torch.Tensor:
-        """Helper to run the diffusion-based denoiser (Ref-LDM)."""
+        """Helper to run the diffusion-based denoiser (Ref-LDM).
+
+        FW-QUAL-13: pass_suffix convention:
+          - "Before"     → DenoiserUNetEnableBeforeRestorersToggle (before Restoration 1)
+          - "AfterFirst" → DenoiserAfterFirstRestorerToggle (between Restoration 1 and 2)
+          - "After"      → DenoiserAfterRestorersToggle (after Restoration 2)
+        """
         use_exclusive_path = control.get("UseReferenceExclusivePathToggle", False)
         denoiser_seed_from_slider_val = int(control.get("DenoiserBaseSeedSlider", 1))
 
@@ -363,19 +401,34 @@ class FrameWorker(threading.Thread):
         )
         return denoised_image
 
-    def _find_best_target_match(self, detected_embedding_np, control_global):
-        """Finds the best matching source face for a detected target face."""
+    def _find_best_target_match(self, detected_embedding_np, control_global,
+                                target_faces_snapshot: dict | None = None):
+        """Finds the best matching source face for a detected target face.
+
+        Args:
+            detected_embedding_np: ArcFace embedding of the detected face.
+            control_global: Global control dict.
+            target_faces_snapshot: Optional pre-snapshotted copy of target_faces dict
+                taken under self.lock.  If None, falls back to reading the live dict
+                (single-frame / legacy callers).
+        """
         best_target_button = None
         best_params_pd = None
         highest_sim = -1.0
 
-        for target_id, target_button_widget in list(
-            self.main_window.target_faces.items()
-        ):
-            face_specific_params_dict = self.parameters.get(target_id, {})
+        # FW-RACE-01: use the snapshot when available; otherwise fall back to live dict.
+        if target_faces_snapshot is not None:
+            faces_to_iterate = target_faces_snapshot.items()
+        else:
+            with self.lock:
+                faces_to_iterate = list(self.main_window.target_faces.items())
 
-            # FW-ROBUST-3: both branches were identical; use the expression directly
+        # FW-RACE-05: snapshot default_parameters under lock once
+        with self.lock:
             default_params_dict = dict(self.main_window.default_parameters.data)
+
+        for target_id, target_button_widget in faces_to_iterate:
+            face_specific_params_dict = self.parameters.get(target_id, {})
 
             current_params_pd = ParametersDict(
                 dict(face_specific_params_dict), cast(dict, default_params_dict)
@@ -412,6 +465,9 @@ class FrameWorker(threading.Thread):
         kv_map_for_swap: Dict | None = None,
     ) -> torch.Tensor:
         """Processes a single perspective crop extracted from a VR frame."""
+        # VR-12: assert crop is 512x512 so downstream swap_core assumptions hold
+        assert perspective_crop_torch_rgb_uint8.shape[-2:] == (512, 512), \
+            f"VR perspective crop must be 512x512, got {perspective_crop_torch_rgb_uint8.shape}"
         processed_crop_torch_rgb_uint8 = perspective_crop_torch_rgb_uint8.clone()
         if kps_5_on_crop_param is None or kps_5_on_crop_param.size == 0:
             return processed_crop_torch_rgb_uint8
@@ -641,10 +697,24 @@ class FrameWorker(threading.Thread):
         if stop_event.is_set():
             return self.frame[..., ::-1]  # Return original BGR frame
 
-        # Keep last frame number for reference
+        # Keep last frame number for reference (this is the single-frame path read; pool
+        # workers update last_processed_frame_number under lock in _process_frame_standard)
         self.last_processed_frame_number = self.frame_number
 
-        self.set_scaling_transforms(control)
+        # FW-PERF-07: dirty-check — only rebuild scaling transforms when interpolation
+        # settings actually change (the underlying get_scaling_transforms has its own
+        # module-level cache but calling set_scaling_transforms also rebuilds the mask
+        # transform objects, so we guard it too).
+        _scaling_keys = {k: control.get(k) for k in (
+            'get_cropped_face_kpsTypeSelection', 'original_face_128_384TypeSelection',
+            'original_face_512TypeSelection', 'UntransformTypeSelection',
+            'ScalebackFrameTypeSelection', 'expression_faceeditor_t256TypeSelection',
+            'expression_faceeditor_backTypeSelection', 'block_shiftTypeSelection',
+            'AntialiasTypeSelection',
+        )}
+        if self._last_scaling_control != _scaling_keys:
+            self.set_scaling_transforms(control)
+            self._last_scaling_control = _scaling_keys
         img_numpy_rgb_uint8 = self.frame
 
         # Prepare the base tensor
@@ -698,12 +768,36 @@ class FrameWorker(threading.Thread):
         - Processing per crop
         - Stitching back
         """
-        swap_button_is_checked_global = self.main_window.swapfacesButton.isChecked()
-        edit_button_is_checked_global = self.main_window.editFacesButton.isChecked()
+        # FW-RACE-02: read from snapshotted feeder state instead of live Qt button
+        swap_button_is_checked_global = self.local_control_state_from_feeder.get('swap_enabled', True)
+        edit_button_is_checked_global = self.local_control_state_from_feeder.get('edit_enabled', True)
 
-        equirect_converter = EquirectangularConverter(
-            img_numpy_rgb_uint8, device=self.models_processor.device
-        )
+        # VR-08: cache the EquirectangularConverter instance at worker level.
+        # When the frame size is unchanged (common for video), reuse the cached
+        # instance and update its image data in-place to avoid redundant Python-side
+        # object allocation.
+        _cur_frame_size = (img_numpy_rgb_uint8.shape[0], img_numpy_rgb_uint8.shape[1])
+        if self._vr_converter is None or self._vr_frame_size != _cur_frame_size:
+            self._vr_converter = EquirectangularConverter(
+                img_numpy_rgb_uint8, device=self.models_processor.device
+            )
+            self._vr_frame_size = _cur_frame_size
+        else:
+            # Reuse the cached converter but refresh the image tensor for this frame
+            _new_tensor = (
+                torch.from_numpy(img_numpy_rgb_uint8)
+                .permute(2, 0, 1)
+                .to(self.models_processor.device)
+            )
+            self._vr_converter.equirect_tensor_cxhxw_rgb_uint8 = _new_tensor
+            self._vr_converter.e2p_instance._img_tensor_cxhxw_rgb_float = (
+                _new_tensor.float() / 255.0
+            )
+        equirect_converter = self._vr_converter
+
+        # VR-11: always use rotation_angles=[0] in VR mode — non-zero angles produce
+        # geometrically invalid spherical coordinates.
+        vr_rotation_angles = [0]
 
         # Detection on full equirectangular image
         bboxes_eq_np, _, _ = self.models_processor.run_detect(
@@ -711,49 +805,42 @@ class FrameWorker(threading.Thread):
             control["DetectorModelSelection"],
             max_num=control["MaxFacesToDetectSlider"],
             score=control["DetectorScoreSlider"] / 100.0,
-            input_size=(512, 512),
+            # VR-09: 2:1 aspect ratio matches equirectangular content
+            input_size=(1024, 512),
             use_landmark_detection=False,  # VR usually detects faces first, then landmarks on crops
             landmark_detect_mode=control["LandmarkDetectModelSelection"],
             landmark_score=control["LandmarkDetectScoreSlider"] / 100.0,
             from_points=False,
-            rotation_angles=[0]
-            if not control["AutoRotationToggle"]
-            else [0, 90, 180, 270],
+            rotation_angles=vr_rotation_angles,
             use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
         )
 
         if not isinstance(bboxes_eq_np, np.ndarray):
             bboxes_eq_np = np.array(bboxes_eq_np)
 
-        # Filtering Block: De-duplicate nearby bounding boxes.
+        # FW-ROBUST-07: reshape 1-D bbox (e.g. single face returned as shape (4,) or (5,))
+        if bboxes_eq_np.ndim == 1 and bboxes_eq_np.shape[0] in (4, 5):
+            bboxes_eq_np = bboxes_eq_np.reshape(1, -1)
+        if len(bboxes_eq_np) == 0:
+            return original_equirect_tensor_for_vr
+
+        # VR-03: replace custom O(n^2) distance-NMS with torchvision IoU-NMS
+        # which runs in C++ and handles the standard suppress-by-overlap case correctly.
         if bboxes_eq_np.ndim == 2 and bboxes_eq_np.shape[0] > 1:
-            initial_box_count = bboxes_eq_np.shape[0]
-            areas = (bboxes_eq_np[:, 2] - bboxes_eq_np[:, 0]) * (
-                bboxes_eq_np[:, 3] - bboxes_eq_np[:, 1]
-            )
-            sorted_indices = np.argsort(areas)[::-1]
-            centers_x = (bboxes_eq_np[:, 0] + bboxes_eq_np[:, 2]) / 2.0
-            centers_y = (bboxes_eq_np[:, 1] + bboxes_eq_np[:, 3]) / 2.0
-            widths = bboxes_eq_np[:, 2] - bboxes_eq_np[:, 0]
-            indices_to_keep = []
-            suppressed_indices = np.zeros(initial_box_count, dtype=bool)
+            _boxes_t = torch.from_numpy(
+                bboxes_eq_np[:, :4].astype(np.float32)
+            ).to(self.models_processor.device)
+            _areas = (
+                (_boxes_t[:, 2] - _boxes_t[:, 0])
+                * (_boxes_t[:, 3] - _boxes_t[:, 1])
+            ).clamp(min=0.0)
+            # Use area as proxy score so larger faces are preferred (kept) by NMS
+            _keep = torchvision.ops.nms(_boxes_t, _areas, iou_threshold=0.5)
+            bboxes_eq_np = bboxes_eq_np[_keep.cpu().numpy()]
 
-            for i in range(initial_box_count):
-                idx1 = sorted_indices[i]
-                if suppressed_indices[idx1]:
-                    continue
-                indices_to_keep.append(idx1)
-                for j in range(initial_box_count):
-                    if idx1 == j or suppressed_indices[j]:
-                        continue
-                    dist_x = centers_x[idx1] - centers_x[j]
-                    dist_y = centers_y[idx1] - centers_y[j]
-                    distance = np.sqrt(dist_x**2 + dist_y**2)
-                    if distance < widths[idx1] * 0.5:
-                        suppressed_indices[j] = True
-            bboxes_eq_np = bboxes_eq_np[indices_to_keep]
-
-        processed_perspective_crops_details = {}
+        # VR-07: use list of namedtuple-style tuples instead of a string-keyed dict
+        # to avoid string allocation for each face and simplify downstream iteration
+        processed_perspective_crops_details = []  # each entry: (eye_side, tensor, theta, phi, fov)
         analyzed_faces_for_vr = []
 
         for bbox_eq_single in bboxes_eq_np:
@@ -780,9 +867,16 @@ class FrameWorker(threading.Thread):
                 * 180.0
             )
 
+            # VR-13: use renamed VR_FOV_SCALE_FACTOR (was VR_DYNAMIC_FOV_PADDING_FACTOR)
+            # VR-02: correct angular_width_deg for latitude compression in equirectangular
+            # projection: true angular width ≈ equirect_width / cos(phi_radians)
+            phi_radians = math.radians(phi)
+            cos_phi = math.cos(phi_radians)
+            # Avoid division by near-zero at poles; clamp cos_phi to at least 0.1
+            angular_width_deg_corrected = angular_width_deg / max(cos_phi, 0.1)
             dynamic_fov_for_crop = np.clip(
-                max(angular_width_deg, angular_height_deg)
-                * self.VR_DYNAMIC_FOV_PADDING_FACTOR,
+                max(angular_width_deg_corrected, angular_height_deg)
+                * self.VR_FOV_SCALE_FACTOR,
                 15.0,
                 100.0,
             )
@@ -829,11 +923,11 @@ class FrameWorker(threading.Thread):
                 continue
 
             kps_on_crop = kpss_5_crop[0]
-            kps_all_on_crop = (
-                kpss_crop[0]
-                if isinstance(kpss_crop, np.ndarray) and kpss_crop.shape[0] > 0
-                else None
-            )
+            # FW-BUG-07: fixed check — kpss_crop is a list not ndarray; use truthiness
+            if kpss_crop:
+                kps_all_on_crop = kpss_crop[0]
+            else:
+                kps_all_on_crop = None
 
             face_emb_crop, _ = self.models_processor.run_recognize_direct(
                 face_crop_tensor,
@@ -894,37 +988,47 @@ class FrameWorker(threading.Thread):
                 else item_data["face_crop_tensor"]
             )
 
-            processed_perspective_crops_details[
-                f"{item_data['original_eye_side']}_{item_data['theta']}_{item_data['phi']}"
-            ] = {
-                "tensor_rgb_uint8": processed_crop_for_stitching,
-                "theta": item_data["theta"],
-                "phi": item_data["phi"],
-                "fov_used_for_crop": item_data["fov_used_for_crop"],
-            }
+            # VR-07: append (eye_side, tensor, theta, phi, fov) tuple instead of dict entry
+            processed_perspective_crops_details.append((
+                item_data["original_eye_side"],
+                processed_crop_for_stitching,
+                item_data["theta"],
+                item_data["phi"],
+                item_data["fov_used_for_crop"],
+            ))
             del item_data["face_crop_tensor"]
 
         # Stitch back
+        # FW-PERF-12: skip PerspectiveConverter instantiation when there are no crops to stitch
+        if not processed_perspective_crops_details:
+            return original_equirect_tensor_for_vr
+
         final_equirect_torch_cxhxw_rgb_uint8 = original_equirect_tensor_for_vr.clone()
         p2e_converter = PerspectiveConverter(
             img_numpy_rgb_uint8, device=self.models_processor.device
         )
 
-        for eye_side, data in processed_perspective_crops_details.items():
+        # VR-15: check stop_event in stitching loop so we can abort early
+        # VR-07: iterate over list of (eye_side, tensor, theta, phi, fov) tuples
+        for _eye_side, _crop_tensor, _theta, _phi, _fov in processed_perspective_crops_details:
+            if stop_event is not None and stop_event.is_set():
+                break
             p2e_converter.stitch_single_perspective(
                 target_equirect_torch_cxhxw_rgb_uint8=final_equirect_torch_cxhxw_rgb_uint8,
-                processed_crop_torch_cxhxw_rgb_uint8=data["tensor_rgb_uint8"],
-                theta=data["theta"],
-                phi=data["phi"],
-                fov=data["fov_used_for_crop"],
-                is_left_eye=("L" in eye_side.split("_")[0]),
+                processed_crop_torch_cxhxw_rgb_uint8=_crop_tensor,
+                theta=_theta,
+                phi=_phi,
+                fov=_fov,
+                is_left_eye=("L" in _eye_side),
             )
+            # FW-MEM-02: release the crop tensor immediately after stitching
+            del _crop_tensor
 
         processed_tensor_rgb_uint8 = final_equirect_torch_cxhxw_rgb_uint8
 
         # Cleanup
+        # VR-08: equirect_converter is now self._vr_converter (cached); do not del it
         del (
-            equirect_converter,
             p2e_converter,
             processed_perspective_crops_details,
             analyzed_faces_for_vr,
@@ -947,27 +1051,40 @@ class FrameWorker(threading.Thread):
         - Swapping/Editing
         - Overlays (BBox, Landmarks, Comparison)
         """
-        swap_button_is_checked_global = self.main_window.swapfacesButton.isChecked()
-        edit_button_is_checked_global = self.main_window.editFacesButton.isChecked()
+        # FW-RACE-02: read button state from snapshotted feeder dict, not live Qt buttons
+        swap_button_is_checked_global = self.local_control_state_from_feeder.get('swap_enabled', True)
+        edit_button_is_checked_global = self.local_control_state_from_feeder.get('edit_enabled', True)
+
+        # FW-RACE-01: snapshot target_faces under lock so the worker thread never
+        # iterates the live dict while the UI thread may be modifying it.
+        with self.lock:
+            target_faces_snapshot = dict(self.main_window.target_faces)
+
         det_faces_data_for_display = []
 
         img = processed_tensor_rgb_uint8
-        img_x, img_y = img.size(2), img.size(1)
+        # FW-QUAL-11: rename img_x/img_y to img_w/img_h for clarity
+        img_w, img_h = img.size(2), img.size(1)
         scale_applied = False
 
-        # Downscale for processing if too large (standard pipeline optimization)
-        if img_x < 512 or img_y < 512:
-            if img_x <= img_y:
-                new_h, new_w = int(512 * img_y / img_x), 512
+        # FW-BUG-06: Upscale small frames so the shorter side is at least 512px before detection
+        if img_w < 512 or img_h < 512:
+            if img_w <= img_h:
+                new_h, new_w = int(512 * img_h / img_w), 512
             else:
-                new_h, new_w = 512, int(512 * img_x / img_y)
+                new_h, new_w = 512, int(512 * img_w / img_h)
             # FW-ROBUST-2: respect the user's interpolation setting rather than
             # always using the default (NEAREST / BILINEAR depending on build)
-            img = v2.Resize(
-                (new_h, new_w),
-                interpolation=self.interpolation_scaleback,
-                antialias=False,
-            )(img)
+            # FW-PERF-08: cache v2.Resize objects keyed by (h, w, interp) to avoid
+            # re-constructing the same transform on every frame
+            _up_key = (new_h, new_w, self.interpolation_scaleback, False)
+            if _up_key not in self._resize_cache:
+                self._resize_cache[_up_key] = v2.Resize(
+                    (new_h, new_w),
+                    interpolation=self.interpolation_scaleback,
+                    antialias=False,
+                )
+            img = self._resize_cache[_up_key](img)
             scale_applied = True
 
         # Manual Rotation
@@ -992,12 +1109,17 @@ class FrameWorker(threading.Thread):
         detection_interval = int(control.get("FaceDetectionIntervalSlider", 1))
         previous_faces_arg = None
 
+        # FW-RACE-03: read last_detected_faces / last_processed_frame_number under lock
+        with self.lock:
+            _last_detected = self.last_detected_faces
+            _last_frame_no = self.last_processed_frame_number
+
         if (
-            len(self.last_detected_faces) > 0
+            len(_last_detected) > 0
             and self.frame_number % detection_interval != 0
-            and self.frame_number == self.last_processed_frame_number + 1
+            and self.frame_number == _last_frame_no + 1
         ):
-            previous_faces_arg = self.last_detected_faces
+            previous_faces_arg = _last_detected
 
         bboxes, kpss_5, kpss = self.models_processor.run_detect(
             img,
@@ -1017,15 +1139,20 @@ class FrameWorker(threading.Thread):
         )
 
         # Update State for next frame
-        self.last_detected_faces = []
+        detected_for_state = []
         if isinstance(bboxes, np.ndarray) and bboxes.shape[0] > 0:
             for i in range(len(bboxes)):
-                self.last_detected_faces.append(
+                detected_for_state.append(
                     {
                         "bbox": bboxes[i],
                         "score": 1.0,
                     }
                 )
+
+        # FW-RACE-03: write last_detected_faces / last_processed_frame_number under lock
+        with self.lock:
+            self.last_detected_faces = detected_for_state
+            self.last_processed_frame_number = self.frame_number
 
         if (
             isinstance(kpss_5, np.ndarray)
@@ -1040,14 +1167,17 @@ class FrameWorker(threading.Thread):
                     control["SimilarityTypeSelection"],
                     control["RecognitionModelSelection"],
                 )
+                # FW-BUG-01: bounds check before indexing kpss
+                kps_all_i = kpss[i] if kpss is not None and i < len(kpss) else None
                 det_faces_data_for_display.append(
                     {
                         "kps_5": kpss_5[i],
-                        "kps_all": kpss[i],
+                        "kps_all": kps_all_i,
                         "embedding": face_emb,
                         "bbox": bboxes[i],
                         "original_face": None,
                         "swap_mask": None,
+                        "matched_target": None,  # FW-BUG-09: cache slot
                     }
                 )
 
@@ -1055,20 +1185,26 @@ class FrameWorker(threading.Thread):
         if det_faces_data_for_display:
             if control["SwapOnlyBestMatchEnableToggle"]:
                 # --- Branch: Swap Only Best Match ---
-                for _, target_face in self.main_window.target_faces.items():
+                # FW-RACE-01: iterate the snapshot, not the live dict
+                for _, target_face in target_faces_snapshot.items():
                     if stop_event.is_set():
                         break
 
+                    # FW-ROBUST-04: use .get() with default_parameters as fallback
+                    with self.lock:
+                        _default_params = dict(self.main_window.default_parameters.data)
                     params = ParametersDict(
-                        self.parameters[target_face.face_id],
-                        self.main_window.default_parameters.data,
+                        self.parameters.get(target_face.face_id, _default_params),
+                        _default_params,
                     )
                     best_fface, best_score = None, -1.0
 
                     for fface in det_faces_data_for_display:
+                        # FW-BUG-09: pass snapshot; cache result on fface for downstream reuse
                         tgt, tgt_params, score = self._find_best_target_match(
-                            fface["embedding"], control
+                            fface["embedding"], control, target_faces_snapshot
                         )
+                        fface['matched_target'] = tgt
                         if tgt and tgt.face_id == target_face.face_id:
                             if (
                                 score >= tgt_params["SimilarityThresholdSlider"]
@@ -1153,9 +1289,12 @@ class FrameWorker(threading.Thread):
                 for fface in det_faces_data_for_display:
                     if stop_event.is_set():
                         break
+                    # FW-BUG-09: pass the target_faces snapshot to avoid re-iterating live dict
                     best_target, params, _ = self._find_best_target_match(
-                        fface["embedding"], control
+                        fface["embedding"], control, target_faces_snapshot
                     )
+                    # FW-BUG-09: cache matched target so downstream helpers can reuse it
+                    fface['matched_target'] = best_target
 
                     if best_target and (
                         swap_button_is_checked_global or edit_button_is_checked_global
@@ -1237,11 +1376,16 @@ class FrameWorker(threading.Thread):
                 expand=True,
             )
         if scale_applied:
-            img = v2.Resize(
-                (img_y, img_x),
-                interpolation=self.interpolation_scaleback,
-                antialias=False,
-            )(img)
+            # FW-QUAL-11: use renamed img_h/img_w variables
+            # FW-PERF-08: reuse cached Resize object for the scale-back transform
+            _down_key = (img_h, img_w, self.interpolation_scaleback, False)
+            if _down_key not in self._resize_cache:
+                self._resize_cache[_down_key] = v2.Resize(
+                    (img_h, img_w),
+                    interpolation=self.interpolation_scaleback,
+                    antialias=False,
+                )
+            img = self._resize_cache[_down_key](img)
 
         processed_tensor_rgb_uint8 = img
 
@@ -1274,9 +1418,17 @@ class FrameWorker(threading.Thread):
         """
         landmarks_to_draw = []
         for fface_data in det_faces_data:
-            _, matched_params, _ = self._find_best_target_match(
-                fface_data["embedding"], control
-            )
+            # FW-BUG-09: use cached matched_target if available to avoid re-running match
+            cached_tgt = fface_data.get('matched_target')
+            if cached_tgt is not None:
+                with self.lock:
+                    _default_params = dict(self.main_window.default_parameters.data)
+                face_specific = self.parameters.get(getattr(cached_tgt, 'face_id', None), {})
+                matched_params = ParametersDict(dict(face_specific), _default_params)
+            else:
+                _, matched_params, _ = self._find_best_target_match(
+                    fface_data["embedding"], control
+                )
             if matched_params:
                 use_adj = matched_params["LandmarksPositionAdjEnableToggle"]
                 keypoints = (
@@ -1294,22 +1446,24 @@ class FrameWorker(threading.Thread):
     ) -> torch.Tensor:
         imgs_to_vstack = []
         for _, fface in enumerate(det_faces_data):
-            best_target_for_compare, parameters_for_face, _ = (
-                self._find_best_target_match(fface["embedding"], control)
-            )
+            # FW-BUG-09 / FW-PERF-01/02/03: use cached match result when available
+            cached_tgt = fface.get('matched_target')
+            if cached_tgt is not None:
+                with self.lock:
+                    _default_params = dict(self.main_window.default_parameters.data)
+                face_specific = self.parameters.get(getattr(cached_tgt, 'face_id', None), {})
+                parameters_for_face = ParametersDict(dict(face_specific), _default_params)
+                best_target_for_compare = cached_tgt
+            else:
+                best_target_for_compare, parameters_for_face, _ = (
+                    self._find_best_target_match(fface["embedding"], control)
+                )
             if best_target_for_compare and parameters_for_face:
                 modified_face = self.get_cropped_face_using_kps(
                     img, fface["kps_5"], parameters_for_face
                 )
-                if control["FrameEnhancerEnableToggle"]:
-                    enhanced_version = self.frame_enhancers.enhance_core(
-                        modified_face.clone(), control=control
-                    )
-                    if enhanced_version.shape[1:] != modified_face.shape[1:]:
-                        enhanced_version = v2.Resize(
-                            modified_face.shape[1:], antialias=True
-                        )(enhanced_version)
-                    modified_face = enhanced_version
+                # FW-PERF-03: skip enhance_core in compare view — diagnostic only,
+                # enhancement is too expensive to run twice per face.
                 imgs_to_cat_horizontally = []
                 original_face_from_swap_core = fface.get("original_face")
                 if original_face_from_swap_core is not None:
@@ -1372,12 +1526,8 @@ class FrameWorker(threading.Thread):
     def get_face_similarity_tform(
         self, swapper_model: str, kps_5: np.ndarray
     ) -> trans.SimilarityTransform:
-        if (
-            swapper_model != "GhostFace-v1"
-            and swapper_model != "GhostFace-v2"
-            and swapper_model != "GhostFace-v3"
-            and swapper_model != "CSCS"
-        ):
+        # FW-QUAL-10: use GHOSTFACE_MODELS frozenset instead of chained != comparisons
+        if swapper_model not in self.GHOSTFACE_MODELS and swapper_model != "CSCS":
             dst = faceutil.get_arcface_template(image_size=512, mode="arcface128")
             dst = np.squeeze(dst)
             # Use instance initialization + .estimate() for older skimage versions
@@ -1385,7 +1535,9 @@ class FrameWorker(threading.Thread):
                 tform = trans.SimilarityTransform.from_estimate(kps_5, dst)
             else:
                 tform = trans.SimilarityTransform()
-                tform.estimate(kps_5, dst)
+                # FW-ROBUST-11: check return value of tform.estimate()
+                if not tform.estimate(kps_5, dst):
+                    raise ValueError("Similarity transform estimation failed for face")
         elif swapper_model == "CSCS":
             # Use instance initialization + .estimate() for older skimage versions
             if hasattr(trans.SimilarityTransform, "from_estimate"):
@@ -1394,8 +1546,11 @@ class FrameWorker(threading.Thread):
                 )
             else:
                 tform = trans.SimilarityTransform()
-                tform.estimate(kps_5, self.models_processor.FFHQ_kps)
+                # FW-ROBUST-11: check return value
+                if not tform.estimate(kps_5, self.models_processor.FFHQ_kps):
+                    raise ValueError("Similarity transform estimation failed for CSCS face")
         else:
+            # FW-QUAL-10: swapper_model in GHOSTFACE_MODELS
             tform = trans.SimilarityTransform()
             dst = faceutil.get_arcface_template(image_size=512, mode="arcfacemap")
             M, _ = faceutil.estimate_norm_arcface_template(kps_5, src=dst)
@@ -1423,6 +1578,61 @@ class FrameWorker(threading.Thread):
             original_face_128,
         )
 
+    @staticmethod
+    def _apply_likeness(
+        source_latent: torch.Tensor, target_latent: torch.Tensor, params: dict
+    ) -> torch.Tensor:
+        """FW-QUAL-09: Identity Boost (Face Likeness) via SLERP / LERP on ArcFace embeddings.
+
+        Promoted from inner function to @staticmethod so it is reusable and not
+        re-created on every call to get_affined_face_dim_and_swapping_latents.
+        """
+        if not params.get("FaceLikenessEnableToggle", False):
+            return source_latent
+
+        factor = float(params.get("FaceLikenessFactorDecimalSlider", 0.0))
+        if factor == 0.0:
+            return source_latent
+
+        # 1. Capture original energy (Norms are generally constant in ArcFace)
+        s_norm = torch.norm(source_latent)
+        t_norm = torch.norm(target_latent)
+
+        if s_norm < 1e-6 or t_norm < 1e-6:
+            return source_latent
+
+        # 2. Normalize to get directional vectors on the hypersphere
+        s_dir = source_latent / s_norm
+        t_dir = target_latent / t_norm
+
+        if factor < 0.0:
+            # --- INTERPOLATION (SLERP) ---
+            # Move naturally towards the target face along the sphere
+            t = 1.0 + factor
+
+            cos_theta = torch.sum(s_dir * t_dir)
+            cos_theta = torch.clamp(cos_theta, -0.9999, 0.9999)
+            theta = torch.acos(cos_theta)
+            sin_theta = torch.sin(theta)
+
+            if sin_theta < 1e-3:
+                blended_dir = (1.0 - t) * t_dir + t * s_dir
+            else:
+                weight_t = torch.sin((1.0 - t) * theta) / sin_theta
+                weight_s = torch.sin(t * theta) / sin_theta
+                blended_dir = weight_t * t_dir + weight_s * s_dir
+        else:
+            # --- EXTRAPOLATION (LERP) ---
+            # Push the vector away from the target to exaggerate the source identity
+            difference_vector = s_dir - t_dir
+            blended_dir = s_dir + (factor * difference_vector)
+
+        # 3. Always restore original Source Energy to prevent latent space corruption
+        blended_dir = blended_dir / torch.norm(blended_dir)
+        final_latent = blended_dir * s_norm
+
+        return final_latent
+
     def get_affined_face_dim_and_swapping_latents(
         self,
         original_faces: tuple,
@@ -1443,55 +1653,8 @@ class FrameWorker(threading.Thread):
         dim = 1
         latent = None
 
-        # Helper to apply Identity Boost (Face Likeness) using SLERP & LERP
-        def apply_likeness_with_norm_preservation(
-            source_latent: torch.Tensor, target_latent: torch.Tensor, params: dict
-        ) -> torch.Tensor:
-            if not params.get("FaceLikenessEnableToggle", False):
-                return source_latent
-
-            factor = float(params.get("FaceLikenessFactorDecimalSlider", 0.0))
-            if factor == 0.0:
-                return source_latent
-
-            # 1. Capture original energy (Norms are generally constant in ArcFace)
-            s_norm = torch.norm(source_latent)
-            t_norm = torch.norm(target_latent)
-
-            if s_norm < 1e-6 or t_norm < 1e-6:
-                return source_latent
-
-            # 2. Normalize to get directional vectors on the hypersphere
-            s_dir = source_latent / s_norm
-            t_dir = target_latent / t_norm
-
-            if factor < 0.0:
-                # --- INTERPOLATION (SLERP) ---
-                # Move naturally towards the target face along the sphere
-                t = 1.0 + factor
-
-                cos_theta = torch.sum(s_dir * t_dir)
-                cos_theta = torch.clamp(cos_theta, -0.9999, 0.9999)
-                theta = torch.acos(cos_theta)
-                sin_theta = torch.sin(theta)
-
-                if sin_theta < 1e-3:
-                    blended_dir = (1.0 - t) * t_dir + t * s_dir
-                else:
-                    weight_t = torch.sin((1.0 - t) * theta) / sin_theta
-                    weight_s = torch.sin(t * theta) / sin_theta
-                    blended_dir = weight_t * t_dir + weight_s * s_dir
-            else:
-                # --- EXTRAPOLATION (LERP) ---
-                # Push the vector away from the target to exaggerate the source identity
-                difference_vector = s_dir - t_dir
-                blended_dir = s_dir + (factor * difference_vector)
-
-            # 3. Always restore original Source Energy to prevent latent space corruption
-            blended_dir = blended_dir / torch.norm(blended_dir)
-            final_latent = blended_dir * s_norm
-
-            return final_latent
+        # FW-QUAL-09: apply_likeness_with_norm_preservation promoted to @staticmethod.
+        # Use self._apply_likeness(...) everywhere below.
 
         # --- Inswapper128 Logic ---
         if swapper_model == "Inswapper128":
@@ -1512,9 +1675,7 @@ class FrameWorker(threading.Thread):
                 .to(self.models_processor.device)
             )
 
-            latent = apply_likeness_with_norm_preservation(
-                latent, dst_latent, parameters
-            )
+            latent = self._apply_likeness(latent, dst_latent, parameters)
 
             dim = 1
             if parameters["SwapperResAutoSelectEnableToggle"]:
@@ -1566,9 +1727,7 @@ class FrameWorker(threading.Thread):
                 .to(self.models_processor.device)
             )
 
-            latent = apply_likeness_with_norm_preservation(
-                latent, dst_latent, parameters
-            )
+            latent = self._apply_likeness(latent, dst_latent, parameters)
 
             if (
                 (
@@ -1607,19 +1766,14 @@ class FrameWorker(threading.Thread):
                 .to(self.models_processor.device)
             )
 
-            latent = apply_likeness_with_norm_preservation(
-                latent, dst_latent, parameters
-            )
+            latent = self._apply_likeness(latent, dst_latent, parameters)
 
             dim = 4
             input_face_affined = original_face_512
 
         # --- GhostFace Logic ---
-        elif (
-            swapper_model == "GhostFace-v1"
-            or swapper_model == "GhostFace-v2"
-            or swapper_model == "GhostFace-v3"
-        ):
+        # FW-QUAL-10: use GHOSTFACE_MODELS frozenset
+        elif swapper_model in self.GHOSTFACE_MODELS:
             latent = (
                 torch.from_numpy(self.models_processor.calc_swapper_latent_ghost(s_e))
                 .float()
@@ -1631,9 +1785,7 @@ class FrameWorker(threading.Thread):
                 .to(self.models_processor.device)
             )
 
-            latent = apply_likeness_with_norm_preservation(
-                latent, dst_latent, parameters
-            )
+            latent = self._apply_likeness(latent, dst_latent, parameters)
 
             dim = 2
             input_face_affined = original_face_256
@@ -1651,9 +1803,7 @@ class FrameWorker(threading.Thread):
                 .to(self.models_processor.device)
             )
 
-            latent = apply_likeness_with_norm_preservation(
-                latent, dst_latent, parameters
-            )
+            latent = self._apply_likeness(latent, dst_latent, parameters)
 
             dim = 2
             input_face_affined = original_face_256
@@ -1691,7 +1841,7 @@ class FrameWorker(threading.Thread):
         prev_face = input_face_affined.clone()
 
         if swapper_model == "Inswapper128":
-            for k in range(itex):
+            for _ in range(itex):  # FW-QUAL-06: renamed k -> _
                 # Lists to hold independent memory buffers for this iteration
                 tile_inputs = []
                 tile_outputs = []
@@ -1743,7 +1893,7 @@ class FrameWorker(threading.Thread):
             version = swapper_model[-1]
             dim_res = dim // 2
 
-            for k in range(itex):
+            for _ in range(itex):  # FW-QUAL-06: renamed k -> _
                 tile_inputs = []
                 tile_outputs = []
                 tile_coords = []
@@ -1782,7 +1932,7 @@ class FrameWorker(threading.Thread):
                 output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "SimSwap512":
-            for k in range(itex):
+            for _ in range(itex):  # FW-QUAL-06: renamed k -> _
                 input_face_disc = input_face_affined.permute(2, 0, 1)
                 input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
                 swapper_output = torch.empty(
@@ -1791,17 +1941,15 @@ class FrameWorker(threading.Thread):
                     device=self.models_processor.device,
                 ).contiguous()
 
-                if self.models_processor.device == "cuda":
-                    torch.cuda.synchronize()
-
                 self.models_processor.run_swapper_simswap512(
                     input_face_disc, latent, swapper_output
                 )
 
                 if self.models_processor.device == "cuda":
-                    torch.cuda.synchronize()
+                    torch.cuda.synchronize()  # FW-PERF-13: moved after inference
 
-                if swapper_output.sum() < 1.0:
+                # FW-BUG-08: use abs().max() instead of sum() for zero-face heuristic
+                if swapper_output.abs().max() < 1e-4:
                     swapper_output = input_face_disc
 
                 swapper_output = torch.squeeze(swapper_output)
@@ -1814,12 +1962,9 @@ class FrameWorker(threading.Thread):
                 output = torch.mul(output, 255)
                 output = torch.clamp(output, 0, 255)
 
-        elif (
-            swapper_model == "GhostFace-v1"
-            or swapper_model == "GhostFace-v2"
-            or swapper_model == "GhostFace-v3"
-        ):
-            for k in range(itex):
+        # FW-QUAL-10: use GHOSTFACE_MODELS frozenset
+        elif swapper_model in self.GHOSTFACE_MODELS:
+            for _ in range(itex):  # FW-QUAL-06: renamed k -> _
                 input_face_disc = torch.mul(input_face_affined, 255.0).permute(2, 0, 1)
                 input_face_disc = torch.div(input_face_disc.float(), 127.5)
                 input_face_disc = torch.sub(input_face_disc, 1)
@@ -1830,20 +1975,16 @@ class FrameWorker(threading.Thread):
                     device=self.models_processor.device,
                 ).contiguous()
 
-                if self.models_processor.device == "cuda":
-                    torch.cuda.synchronize()
-
                 self.models_processor.run_swapper_ghostface(
                     input_face_disc, latent, swapper_output, swapper_model
                 )
 
                 if self.models_processor.device == "cuda":
-                    torch.cuda.synchronize()
+                    torch.cuda.synchronize()  # FW-PERF-13: moved after inference
 
                 swapper_output = swapper_output[0]
-                if swapper_output.sum() < 1.0:
-                    # FW-BUG-11: use the input face as fallback instead of
-                    # silently continuing with an essentially-zero tensor.
+                # FW-BUG-11: use abs().mean() instead of sum() for zero-output heuristic
+                if swapper_output.abs().mean() < 0.01:
                     # input_face_affined is [H,W,3] in [0,1]; convert to the
                     # GhostFace [-1,1] CHW range that swapper_output uses.
                     swapper_output = (
@@ -1861,7 +2002,7 @@ class FrameWorker(threading.Thread):
                 output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "CSCS":
-            for k in range(itex):
+            for _ in range(itex):  # FW-QUAL-06: renamed k -> _
                 input_face_disc = input_face_affined.permute(2, 0, 1)
                 input_face_disc = v2.functional.normalize(
                     input_face_disc, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
@@ -1873,15 +2014,12 @@ class FrameWorker(threading.Thread):
                     device=self.models_processor.device,
                 ).contiguous()
 
-                if self.models_processor.device == "cuda":
-                    torch.cuda.synchronize()
-
                 self.models_processor.run_swapper_cscs(
                     input_face_disc, latent, swapper_output
                 )
 
                 if self.models_processor.device == "cuda":
-                    torch.cuda.synchronize()
+                    torch.cuda.synchronize()  # FW-PERF-13: moved after inference
 
                 swapper_output = torch.squeeze(swapper_output)
                 swapper_output = torch.add(torch.mul(swapper_output, 0.5), 0.5)
@@ -1895,14 +2033,25 @@ class FrameWorker(threading.Thread):
                 output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "DeepFaceLive (DFM)" and dfm_model:
+            # FW-BUG-05: convert original_face_512 from CHW uint8 to HWC float32 [0,1]
+            # before passing to DFM model, which expects HWC float32 [0,1] input.
+            dfm_input = original_face_512.permute(1, 2, 0).float() / 255.0
+            # DFM contract: dfm_model.convert() must return HWC float32 [0,1] tensor.
             out_celeb, _, _ = dfm_model.convert(
-                original_face_512,
+                dfm_input,
                 parameters["DFMAmpMorphSlider"] / 100,
                 rct=parameters["DFMRCTColorToggle"],
             )
+            # FW-BUG-02: assert DFM output contract (HWC float32 [0,1])
+            assert out_celeb.ndim == 3 and out_celeb.shape[2] == 3, \
+                f"DFM model must return HWC RGB tensor, got shape {out_celeb.shape}"
             # FW-MEM-2: prev_face already set before any branching; no extra clone
             input_face_affined = out_celeb.clone()
             output = out_celeb.clone()
+
+        # FW-QUAL-08: warn when all tiles produced zero output (model returned blank)
+        if output.abs().max() < 1.0:
+            print("[WARN] All tiles failed for face — output is all-zero")
 
         output = output.permute(2, 0, 1)
         swap = self.t512(output)
@@ -1922,6 +2071,10 @@ class FrameWorker(threading.Thread):
         left = parameters["BorderLeftSlider"]
         right = 128 - parameters["BorderRightSlider"]
         bottom = 128 - parameters["BorderBottomSlider"]
+
+        # FW-BUG-12: validate border values to prevent silent tensor indexing bugs
+        assert 0 <= left <= right <= 128, f"Border mask left/right out of range: {left}, {right}"
+        assert 0 <= top <= bottom <= 128, f"Border mask top/bottom out of range: {top}, {bottom}"
 
         border_mask[:, :top, :] = 0
         border_mask[:, bottom:, :] = 0
@@ -1997,11 +2150,94 @@ class FrameWorker(threading.Thread):
 
         return mask
 
+    def _apply_restorer_with_auto(
+        self,
+        swap: torch.Tensor,
+        swap2: torch.Tensor,
+        swap_original2: torch.Tensor,
+        original_face_512: torch.Tensor,
+        mask_forcalc_512: torch.Tensor,
+        parameters: dict,
+        tform_scale: float,
+        debug: bool,
+        debug_info: dict,
+        slot_id: int,
+    ) -> torch.Tensor:
+        """
+        FW-QUAL-01/02: Shared helper for Restoration-2 auto-blend logic.
+
+        Applies auto sharpness-driven alpha blending (or Gaussian blur fallback)
+        between `swap_original2` (pre-restorer) and `swap2` (post-restorer).
+        When auto mode is disabled, applies a simple weighted blend.
+
+        Args:
+            swap:             Current swap tensor (not used directly, but returned as output).
+            swap2:            Restorer output tensor.
+            swap_original2:   Snapshot of swap *before* restorer was applied.
+            original_face_512: Original face tensor (used by face_restorer_auto).
+            mask_forcalc_512: Mask tensor for sharpness calculation.
+            parameters:       Per-face parameters dict.
+            tform_scale:      Similarity-transform scale (used as scale_factor).
+            debug:            Whether debug mode is active.
+            debug_info:       Mutable dict for debug annotations; key is f'Restore2_{slot_id}'.
+            slot_id:          Restorer slot identifier (2 for both callers).
+
+        Returns:
+            Updated swap tensor after blending.
+        """
+        debug_key = f"Restore2_{slot_id}"
+        if parameters["FaceRestorerAutoEnable2Toggle"]:
+            alpha_restorer2 = float(parameters["FaceRestorerBlend2Slider"]) / 100.0
+            adjust_sharpness2 = float(parameters["FaceRestorerAutoSharpAdjust2Slider"])
+            scale_factor2 = round(tform_scale, 2)
+            automasktoggle2 = parameters["FaceRestorerAutoMask2EnableToggle"]
+            automaskadjust2 = parameters["FaceRestorerAutoSharpMask2AdjustDecimalSlider"]
+            automaskblur2 = 2
+            restore_mask = mask_forcalc_512.clone()
+
+            alpha_auto2, blur_value2 = self.face_restorer_auto(
+                original_face_512.clone(),
+                swap_original2.clone(),
+                swap2,
+                alpha_restorer2,
+                adjust_sharpness2,
+                scale_factor2,
+                debug,
+                restore_mask,
+                automasktoggle2,
+                automaskadjust2,
+                automaskblur2,
+            )
+
+            if blur_value2 > 0:
+                kernel_size = 2 * blur_value2 + 1
+                sigma = blur_value2 * 0.1
+                gaussian_blur = transforms.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
+                swap = gaussian_blur(swap_original2)
+                debug_info[debug_key] = f": {-blur_value2:.2f}"
+            elif isinstance(alpha_auto2, torch.Tensor):
+                swap = swap2 * alpha_auto2 + swap_original2 * (1 - alpha_auto2)
+            elif alpha_auto2 != 0:
+                swap = swap2 * alpha_auto2 + swap_original2 * (1 - alpha_auto2)
+                if debug:
+                    debug_info[debug_key] = f": {alpha_auto2 * 100:.2f}"
+            else:
+                swap = swap_original2
+                if debug:
+                    debug_info[debug_key] = f": {alpha_auto2 * 100:.2f}"
+        else:
+            alpha_restorer2 = float(parameters["FaceRestorerBlend2Slider"]) / 100.0
+            swap = torch.add(
+                torch.mul(swap2, alpha_restorer2),
+                torch.mul(swap_original2, 1 - alpha_restorer2),
+            )
+        return swap
+
     def swap_core(
         self,
         img: torch.Tensor,
         kps_5: np.ndarray,
-        kps: np.ndarray | bool = False,
+        kps: np.ndarray | None = None,  # FW-ROBUST-06: changed default False -> None
         s_e: np.ndarray | None = None,
         t_e: np.ndarray | None = None,
         parameters: dict | None = None,
@@ -2069,47 +2305,55 @@ class FrameWorker(threading.Thread):
                 )
             )
 
-            # Optional Face Scaling adjustment
-            if parameters["FaceAdjEnableToggle"]:
-                input_face_affined = v2.functional.affine(
-                    input_face_affined,
-                    0,
-                    (0, 0),
-                    1 + parameters["FaceScaleAmountSlider"] / 100,
-                    0,
-                    center=(dim * 128 / 2, dim * 128 / 2),
-                    interpolation=v2.InterpolationMode.BILINEAR,
+            # FW-BUG-03: guard input_face_affined is None (latent computation failed)
+            if input_face_affined is None:
+                swap = original_face_512
+                # skip to mask section — latent computation failed, use original face
+            else:
+                # Optional Face Scaling adjustment
+                if parameters["FaceAdjEnableToggle"]:
+                    input_face_affined = v2.functional.affine(
+                        input_face_affined,
+                        0,
+                        (0, 0),
+                        1 + parameters["FaceScaleAmountSlider"] / 100,
+                        0,
+                        center=(dim * 128 / 2, dim * 128 / 2),
+                        interpolation=v2.InterpolationMode.BILINEAR,
+                    )
+
+                itex = 1
+                if parameters["StrengthEnableToggle"]:
+                    # FW-BUG-10: use round() instead of ceil() so slider value is
+                    # interpreted as a multiplier, not always rounded up
+                    itex = max(1, round(parameters["StrengthAmountSlider"] / 100.0))
+
+                output_size = int(128 * dim)
+                output = torch.zeros(
+                    (output_size, output_size, 3),
+                    dtype=torch.float32,
+                    device=self.models_processor.device,
                 )
+                input_face_affined = input_face_affined.permute(1, 2, 0).contiguous()
+                input_face_affined = torch.div(input_face_affined, 255.0)
 
-            itex = 1
-            if parameters["StrengthEnableToggle"]:
-                itex = ceil(parameters["StrengthAmountSlider"] / 100.0)
-
-            output_size = int(128 * dim)
-            output = torch.zeros(
-                (output_size, output_size, 3),
-                dtype=torch.float32,
-                device=self.models_processor.device,
-            )
-            input_face_affined = input_face_affined.permute(1, 2, 0).contiguous()
-            input_face_affined = torch.div(input_face_affined, 255.0)
-
-            swap, prev_face = self.get_swapped_and_prev_face(
-                output,
-                input_face_affined,
-                original_face_512,
-                latent,
-                itex,
-                dim,
-                swapper_model,
-                dfm_model_instance,
-                parameters,
-            )
+                swap, prev_face = self.get_swapped_and_prev_face(
+                    output,
+                    input_face_affined,
+                    original_face_512,
+                    latent,
+                    itex,
+                    dim,
+                    swapper_model,
+                    dfm_model_instance,
+                    parameters,
+                )
 
         else:
             swap = original_face_512
             if parameters["StrengthEnableToggle"]:
-                itex = ceil(parameters["StrengthAmountSlider"] / 100.0)
+                # FW-BUG-10: use round() instead of ceil()
+                itex = max(1, round(parameters["StrengthAmountSlider"] / 100.0))
                 prev_face = torch.div(swap, 255.0)
                 prev_face = prev_face.permute(1, 2, 0)
 
@@ -2135,7 +2379,6 @@ class FrameWorker(threading.Thread):
                 swap = torch.add(swap, prev_face)
 
         # --- DYNAMIC MASKS INITIALIZATION ---
-        border_mask, border_mask_calc = self.get_border_mask(parameters)
         current_swap_h, current_swap_w = swap.shape[1], swap.shape[2]
 
         yaw_deg, pitch_deg = faceutil.calc_face_yaw_pitch(kps_5)
@@ -2150,16 +2393,22 @@ class FrameWorker(threading.Thread):
             tform,
         )
 
-        if (
-            border_mask.shape[1] != current_swap_h
-            or border_mask.shape[2] != current_swap_w
-        ):
-            resizer = v2.Resize((current_swap_h, current_swap_w), antialias=True)
-            border_mask = resizer(border_mask)
-            border_mask_calc = resizer(border_mask_calc)
-
-        border_mask = border_mask * side_mask
-        border_mask_calc = border_mask_calc * side_mask
+        # FW-PERF-09: skip get_border_mask entirely when the toggle is off;
+        # when disabled it would just return all-ones, so the result equals side_mask.
+        if parameters.get("BordermaskEnableToggle", False):
+            border_mask, border_mask_calc = self.get_border_mask(parameters)
+            if (
+                border_mask.shape[1] != current_swap_h
+                or border_mask.shape[2] != current_swap_w
+            ):
+                resizer = v2.Resize((current_swap_h, current_swap_w), antialias=True)
+                border_mask = resizer(border_mask)
+                border_mask_calc = resizer(border_mask_calc)
+            border_mask = border_mask * side_mask
+            border_mask_calc = border_mask_calc * side_mask
+        else:
+            border_mask = side_mask
+            border_mask_calc = side_mask
 
         swap_mask = torch.ones(
             (current_swap_h, current_swap_w),
@@ -2169,18 +2418,21 @@ class FrameWorker(threading.Thread):
         swap_mask = torch.unsqueeze(swap_mask, 0)
         swap_mask_noFP = border_mask.clone()
 
+        # FW-MEM-03: allocate one base ones-tensor and share it for masks that will
+        # be unconditionally overwritten before first read; only deep-clone where the
+        # initial all-ones value is truly consumed before the mask is reassigned.
         BgExclude = torch.ones(
-            (512, 512), dtype=torch.float32, device=self.models_processor.device
+            (1, 512, 512), dtype=torch.float32, device=self.models_processor.device
         )
-        BgExclude = torch.unsqueeze(BgExclude, 0)
-        diff_mask = BgExclude.clone()
-        texture_mask_view = BgExclude.clone()
-        restore_mask = BgExclude.clone()
-        texture_exclude_512 = BgExclude.clone()
+        diff_mask = BgExclude  # overwritten inside Differencing block before read
+        texture_mask_view = BgExclude  # overwritten inside FaceParser block before read
+        # FW-QUAL-04: restore_mask removed here; it is always assigned inside the
+        # FaceRestorerAutoEnable2Toggle branch before being read (no early init needed)
+        texture_exclude_512 = BgExclude.clone()  # used as default in out.get(); needs own copy
 
-        calc_mask = BgExclude.clone()
-        calc_mask_dill = BgExclude.clone()
-        mask_forcalc_512 = BgExclude.clone()
+        calc_mask = BgExclude.clone()       # may be read before overwrite in face-parser path
+        calc_mask_dill = BgExclude.clone()  # consumed by VGG/masking before overwrite
+        mask_forcalc_512 = BgExclude.clone()  # consumed by _apply_restorer_with_auto
 
         M_ref = tform.params[0:2]
         ones_column_ref = np.ones((kps_5.shape[0], 1), dtype=np.float32)
@@ -2208,7 +2460,7 @@ class FrameWorker(threading.Thread):
         # Face editor beginning
         if (
             parameters["FaceEditorEnableToggle"]
-            and self.main_window.editFacesButton.isChecked()
+            and self.local_control_state_from_feeder.get('edit_enabled', True)  # FW-RACE-02
             and parameters["FaceEditorBeforeTypeSelection"] == "Beginning"
         ):
             editor_mask = swap_mask.clone()
@@ -2243,9 +2495,12 @@ class FrameWorker(threading.Thread):
                     swap = swap * (1.0 - overlay_mask) + overlay_rgb * overlay_mask
 
         # --- RESTORATION 1 ---
-        swap_original = swap.clone()
+        # FW-PERF-11: defer clone until we know it is needed (lazy snapshot)
+        swap_original = None
 
         if parameters["FaceRestorerEnableToggle"]:
+            # FW-PERF-11: clone only when the restorer will actually run
+            swap_original = swap.clone()
             swap_restorecalc = self.models_processor.apply_facerestorer(
                 swap,
                 parameters["FaceRestorerDetTypeSelection"],
@@ -2551,7 +2806,7 @@ class FrameWorker(threading.Thread):
         # Face Editor (After First)
         if (
             parameters["FaceEditorEnableToggle"]
-            and self.main_window.editFacesButton.isChecked()
+            and self.local_control_state_from_feeder.get('edit_enabled', True)  # FW-RACE-02
             and parameters["FaceEditorBeforeTypeSelection"] == "After First Restorer"
         ):
             editor_mask = swap_mask.clone()
@@ -2571,6 +2826,7 @@ class FrameWorker(threading.Thread):
             swap = self._apply_denoiser_pass(swap, control, "AfterFirst", kv_map)
 
         # --- RESTORATION 2 ---
+        # FW-QUAL-01/02: duplicated ~60-line block extracted to _apply_restorer_with_auto
         if (
             parameters["FaceRestorerEnable2Toggle"]
             and not parameters["FaceRestorerEnable2EndToggle"]
@@ -2586,60 +2842,11 @@ class FrameWorker(threading.Thread):
                 kps_ref,
                 slot_id=2,
             )
-
-            if parameters["FaceRestorerAutoEnable2Toggle"]:
-                original_face_512_autorestore2 = original_face_512.clone()
-                swap_original_autorestore2 = swap_original2.clone()
-                alpha_restorer2 = float(parameters["FaceRestorerBlend2Slider"]) / 100.0
-                adjust_sharpness2 = float(
-                    parameters["FaceRestorerAutoSharpAdjust2Slider"]
-                )
-                scale_factor2 = round(tform.scale, 2)
-                automasktoggle2 = parameters["FaceRestorerAutoMask2EnableToggle"]
-                automaskadjust2 = parameters[
-                    "FaceRestorerAutoSharpMask2AdjustDecimalSlider"
-                ]
-                automaskblur2 = 2
-                restore_mask = mask_forcalc_512.clone()
-
-                alpha_auto2, blur_value2 = self.face_restorer_auto(
-                    original_face_512_autorestore2,
-                    swap_original_autorestore2,
-                    swap2,
-                    alpha_restorer2,
-                    adjust_sharpness2,
-                    scale_factor2,
-                    debug,
-                    restore_mask,
-                    automasktoggle2,
-                    automaskadjust2,
-                    automaskblur2,
-                )
-
-                if blur_value2 > 0:
-                    kernel_size = 2 * blur_value2 + 1
-                    sigma = blur_value2 * 0.1
-                    gaussian_blur = transforms.GaussianBlur(
-                        kernel_size=kernel_size, sigma=sigma
-                    )
-                    swap = gaussian_blur(swap_original2)
-                    debug_info["Restore2"] = f": {-blur_value2:.2f}"
-                elif isinstance(alpha_auto2, torch.Tensor):
-                    swap = swap2 * alpha_auto2 + swap_original2 * (1 - alpha_auto2)
-                elif alpha_auto2 != 0:
-                    swap = swap2 * alpha_auto2 + swap_original2 * (1 - alpha_auto2)
-                    if debug:
-                        debug_info["Restore2"] = f": {alpha_auto2 * 100:.2f}"
-                else:
-                    swap = swap_original2
-                    if debug:
-                        debug_info["Restore2"] = f": {alpha_auto2 * 100:.2f}"
-            else:
-                alpha_restorer2 = float(parameters["FaceRestorerBlend2Slider"]) / 100.0
-                swap = torch.add(
-                    torch.mul(swap2, alpha_restorer2),
-                    torch.mul(swap_original2, 1 - alpha_restorer2),
-                )
+            swap = self._apply_restorer_with_auto(
+                swap, swap2, swap_original2, original_face_512,
+                mask_forcalc_512, parameters, tform.scale,
+                debug, debug_info, slot_id=2,
+            )
 
         # Expression (After Second)
         if (
@@ -2661,7 +2868,7 @@ class FrameWorker(threading.Thread):
         # Editor (After Second)
         if (
             parameters["FaceEditorEnableToggle"]
-            and self.main_window.editFacesButton.isChecked()
+            and self.local_control_state_from_feeder.get('edit_enabled', True)  # FW-RACE-02
             and parameters["FaceEditorBeforeTypeSelection"] == "After Second Restorer"
         ):
             editor_mask = t512_mask(swap_mask).clone()
@@ -2675,6 +2882,10 @@ class FrameWorker(threading.Thread):
                 swap_mask = swap_mask_noFP
 
         # --- AUTO COLOR (Mask 512) ---
+        # FW-QUAL-12: AutoColorEnableToggle runs here — BEFORE FaceParser mask is applied
+        # to the global swap_mask (the EndingColorTransfer runs at the end, AFTER the
+        # FaceParser end-pass and the final swap_mask re-calculation, so it operates on a
+        # tighter mask that excludes eyes/mouth/hairline etc.).
         if parameters.get("AutoColorEnableToggle", False):
             if parameters["AutoColorTransferTypeSelection"] == "Test":
                 swap = faceutil.histogram_matching(
@@ -2792,7 +3003,17 @@ class FrameWorker(threading.Thread):
                 # Fallback to raw mask if everything is disabled
                 mask_final_512 = (1.0 - mask_forcalc_512).clamp(0.0, 1.0)
 
-            # 4. AutoColor Backup Logic
+            # FW-QUAL-03: dead-code block converted from triple-quoted string to comments.
+            # 4. Final Mask Smoothing (Applied only ONCE at the end) — disabled / superseded
+            # if parameters.get("FaceParserBlurTextureSlider", 0) > 0:
+            #     orig_m = mask_final_512.clone()
+            #     b_fp = parameters["FaceParserBlurTextureSlider"]
+            #     kernel_size = int(b_fp * 2 + 1)
+            #     gauss = transforms.GaussianBlur(kernel_size, (b_fp + 1) * 0.2)
+            #     mask_final_512 = gauss(mask_final_512.type(torch.float32))
+            #     # Restore sharp inner boundaries while softening the gradients
+            #     mask_final_512 = torch.max(mask_final_512, orig_m).clamp(0.0, 1.0)
+            # 5. AutoColor Backup Logic
             if parameters.get("AutoColorEnableToggle", False):
                 swap_texture_backup = swap.clone()
             else:
@@ -2930,7 +3151,7 @@ class FrameWorker(threading.Thread):
         # Face Editor (After Texture Transfer)
         if (
             parameters["FaceEditorEnableToggle"]
-            and self.main_window.editFacesButton.isChecked()
+            and self.local_control_state_from_feeder.get('edit_enabled', True)  # FW-RACE-02
             and parameters["FaceEditorBeforeTypeSelection"] == "After Texture Transfer"
         ):
             editor_mask = t512_mask(swap_mask).clone()
@@ -2985,6 +3206,7 @@ class FrameWorker(threading.Thread):
             swap = swap * 255.0
 
         # --- RESTORATION 2 (END) ---
+        # FW-QUAL-01/02: duplicated ~60-line block extracted to _apply_restorer_with_auto
         if (
             parameters["FaceRestorerEnable2Toggle"]
             and parameters["FaceRestorerEnable2EndToggle"]
@@ -3000,60 +3222,11 @@ class FrameWorker(threading.Thread):
                 kps_ref,
                 slot_id=2,
             )
-
-            if parameters["FaceRestorerAutoEnable2Toggle"]:
-                original_face_512_autorestore2 = original_face_512.clone()
-                swap_original_autorestore2 = swap_original2.clone()
-                alpha_restorer2 = float(parameters["FaceRestorerBlend2Slider"]) / 100.0
-                adjust_sharpness2 = float(
-                    parameters["FaceRestorerAutoSharpAdjust2Slider"]
-                )
-                scale_factor2 = round(tform.scale, 2)
-                automasktoggle2 = parameters["FaceRestorerAutoMask2EnableToggle"]
-                automaskadjust2 = parameters[
-                    "FaceRestorerAutoSharpMask2AdjustDecimalSlider"
-                ]
-                automaskblur2 = 2
-                restore_mask = mask_forcalc_512.clone()
-
-                alpha_auto2, blur_value2 = self.face_restorer_auto(
-                    original_face_512_autorestore2,
-                    swap_original_autorestore2,
-                    swap2,
-                    alpha_restorer2,
-                    adjust_sharpness2,
-                    scale_factor2,
-                    debug,
-                    restore_mask,
-                    automasktoggle2,
-                    automaskadjust2,
-                    automaskblur2,
-                )
-
-                if blur_value2 > 0:
-                    kernel_size = 2 * blur_value2 + 1
-                    sigma = blur_value2 * 0.1
-                    gaussian_blur = transforms.GaussianBlur(
-                        kernel_size=kernel_size, sigma=sigma
-                    )
-                    swap = gaussian_blur(swap_original2)
-                    debug_info["Restore2"] = f": {-blur_value2:.2f}"
-                elif isinstance(alpha_auto2, torch.Tensor):
-                    swap = swap2 * alpha_auto2 + swap_original2 * (1 - alpha_auto2)
-                elif alpha_auto2 != 0:
-                    swap = swap2 * alpha_auto2 + swap_original2 * (1 - alpha_auto2)
-                    if debug:
-                        debug_info["Restore2"] = f": {alpha_auto2 * 100:.2f}"
-                else:
-                    swap = swap_original2
-                    if debug:
-                        debug_info["Restore2"] = f": {alpha_auto2 * 100:.2f}"
-            else:
-                alpha_restorer2 = float(parameters["FaceRestorerBlend2Slider"]) / 100.0
-                swap = torch.add(
-                    torch.mul(swap2, alpha_restorer2),
-                    torch.mul(swap_original2, 1 - alpha_restorer2),
-                )
+            swap = self._apply_restorer_with_auto(
+                swap, swap2, swap_original2, original_face_512,
+                mask_forcalc_512, parameters, tform.scale,
+                debug, debug_info, slot_id=2,
+            )
 
         # Third denoiser pass - After restorers
         if control.get("DenoiserAfterRestorersToggle", False):
@@ -3166,16 +3339,18 @@ class FrameWorker(threading.Thread):
                 if debug:
                     debug_info["JPEG Quality"] = f"{jpeg_q_eff}"
 
-                swap2 = faceutil.jpegBlur(swap, jpeg_q_eff)
+                # FW-BUG-14: renamed swap2 -> swap_jpeg in JPEG block
+                swap_jpeg = faceutil.jpegBlur(swap, jpeg_q_eff)
                 blend = parameters["JPEGCompressionBlendSlider"] / 100.0
-                swap = torch.add(swap2 * blend, swap * (1.0 - blend))
+                swap = torch.add(swap_jpeg * blend, swap * (1.0 - blend))
 
         # Artefacts: BlockShift
         if parameters["BlockShiftEnableToggle"]:
             base_quality = parameters["BlockShiftAmountSlider"]
             max_px = parameters["BlockShiftMaxAmountSlider"]
 
-            swap2 = self.apply_block_shift_gpu_jitter(
+            # FW-BUG-14: renamed swap2 -> swap_blockshift in BlockShift block
+            swap_blockshift = self.apply_block_shift_gpu_jitter(
                 swap,
                 block_size=base_quality,
                 max_amount_pixels=float(max_px),
@@ -3183,9 +3358,8 @@ class FrameWorker(threading.Thread):
             )
 
             block_shift_blend = parameters["BlockShiftBlendAmountSlider"] / 100.0
-            # FW-BUG-14: removed duplicate standalone blend; keep only torch.add version
             swap = torch.add(
-                torch.mul(swap2, block_shift_blend),
+                torch.mul(swap_blockshift, block_shift_blend),
                 torch.mul(swap, 1 - block_shift_blend),
             )
 
@@ -3198,10 +3372,12 @@ class FrameWorker(threading.Thread):
             )
             swap = torch.clamp(swap + noise, 0.0, 255.0)
 
-        if control.get("AnalyseImageEnableToggle", False):
+        # FW-PERF-14: only run the FFT/pooling analysis when debug output will be shown
+        if debug and control.get("AnalyseImageEnableToggle", False):
             image_analyse_swap = self.analyze_image(swap)
-            if debug:
-                debug_info["JS: "] = image_analyse_swap
+            # FW-QUAL-07: flatten image analysis dict into individual debug keys
+            for _k, _v in image_analyse_swap.items():
+                debug_info[f"JS:{_k}"] = _v
 
         if debug and debug_info:
             one_liner = ", ".join(f"{key}={value}" for key, value in debug_info.items())
@@ -3243,7 +3419,7 @@ class FrameWorker(threading.Thread):
             if mask_show_type == "swap_mask":
                 if (
                     parameters["FaceEditorEnableToggle"]
-                    and self.main_window.editFacesButton.isChecked()
+                    and self.local_control_state_from_feeder.get('edit_enabled', True)  # FW-RACE-02
                 ):
                     swap_mask_clone = torch.ones_like(swap_mask).clone()
                 else:
@@ -3283,7 +3459,10 @@ class FrameWorker(threading.Thread):
         if bottom > img.shape[1]:
             bottom = img.shape[1]
 
-        swap = v2.functional.pad(swap, (0, 0, img.shape[2] - 512, img.shape[1] - 512))
+        # FW-BUG-04: prevent negative padding when img is smaller than 512 in either dimension
+        pad_w = max(0, img.shape[2] - 512)
+        pad_h = max(0, img.shape[1] - 512)
+        swap = v2.functional.pad(swap, (0, 0, pad_w, pad_h))
         swap = v2.functional.affine(
             swap,
             tform.inverse.rotation * 57.2958,
@@ -3296,7 +3475,7 @@ class FrameWorker(threading.Thread):
         swap = swap[0:3, top:bottom, left:right]
 
         swap_mask = v2.functional.pad(
-            swap_mask, (0, 0, img.shape[2] - 512, img.shape[1] - 512)
+            swap_mask, (0, 0, pad_w, pad_h)
         )
         swap_mask = v2.functional.affine(
             swap_mask,
@@ -3436,8 +3615,19 @@ class FrameWorker(threading.Thread):
             kernel_size, sigma, lambd, gamma, psi, theta_values, image.device
         )  # [N, 1, k, k]
 
+        # FW-PERF-06: cache expanded kernels keyed by (shape, C) to avoid repeat_interleave overhead
+        if not hasattr(self, '_gabor_kernels_cache'):
+            from collections import OrderedDict
+            self._gabor_kernels_cache = OrderedDict()
+        expand_cache_key = (*kernels.shape, C)
+        if expand_cache_key not in self._gabor_kernels_cache:
+            # FW-MEM-01: bound the LRU cache size
+            MAX_GABOR_CACHE = 32
+            if len(self._gabor_kernels_cache) >= MAX_GABOR_CACHE:
+                self._gabor_kernels_cache.popitem(last=False)
+            self._gabor_kernels_cache[expand_cache_key] = kernels.repeat_interleave(C, dim=0)
         # expand to all channels:
-        weight = kernels.repeat_interleave(C, dim=0)  # → [N*C, 1, k, k]
+        weight = self._gabor_kernels_cache[expand_cache_key]  # → [N*C, 1, k, k]
         out = F.conv2d(
             image,  # [1, C, H, W]
             weight,
@@ -3490,6 +3680,10 @@ class FrameWorker(threading.Thread):
             kernels.append(gb)
 
         result = torch.stack(kernels).unsqueeze(1)  # → [N, 1, k, k]
+        # FW-MEM-01: evict oldest entry if cache exceeds limit
+        MAX_GABOR_CACHE = 32
+        if len(self._gabor_kernels_cache) >= MAX_GABOR_CACHE:
+            self._gabor_kernels_cache.popitem(last=False)
         self._gabor_kernels_cache[cache_key] = result
         return result
 
@@ -3550,14 +3744,13 @@ class FrameWorker(threading.Thread):
                 prev_alpha = 0.0
                 base = swap_original
                 max_blur_strength = 10
-                for bs in range(0, max_blur_strength + 1):
-                    if bs == 0:
-                        kernel_size = 1
-                        sigma = 1e-6
-                    else:
-                        kernel_size = 2 * bs + 1
-                        sigma = max(bs, 1e-6)
-                    gaussian_blur = transforms.GaussianBlur(kernel_size, sigma)
+                # FW-PERF-10: precompute GaussianBlur objects outside the scoring loop
+                blur_kernels_for_auto = [
+                    (transforms.GaussianBlur(1, 1e-6) if bs == 0
+                     else transforms.GaussianBlur(2 * bs + 1, max(bs, 1e-6)))
+                    for bs in range(0, max_blur_strength + 1)
+                ]
+                for bs, gaussian_blur in enumerate(blur_kernels_for_auto):
                     swap2_blurred = gaussian_blur(base)
                     scores_swap_b = self.sharpness_score(swap2_blurred)
                     score_new_swap_b = scores_swap_b["combined"].item() * 100.0
@@ -3670,9 +3863,12 @@ class FrameWorker(threading.Thread):
             return m.sum().clamp(min=1.0) if m is not None else t.numel()
 
         # --- Variance of Laplacian ---
-        lap = torch.tensor(
-            [[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=image.device, dtype=torch.float32
-        ).view(1, 1, 3, 3)
+        # FW-PERF-04: use promoted instance kernel; create lazily if not yet on device
+        if self._lap_kernel is None or self._lap_kernel.device != image.device:
+            self._lap_kernel = torch.tensor(
+                [[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(image.device)
+        lap = self._lap_kernel
         L = F.conv2d(gray, lap, padding=1).squeeze()  # [H,W]
         L2 = L.pow(2)
         if m is not None:
@@ -3684,12 +3880,16 @@ class FrameWorker(threading.Thread):
         var_lap = (mean_L2 - mean_L.pow(2)).clamp(min=0.0)
 
         # --- Thresholded Tenengrad ---
-        sobel_x = torch.tensor(
-            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]],
-            device=image.device,
-            dtype=torch.float32,
-        ).view(1, 1, 3, 3)
-        sobel_y = sobel_x.transpose(2, 3)
+        # FW-PERF-04: use promoted instance kernels; create lazily if not yet on device
+        if self._sobel_x is None or self._sobel_x.device != image.device:
+            self._sobel_x = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(image.device)
+            self._sobel_y = torch.tensor(
+                [[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(image.device)
+        sobel_x = self._sobel_x
+        sobel_y = self._sobel_y
         Gx = F.conv2d(gray, sobel_x, padding=1).squeeze()  # [H,W]
         Gy = F.conv2d(gray, sobel_y, padding=1).squeeze()
         G = (Gx.pow(2) + Gy.pow(2)).sqrt()
@@ -3722,14 +3922,21 @@ class FrameWorker(threading.Thread):
         # [3,H,W] -> [1,1,H,W] gray, range [0..1]
         gray = (image / 255.0).mean(dim=0, keepdim=True).unsqueeze(0)
 
-        # Convs
-        lap_k = torch.tensor(
-            [[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=device, dtype=torch.float32
-        ).view(1, 1, 3, 3)
-        sobel_x = torch.tensor(
-            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=torch.float32
-        ).view(1, 1, 3, 3)
-        sobel_y = sobel_x.transpose(2, 3)
+        # FW-PERF-04/05: use promoted instance kernels to avoid re-allocating each call
+        if self._lap_kernel is None or self._lap_kernel.device != device:
+            self._lap_kernel = torch.tensor(
+                [[0, 1, 0], [1, -4, 1], [0, 1, 0]], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(device)
+        if self._sobel_x is None or self._sobel_x.device != device:
+            self._sobel_x = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(device)
+            self._sobel_y = torch.tensor(
+                [[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32
+            ).unsqueeze(0).unsqueeze(0).to(device)
+        lap_k = self._lap_kernel
+        sobel_x = self._sobel_x
+        sobel_y = self._sobel_y
 
         lap = F.conv2d(gray, lap_k, padding=1).squeeze(0).squeeze(0)  # [H,W]
         gx = F.conv2d(gray, sobel_x, padding=1).squeeze(0).squeeze(0)  # [H,W]
@@ -3767,7 +3974,12 @@ class FrameWorker(threading.Thread):
         smap = comb_weight * lap_n + (1.0 - comb_weight) * grad_n  # [H,W]
 
         # Optional smoothing to avoid noisy alpha
-        if smooth_kernel and smooth_kernel >= 3 and smooth_kernel % 2 == 1:
+        # FW-ROBUST-09: ensure kernel size is odd and at least 3
+        if smooth_kernel:
+            if smooth_kernel % 2 == 0:
+                smooth_kernel += 1
+            smooth_kernel = max(3, smooth_kernel)
+        if smooth_kernel and smooth_kernel >= 3:
             k = smooth_kernel
             smap3 = smap.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
             gb = transforms.GaussianBlur(kernel_size=k, sigma=max(1, k // 2))
@@ -3815,7 +4027,8 @@ class FrameWorker(threading.Thread):
         )
 
         # Pad to multiples of B (bottom/right), crop back later
-        B = int(2**block_size)
+        # FW-BUG-13: use block_size directly as B; old 2**block_size was exponential
+        B = max(1, int(block_size))
         H_pad = (B - (H % B)) % B
         W_pad = (B - (W % B)) % B
         if H_pad or W_pad:
