@@ -1042,6 +1042,9 @@ class FrameWorker(threading.Thread):
             return original_equirect_tensor_for_vr
 
         final_equirect_torch_cxhxw_rgb_uint8 = original_equirect_tensor_for_vr.clone()
+        vr_single_eye_mode = (
+            control.get("VR180EyeModeSelection", "Both Eyes") == "Single Eye"
+        )
         p2e_converter = PerspectiveConverter(
             img_numpy_rgb_uint8, device=self.models_processor.device
         )
@@ -1063,7 +1066,7 @@ class FrameWorker(threading.Thread):
                 theta=_theta,
                 phi=_phi,
                 fov=_fov,
-                is_left_eye=("L" in _eye_side),
+                is_left_eye=(None if vr_single_eye_mode else ("L" in _eye_side)),
             )
             # FW-MEM-02: release the crop tensor immediately after stitching
             del _crop_tensor

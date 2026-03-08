@@ -2,7 +2,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from torchvision import transforms
-from typing import Dict
+from typing import Dict, Optional
 
 
 # Assuming Equirec2Perspec_vr and Perspec2Equirec_vr are in app.processors.external
@@ -159,7 +159,7 @@ class PerspectiveConverter:
         theta: float,
         phi: float,
         fov: float,
-        is_left_eye: bool,
+        is_left_eye: Optional[bool],  # None = single-eye (full-frame) mode
     ):
         """
         Stitches a single processed perspective crop back into the target equirectangular image.
@@ -182,11 +182,15 @@ class PerspectiveConverter:
         )
 
         eye_region_mask = torch.zeros_like(mask_torch_original_shape, dtype=torch.bool)
-        half_width = self.orig_width // 2
-        if is_left_eye:
-            eye_region_mask[:, :, :half_width] = True
+        if is_left_eye is None:
+            # Single-eye mode: stitch covers the full frame
+            eye_region_mask[:] = True
         else:
-            eye_region_mask[:, :, half_width:] = True
+            half_width = self.orig_width // 2
+            if is_left_eye:
+                eye_region_mask[:, :, :half_width] = True
+            else:
+                eye_region_mask[:, :, half_width:] = True
 
         eye_specific_mask_torch_original_shape = (
             mask_torch_original_shape & eye_region_mask

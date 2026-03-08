@@ -231,6 +231,15 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": "Enable VR180 mode. This will treat the input video as an equirectangular VR180 video and apply face swapping within perspective crops.",
         },
+        "VR180EyeModeSelection": {
+            "level": 1,
+            "label": "VR180 Eye Mode",
+            "options": ["Both Eyes", "Single Eye"],
+            "default": "Both Eyes",
+            "help": "Select 'Both Eyes' for standard VR180 video (left+right eye side-by-side). Select 'Single Eye' if the input video already contains only one eye's equirectangular view (full frame = one hemisphere).",
+            "parentToggle": "VR180ModeEnableToggle",
+            "requiredToggleValue": True,
+        },
         "MaxDFMModelsSlider": {
             "level": 1,
             "label": "Maximum DFM Models to use",

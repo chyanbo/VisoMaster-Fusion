@@ -485,7 +485,7 @@ def _load_job_controls_and_state(
 
     # Update parameter widgets to default (or first face's)
     common_widget_actions.set_widgets_values_using_face_id_parameters(
-        main_window, face_id=False
+        main_window, face_id=None
     )
 
     if not is_batch_load:
@@ -748,7 +748,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
 
         else:
             # If no faces were loaded, ensure selection is cleared
-            main_window.selected_target_face_id = False
+            main_window.selected_target_face_id = None
             main_window.cur_selected_target_face_button = None
             main_window.current_widget_parameters = (
                 main_window.default_parameters.copy()
@@ -906,7 +906,7 @@ def _restore_workspace_from_snapshot(main_window: "MainWindow", data: dict):
             ].copy()
         else:
             # If no faces were restored
-            main_window.selected_target_face_id = False
+            main_window.selected_target_face_id = None
             main_window.cur_selected_target_face_button = None
             main_window.current_widget_parameters = (
                 main_window.default_parameters.copy()

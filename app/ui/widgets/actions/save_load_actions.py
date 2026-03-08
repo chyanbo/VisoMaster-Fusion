@@ -484,7 +484,7 @@ def load_saved_workspace(
                     ),
                 )
                 common_widget_actions.set_widgets_values_using_face_id_parameters(
-                    main_window, face_id=False
+                    main_window, face_id=None
                 )
 
             # Restore Window State
