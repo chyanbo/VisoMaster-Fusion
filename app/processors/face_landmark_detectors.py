@@ -498,9 +498,17 @@ class FaceLandmarkDetectors:
 
         # Post-process the 1D prediction array into 3D/2D coordinates.
         # 68 * 3 = 204 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
-        pred = (
-            pred.reshape((-1, 3)) if pred.shape[0] == 68 * 3 else pred.reshape((-1, 2))
-        )
+        total_elements = pred.shape[0]
+        if total_elements == 68 * 2:
+            # 2D strict (136 elements)
+            pred = pred.reshape((-1, 2))
+        elif total_elements % 3 == 0:
+            # 3D (ex: 204 elements or 3309 mesh elements)
+            pred = pred.reshape((-1, 3))
+        else:
+            # Fallback 2D
+            pred = pred.reshape((-1, 2))
+
         if 68 < pred.shape[0]:
             pred = pred[-68:]
         pred[:, 0:2] = (pred[:, 0:2] + 1) * 96.0  # Scale to image size (192/2)
@@ -592,9 +600,14 @@ class FaceLandmarkDetectors:
         pred = net_outs_106[0][0]
 
         # 106 * 3 = 318 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
-        pred = (
-            pred.reshape((-1, 3)) if pred.shape[0] == 106 * 3 else pred.reshape((-1, 2))
-        )
+        total_elements = pred.shape[0]
+        if total_elements == 106 * 2:
+            pred = pred.reshape((-1, 2))
+        elif total_elements % 3 == 0:
+            pred = pred.reshape((-1, 3))
+        else:
+            pred = pred.reshape((-1, 2))
+
         if 106 < pred.shape[0]:
             pred = pred[-106:]
 

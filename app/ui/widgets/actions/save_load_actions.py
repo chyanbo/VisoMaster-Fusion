@@ -855,6 +855,8 @@ def save_current_job(main_window: "MainWindow"):
         "control": main_window.control.copy(),
         "job_marker_pairs": main_window.job_marker_pairs,
         "current_widget_parameters": main_window.current_widget_parameters.data.copy(),
+        "last_target_media_folder_path": main_window.last_target_media_folder_path,
+        "last_input_media_folder_path": main_window.last_input_media_folder_path,
     }
 
     # Serialize target face specifics for the job
