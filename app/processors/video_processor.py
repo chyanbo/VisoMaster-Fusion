@@ -36,7 +36,9 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 TAIL_TOLERANCE = 10  # Reduced from 300 (VP-34) to allow seeking closer to EOF.
-MAX_CONSECUTIVE_ERRORS = 300  # Stop reading after this many consecutive frame read failures
+MAX_CONSECUTIVE_ERRORS = (
+    300  # Stop reading after this many consecutive frame read failures
+)
 
 # Audio-Video Sync: Always use segmented extraction when frames are skipped (perfect sync)
 # Simple extraction used when no frames are skipped (no sync issues)
@@ -470,7 +472,10 @@ class VideoProcessor(QObject):
                             break
 
                     # 2) Standard mode: read failure near file end -> treat as EOF
-                    if not is_segment_mode and fn >= self.max_frame_number - TAIL_TOLERANCE:
+                    if (
+                        not is_segment_mode
+                        and fn >= self.max_frame_number - TAIL_TOLERANCE
+                    ):
                         print(
                             f"[INFO] Feeder: Read failure near file end (frame={fn}/{self.max_frame_number}), treating as EOF."
                         )
@@ -646,7 +651,7 @@ class VideoProcessor(QObject):
         is_playback_loop_enabled = self.main_window.control["VideoPlaybackLoopToggle"]
         should_stop_playback = False
         should_finalize_default_recording = False
-        
+
         if self.file_type == "video":
             if self.is_processing_segments:
                 # --- Segment Recording Stop Logic ---
@@ -2433,8 +2438,7 @@ class VideoProcessor(QObject):
                 if self.stopped_by_error_limit:
                     path_obj = Path(final_file_path)
                     final_file_path = str(
-                        path_obj.parent
-                        / f"{path_obj.stem}_incomplete{path_obj.suffix}"
+                        path_obj.parent / f"{path_obj.stem}_incomplete{path_obj.suffix}"
                     )
                     print(
                         f"[WARN] Output marked as incomplete due to excessive read errors: {final_file_path}"

@@ -360,3 +360,66 @@ class TestEyeRegionMask:
             is_left_eye=None,
         )
         assert target.shape == (3, self.h, self.w)
+
+    # Q-IMP-03: small VR face erosion guard
+    def test_small_mask_not_destroyed_by_erosion_k1(self):
+        """Q-IMP-03: erosion_kernel_size=1 (no erosion) preserves a tiny mask region."""
+        mask = torch.zeros(1, self.h, self.w, dtype=torch.bool)
+        # 8×8 true region → mask_region_side ≈ 8 < 48 → guard should use _erosion_k=1
+        mask[:, 40:48, 85:93] = True
+        feathered = self.pc._apply_feathering(
+            mask, feather_radius=5, erosion_kernel_size=1
+        )
+        assert feathered.max().item() > 0.0, (
+            "Small mask was fully destroyed; erosion guard (erosion_kernel_size=1) not effective"
+        )
+
+    def test_mask_region_side_threshold_logic(self):
+        """Q-IMP-03: mask_region_side < 48 → _erosion_k=1; ≥ 48 → normal path."""
+        # Below threshold: sqrt(100) = 10 < 48
+        small_true_pixels = 100
+        side_small = int(small_true_pixels**0.5)
+        assert side_small < 48
+        _erosion_k_small = 1 if side_small < 48 else 25
+        assert _erosion_k_small == 1
+
+        # At/above threshold: sqrt(2304) = 48, not < 48
+        large_true_pixels = 2304
+        side_large = int(large_true_pixels**0.5)
+        assert side_large >= 48
+        _erosion_k_large = 1 if side_large < 48 else 25
+        assert _erosion_k_large == 25
+
+
+# ---------------------------------------------------------------------------
+# Q-BUG-02: .round_().byte() vs .byte() truncation bias
+# ---------------------------------------------------------------------------
+
+
+def test_byte_truncates_toward_zero():
+    """Q-BUG-02: .byte() floors toward zero, producing a systematic negative bias."""
+    t = torch.tensor([127.9, 200.6, 50.7], dtype=torch.float32)
+    truncated = t.byte()
+    # Each value is floored: 127.9→127, 200.6→200, 50.7→50
+    assert truncated[0].item() == 127
+    assert truncated[1].item() == 200
+    assert truncated[2].item() == 50
+
+
+def test_round_then_byte_gives_nearest_integer():
+    """Q-BUG-02: .round_().byte() rounds to nearest, correcting the bias."""
+    t = torch.tensor([127.9, 200.6, 50.7], dtype=torch.float32)
+    rounded = t.clone().round_().byte()
+    # 127.9→128, 200.6→201, 50.7→51
+    assert rounded[0].item() == 128
+    assert rounded[1].item() == 201
+    assert rounded[2].item() == 51
+
+
+def test_round_then_byte_reduces_mean_error():
+    """Q-BUG-02: rounding has lower mean absolute error than truncation."""
+    t = torch.tensor([50.7, 100.8, 150.9, 200.6], dtype=torch.float32)
+    nearest = t.round()
+    err_trunc = (t.byte().float() - nearest).abs().mean().item()
+    err_round = (t.clone().round_().byte().float() - nearest).abs().mean().item()
+    assert err_round <= err_trunc

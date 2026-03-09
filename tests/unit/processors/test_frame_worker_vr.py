@@ -39,6 +39,10 @@ _STUBS = [
     "kornia",
     "kornia.enhance",
     "kornia.color",
+    # frame_worker.py imports kornia.geometry.transform at module level (c6b67d0);
+    # all three levels must be stubbed so the dotted import resolves.
+    "kornia.geometry",
+    "kornia.geometry.transform",
     "skimage",
     "skimage.transform",
     "app.ui.widgets.widget_components",
@@ -131,6 +135,8 @@ def _make_worker(main_window):
         worker.parameters = {}
         worker.last_processed_frame_number = -1
         worker.last_detected_faces = []
+        worker.last_detected_faces_vr = []
+        worker.last_processed_frame_number_vr = -1
         worker.VR_PERSPECTIVE_RENDER_SIZE = 512
         worker.VR_FOV_SCALE_FACTOR = 1.5
         worker.is_view_face_compare = False
@@ -138,14 +144,18 @@ def _make_worker(main_window):
         worker.lock = threading.Lock()
         worker._tracker_lock = threading.Lock()
         worker.local_control_state_from_feeder = {}
-        worker._lap_kernel = None
-        worker._sobel_x = None
-        worker._sobel_y = None
+        # Convolution kernels added in c6b67d0 (use current attribute names)
+        worker.kernel_lap = None
+        worker.kernel_sobel_x = None
+        worker.kernel_sobel_y = None
         worker._vr_converter = None
         worker._vr_frame_size = None
         worker._last_scaling_control = None
         worker._resize_cache = {}
         worker._gabor_kernels_cache = OrderedDict()
+        # Q-QUAL-01 / Q-QUAL-03: EMA state dicts
+        worker._smoothed_kps = {}
+        worker._color_stats_ema = {}
         worker.t512 = MagicMock()
         worker.t384 = MagicMock()
         worker.t256 = MagicMock()
