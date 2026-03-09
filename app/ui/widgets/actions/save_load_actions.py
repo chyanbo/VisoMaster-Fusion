@@ -539,11 +539,6 @@ def load_saved_workspace(
             )
             filter_actions.filter_target_videos(main_window)
             list_view_actions.load_target_webcams(main_window)
-        except (json.JSONDecodeError, KeyError, TypeError) as e:
-            QtWidgets.QMessageBox.critical(
-                main_window, "Error", f"Failed to load workspace: {e}"
-            )
-            return
 
             # restore dock layout if it was saved
             dock_state_str = window_state.get("dock_state", data.get("dock_state", ""))
@@ -553,6 +548,11 @@ def load_saved_workspace(
                     main_window.restoreState(ba)
                 except Exception as e:
                     print(f"[WARN] Failed to restore dock layout: {e}")
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            QtWidgets.QMessageBox.critical(
+                main_window, "Error", f"Failed to load workspace: {e}"
+            )
+            return
 
 
 def save_current_workspace(
