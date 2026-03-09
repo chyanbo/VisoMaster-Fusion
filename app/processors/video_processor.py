@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 TAIL_TOLERANCE = 10  # Reduced from 300 (VP-34) to allow seeking closer to EOF.
+MAX_CONSECUTIVE_ERRORS = 300  # Stop reading after this many consecutive frame read failures
 
 # Audio-Video Sync: Always use segmented extraction when frames are skipped (perfect sync)
 # Simple extraction used when no frames are skipped (no sync issues)
@@ -171,9 +172,12 @@ class VideoProcessor(QObject):
         )  # Track which frames were skipped due to read errors
         self.consecutive_read_errors: int = 0  # Count consecutive read failures
         self.max_consecutive_errors: int = (
-            300  # Stop after this many consecutive errors
+            MAX_CONSECUTIVE_ERRORS  # Stop after this many consecutive errors
         )
         self.total_skipped_frames: int = 0  # Counter for skipped frames
+        self.stopped_by_error_limit: bool = (
+            False  # Track if processing stopped due to error limit
+        )
 
         # --- Multi-Segment Recording State ---
         self.segments_to_process: List[Tuple[int, int]] = []
@@ -465,7 +469,18 @@ class VideoProcessor(QObject):
                             )
                             break
 
-                    # 2) Standard mode: unified frame skip logic (no longer depends on potentially inaccurate max_frame_number)
+                    # 2) Standard mode: read failure near file end -> treat as EOF
+                    if not is_segment_mode and fn >= self.max_frame_number - TAIL_TOLERANCE:
+                        print(
+                            f"[INFO] Feeder: Read failure near file end (frame={fn}/{self.max_frame_number}), treating as EOF."
+                        )
+                        # Advance next_frame_to_display past max to trigger finalization
+                        with self.state_lock:
+                            self.next_frame_to_display = self.max_frame_number + 1
+                        self.processing = False
+                        break
+
+                    # 3) Standard mode: unified frame skip logic (no longer depends on potentially inaccurate max_frame_number)
                     # Skip corrupted frames and continue, but stop if too many consecutive failures (likely reached EOF)
                     self.consecutive_read_errors += 1
                     self.skipped_frames.add(self.current_frame_number)
@@ -476,6 +491,10 @@ class VideoProcessor(QObject):
                         print(
                             f"[INFO] Feeder: Too many consecutive read errors ({self.consecutive_read_errors}), likely reached EOF. Stopping."
                         )
+                        self.stopped_by_error_limit = True
+                        # Advance next_frame_to_display past max to trigger finalization
+                        with self.state_lock:
+                            self.next_frame_to_display = self.max_frame_number + 1
                         if is_segment_mode:
                             self.is_processing_segments = False
                         else:
@@ -622,14 +641,12 @@ class VideoProcessor(QObject):
         This function is called repeatedly via QTimer.singleShot.
         """
 
-        # 1. Stop check
-        if not self.processing:  # General check (if stop_processing was called)
-            return
-
-        # 2. End-of-media / End-of-segment logic
+        # 0. Check for end-of-media FIRST (before processing flag check)
+        # This ensures we finalize even if feeder stopped due to errors
         is_playback_loop_enabled = self.main_window.control["VideoPlaybackLoopToggle"]
         should_stop_playback = False
         should_finalize_default_recording = False
+        
         if self.file_type == "video":
             if self.is_processing_segments:
                 # --- Segment Recording Stop Logic ---
@@ -667,7 +684,11 @@ class VideoProcessor(QObject):
                     self.process_video()
                 return
 
-        # --- 3. METRONOME TIMING LOGIC ---
+        # 1. Stop check (after end-of-media check)
+        if not self.processing:  # General check (if stop_processing was called)
+            return
+
+        # --- 2. METRONOME TIMING LOGIC ---
         now_sec = time.perf_counter()
 
         # Calculate next tick time (based on *last* scheduled time to prevent drift)
@@ -912,6 +933,7 @@ class VideoProcessor(QObject):
         self.processing = True  # General flag ON
         self.is_processing_segments = False
         self.playback_started = False
+        self.stopped_by_error_limit = False  # Reset error limit flag for new processing
 
         # Initialize feeder state with the current UI global state
         with self.state_lock:
@@ -2288,6 +2310,13 @@ class VideoProcessor(QObject):
         """Finalizes a successful default-style recording (adds audio, cleans up)."""
         print("[INFO] Finalizing default-style recording...")
 
+        # Check if processing stopped due to error limit
+        if self.stopped_by_error_limit:
+            print(
+                f"[WARN] Recording stopped due to excessive consecutive read errors ({self.consecutive_read_errors}). "
+                f"Output will be saved with '_incomplete' suffix. Total skipped frames: {self.total_skipped_frames}."
+            )
+
         try:
             self.processing = False  # Stop metronome
 
@@ -2399,6 +2428,17 @@ class VideoProcessor(QObject):
                     use_job_name_for_output=use_job_name,
                     output_file_name=output_file_name,
                 )
+
+                # Add suffix if stopped due to error limit
+                if self.stopped_by_error_limit:
+                    path_obj = Path(final_file_path)
+                    final_file_path = str(
+                        path_obj.parent
+                        / f"{path_obj.stem}_incomplete{path_obj.suffix}"
+                    )
+                    print(
+                        f"[WARN] Output marked as incomplete due to excessive read errors: {final_file_path}"
+                    )
 
                 output_dir = os.path.dirname(final_file_path)
                 if output_dir and not os.path.exists(output_dir):
@@ -2646,6 +2686,7 @@ class VideoProcessor(QObject):
         self.recording = False
         self.processing = True  # Master flag
         self.triggered_by_job_manager = triggered_by_job_manager
+        self.stopped_by_error_limit = False  # Reset error limit flag for new processing
         self.segments_to_process = sorted(segments)
         self.current_segment_index = -1
         self.temp_segment_files = []
@@ -2904,6 +2945,13 @@ class VideoProcessor(QObject):
         """Concatenates all valid temporary segment files into the final output file."""
         print("[INFO] --- Finalizing concatenation of segments... ---")
 
+        # Check if processing stopped due to error limit
+        if self.stopped_by_error_limit:
+            print(
+                f"[WARN] Segment recording stopped due to excessive consecutive read errors ({self.consecutive_read_errors}). "
+                f"Output will be saved with '_incomplete' suffix. Total skipped frames: {self.total_skipped_frames}."
+            )
+
         # Failsafe: If this is called while an ffmpeg process is still running
         if self.recording_sp:
             segment_num = self.current_segment_index + 1
@@ -2981,6 +3029,16 @@ class VideoProcessor(QObject):
             use_job_name_for_output=use_job_name,
             output_file_name=output_file_name,
         )
+
+        # Add suffix if stopped due to error limit
+        if self.stopped_by_error_limit:
+            path_obj = Path(final_file_path)
+            final_file_path = str(
+                path_obj.parent / f"{path_obj.stem}_incomplete{path_obj.suffix}"
+            )
+            print(
+                f"[WARN] Output marked as incomplete due to excessive read errors: {final_file_path}"
+            )
 
         output_dir = os.path.dirname(final_file_path)
 
