@@ -619,6 +619,8 @@ def set_widgets_values_using_face_id_parameters(
         # print(f"Set widgets values using face_id {face_id}")
         parameters = main_window.parameters[face_id].copy()
     parameter_widgets = main_window.parameter_widgets
+    # Preserve outer suppression state so nested batch operations do not override it.
+    previous_batch_flag = getattr(main_window, "_batch_update_in_progress", False)
     # PERF-05: Set batch update flag to suppress per-widget refresh_frame calls during the loop
     main_window._batch_update_in_progress = True
     try:
@@ -631,9 +633,10 @@ def set_widgets_values_using_face_id_parameters(
                 _set_single_widget_value(widget, parameter_value)
                 widget.enable_refresh_frame = True
     finally:
-        main_window._batch_update_in_progress = False
-        # Trigger a single frame refresh after all widgets have been updated
-        refresh_frame(main_window)
+        main_window._batch_update_in_progress = previous_batch_flag
+        # Trigger a single refresh only if this function owns the outermost batch scope.
+        if not previous_batch_flag:
+            refresh_frame(main_window)
 
 
 def set_control_widgets_values(main_window: "MainWindow", enable_exec_func=True):
