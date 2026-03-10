@@ -511,7 +511,9 @@ class VideoProcessor(QObject):
                         f"[WARN] Feeder: Skipping corrupted frame {self.current_frame_number} (Total skipped: {self.total_skipped_frames}, Consecutive errors: {self.consecutive_read_errors})."
                     )
                     self.current_frame_number += 1
-                    misc_helpers.seek_frame(self.media_capture, self.current_frame_number)
+                    misc_helpers.seek_frame(
+                        self.media_capture, self.current_frame_number
+                    )
                     continue  # Skip this frame and try the next one
 
                 # Successfully read a frame, reset consecutive error counter

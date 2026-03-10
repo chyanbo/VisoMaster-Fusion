@@ -1193,7 +1193,9 @@ class FrameWorker(threading.Thread):
                     and best_target_button_vr.assigned_input_faces
                 ):
                     with self.models_processor.model_lock:
-                        if best_target_button_vr.assigned_kv_map is None: # Double Check inside lock
+                        if (
+                            best_target_button_vr.assigned_kv_map is None
+                        ):  # Double Check inside lock
                             best_target_button_vr.calculate_assigned_input_embedding()
 
                 analyzed_faces_for_vr.append(
@@ -1607,7 +1609,9 @@ class FrameWorker(threading.Thread):
                             and target_face.assigned_input_faces
                         ):
                             with self.models_processor.model_lock:
-                                if target_face.assigned_kv_map is None: # Double Check inside lock
+                                if (
+                                    target_face.assigned_kv_map is None
+                                ):  # Double Check inside lock
                                     target_face.calculate_assigned_input_embedding()
 
                         # --- MORPHING: Swap Only Best Match ---
@@ -1712,7 +1716,9 @@ class FrameWorker(threading.Thread):
                             and best_target.assigned_input_faces
                         ):
                             with self.models_processor.model_lock:
-                                if best_target.assigned_kv_map is None: # Double Check inside lock
+                                if (
+                                    best_target.assigned_kv_map is None
+                                ):  # Double Check inside lock
                                     best_target.calculate_assigned_input_embedding()
 
                         # --- MORPHING: Branch Swap All Matches ---
@@ -2606,7 +2612,9 @@ class FrameWorker(threading.Thread):
             version = swapper_model[-1]
             dim_res = dim // 2
 
-            for k in range(itex):  # FW-QUAL-06: renamed k -> _ - Fix : Restored k to prevent crash
+            for k in range(
+                itex
+            ):  # FW-QUAL-06: renamed k -> _ - Fix : Restored k to prevent crash
                 prev_face = (
                     input_face_affined.clone()
                 )  # save N-1 result before this pass
@@ -2677,7 +2685,9 @@ class FrameWorker(threading.Thread):
                     output = torch.clamp(output, 0, 255)
 
         elif swapper_model == "SimSwap512":
-            for k in range(itex):  # FW-QUAL-06: renamed k -> _ - Fix : restored k to prevent crash
+            for k in range(
+                itex
+            ):  # FW-QUAL-06: renamed k -> _ - Fix : restored k to prevent crash
                 prev_face = (
                     input_face_affined.clone()
                 )  # save N-1 result before this pass

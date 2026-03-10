@@ -188,13 +188,13 @@ def update_parameter(
         exec_function(*final_exec_args)
 
 
-def refresh_frame(main_window: "MainWindow"):
+def refresh_frame(main_window: "MainWindow", synchronous: bool = False):
     # PERF-05: Skip frame refresh if a batch update is in progress
     if getattr(main_window, "_batch_update_in_progress", False):
         return
     video_processor = main_window.video_processor
     if not video_processor.processing:
-        video_processor.process_current_frame()
+        video_processor.process_current_frame(synchronous=synchronous)
 
 
 # Function to Hide Elements conditionally from values in LayoutData (Currently supports using Selection box and Toggle button to hide other widgets)

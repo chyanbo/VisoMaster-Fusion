@@ -1,4 +1,5 @@
 """Auto-mouth: detect mouth openness from pipeline landmarks; maintain on/stay/off state."""
+
 from __future__ import annotations
 from dataclasses import dataclass
 import numpy as np

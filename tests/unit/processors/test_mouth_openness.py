@@ -1,4 +1,5 @@
 """Unit tests for app.processors.mouth_openness."""
+
 from __future__ import annotations
 
 import numpy as np
@@ -16,7 +17,10 @@ from app.processors.mouth_openness import (
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_kps_203(n: int = 203, mouth_vert: float = 10.0, mouth_horiz: float = 50.0) -> np.ndarray:
+
+def _make_kps_203(
+    n: int = 203, mouth_vert: float = 10.0, mouth_horiz: float = 50.0
+) -> np.ndarray:
     """Build a dummy kps array for the 203-point case.
 
     203-pt relevant indices:
@@ -28,13 +32,15 @@ def _make_kps_203(n: int = 203, mouth_vert: float = 10.0, mouth_horiz: float = 5
     assert n >= 203
     kps = np.zeros((n, 2), dtype=np.float32)
     kps[48] = [0.0, 0.0]
-    kps[66] = [mouth_horiz, 0.0]        # right mouth corner (horiz)
+    kps[66] = [mouth_horiz, 0.0]  # right mouth corner (horiz)
     kps[90] = [mouth_horiz / 2, 0.0]
     kps[102] = [mouth_horiz / 2, mouth_vert]
     return kps
 
 
-def _make_kps_68(n: int = 68, mouth_vert: float = 10.0, mouth_horiz: float = 50.0) -> np.ndarray:
+def _make_kps_68(
+    n: int = 68, mouth_vert: float = 10.0, mouth_horiz: float = 50.0
+) -> np.ndarray:
     """Build a dummy kps array for the 68-point case.
 
     68-pt relevant indices:
