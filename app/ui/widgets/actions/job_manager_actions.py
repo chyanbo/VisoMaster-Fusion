@@ -513,6 +513,26 @@ def _load_job_markers(main_window: "MainWindow", data: dict):
     main_window.videoSeekSlider.update()
 
 
+def _begin_batch_refresh_suppression(main_window: "MainWindow") -> bool:
+    """Suppress intermediate frame refreshes and return the previous flag value."""
+    previous_batch_flag = getattr(main_window, "_batch_update_in_progress", False)
+    main_window._batch_update_in_progress = True
+    return previous_batch_flag
+
+
+def _restore_batch_refresh_state(main_window: "MainWindow", previous_batch_flag: bool):
+    """Restore the previous frame-refresh suppression state."""
+    main_window._batch_update_in_progress = previous_batch_flag
+
+
+def _restore_state_and_refresh(
+    main_window: "MainWindow", previous_batch_flag: bool
+):
+    """Restore suppression flag and run a single final frame refresh."""
+    _restore_batch_refresh_state(main_window, previous_batch_flag)
+    common_widget_actions.refresh_frame(main_window)
+
+
 def _validate_job_files_exist(data: dict) -> tuple[bool, str | None]:
     """
     (NEW) Performs a pre-flight check on job data *before* loading.
@@ -706,6 +726,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
     )
     progress_dialog.show()
     QtWidgets.QApplication.processEvents()
+    previous_batch_flag = _begin_batch_refresh_suppression(main_window)
 
     # --- Execute Loading Steps ---
     try:
@@ -803,7 +824,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
         main_window.videoSeekSlider.update()
 
         # Final refresh ensures graphics view is up-to-date after potential parameter changes
-        common_widget_actions.refresh_frame(main_window)
+        _restore_state_and_refresh(main_window, previous_batch_flag)
 
         # --- Re-enable all UI controls after loading ---
         layout_actions.enable_all_parameters_and_control_widget(main_window)
@@ -820,6 +841,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
             f"An error occurred while loading job '{job_name}':\n{e}",
         )
     finally:
+        _restore_batch_refresh_state(main_window, previous_batch_flag)
         progress_dialog.close()
 
 
@@ -858,6 +880,7 @@ def _restore_workspace_from_snapshot(main_window: "MainWindow", data: dict):
     progress_dialog.update_progress(0, total_steps, "Initializing restore...")
     progress_dialog.show()
     QtWidgets.QApplication.processEvents()
+    previous_batch_flag = _begin_batch_refresh_suppression(main_window)
 
     # --- Execute Loading Steps ---
     try:
@@ -961,7 +984,7 @@ def _restore_workspace_from_snapshot(main_window: "MainWindow", data: dict):
         main_window.videoSeekSlider.update()
 
         # Final refresh ensures graphics view is up-to-date
-        common_widget_actions.refresh_frame(main_window)
+        _restore_state_and_refresh(main_window, previous_batch_flag)
 
         # --- Re-enable all UI controls after restoring ---
         layout_actions.enable_all_parameters_and_control_widget(main_window)
@@ -978,6 +1001,7 @@ def _restore_workspace_from_snapshot(main_window: "MainWindow", data: dict):
             f"An error occurred while restoring the workspace:\n{e}",
         )
     finally:
+        _restore_batch_refresh_state(main_window, previous_batch_flag)
         progress_dialog.close()
 
 
@@ -1389,6 +1413,7 @@ def load_job_settings(main_window: "MainWindow", job_data: dict):
     Assumes master assets are already loaded.
     """
     print("[INFO] Load job settings called.")
+    previous_batch_flag = _begin_batch_refresh_suppression(main_window)
     try:
         # Store job name context for processing
         main_window.current_job_name = job_data.get("job_name_internal", "Unknown Job")
@@ -1397,10 +1422,10 @@ def load_job_settings(main_window: "MainWindow", job_data: dict):
         )
         main_window.output_file_name = job_data.get("output_file_name", None)
 
-        # --- Re-ordered loading logic ---
+        # During job restore, suppress intermediate refreshes so the first processed
+        # frame sees fully restored controls instead of stale pre-load state.
 
-        # 1. Select the media FIRST. This triggers the (asynchronous) loading
-        # of the first frame via process_current_frame.
+        # 1. Select the media.
         selected_media_id = job_data.get("selected_media_id", False)
         if (
             selected_media_id
@@ -1422,15 +1447,17 @@ def load_job_settings(main_window: "MainWindow", job_data: dict):
                 print("[ERROR] No target media loaded, cannot proceed.")
                 # This job will likely fail, but we must continue
 
-        # 2. Load target faces and parameters. This is safe.
+        # 2. Load target faces and parameters.
         _load_job_target_faces_and_params(main_window, job_data)
 
-        # 3. Load controls. This is now safe because the swap_button logic
-        #    is fixed (is_batch_load=True) and won't trigger a bad refresh.
+        # 3. Load controls/state.
         _load_job_controls_and_state(main_window, job_data, is_batch_load=True)
 
-        # 4. Load markers. This is safe.
+        # 4. Load markers.
         _load_job_markers(main_window, job_data)
+
+        # Run exactly one refresh with the final restored state.
+        _restore_state_and_refresh(main_window, previous_batch_flag)
 
         print(
             f"[INFO] Lightweight settings loaded for job: {main_window.current_job_name}"
@@ -1445,6 +1472,7 @@ def load_job_settings(main_window: "MainWindow", job_data: dict):
             f"An error occurred while loading settings for job:\n{e}",
         )
     finally:
+        _restore_batch_refresh_state(main_window, previous_batch_flag)
         # Allow pending UI events to process before signaling completion
         QtWidgets.QApplication.processEvents()
         # Use the instance event from the job_processor

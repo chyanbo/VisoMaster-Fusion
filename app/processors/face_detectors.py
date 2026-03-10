@@ -1,4 +1,5 @@
 import threading
+import math
 from typing import TYPE_CHECKING, Dict, Any
 
 import torch
@@ -143,6 +144,62 @@ class FaceDetectors:
             det_img = (det_img - 127.5) / 128.0  # Normalize to [-1.0, 1.0] range
 
         return det_img, det_scale, input_size
+
+    def _infer_fixed_square_input_from_outputs(
+        self, ort_session, first_stride: int = 8
+    ) -> int | None:
+        """
+        Attempts to infer a fixed square model input size from the first detection head
+        output shape. For RetinaFace/SCRFD this head typically has shape {N,1} where
+        N = (input/stride)^2 * num_anchors and num_anchors is usually 2.
+        """
+        try:
+            outputs = ort_session.get_outputs()
+            if not outputs:
+                return None
+
+            shape = outputs[0].shape
+            if not shape or len(shape) < 1:
+                return None
+
+            n = shape[0]
+            if not isinstance(n, int) or n <= 0:
+                return None
+
+            # Try common anchor counts used by RetinaFace/SCRFD exports.
+            for anchors in (2, 1):
+                if n % anchors != 0:
+                    continue
+                cells = n // anchors
+                side = int(round(math.sqrt(cells)))
+                if side > 0 and side * side == cells:
+                    return side * first_stride
+        except Exception:
+            return None
+
+        return None
+
+    def _resolve_detector_input_size(
+        self, detect_mode: str, requested_input_size: tuple, ort_session
+    ) -> tuple:
+        """
+        Resolves the effective detection input size.
+        For fixed-shape RetinaFace/SCRFD exports, running at a mismatched size can spam
+        ONNX Runtime VerifyOutputSizes warnings. If a fixed square size is detectable,
+        prefer it over the requested value.
+        """
+        if detect_mode not in ("RetinaFace", "SCRFD"):
+            return requested_input_size
+
+        inferred_size = self._infer_fixed_square_input_from_outputs(ort_session)
+        if inferred_size is None:
+            return requested_input_size
+
+        requested_w, requested_h = requested_input_size
+        if requested_w == inferred_size and requested_h == inferred_size:
+            return requested_input_size
+
+        return (inferred_size, inferred_size)
 
     def _filter_detections_gpu(
         self,
@@ -564,7 +621,9 @@ class FaceDetectors:
         args.update(kwargs)
 
         if detect_mode in ["RetinaFace", "SCRFD"]:
-            args["input_size"] = input_size
+            args["input_size"] = self._resolve_detector_input_size(
+                detect_mode, input_size, ort_session
+            )
 
         # Run the detector — returns (det, kpss_5, kpss, det_scores)
         det, kpss_5, kpss, det_scores = detection_function(**args)

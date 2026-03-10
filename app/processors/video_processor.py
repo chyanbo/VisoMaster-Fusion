@@ -1624,6 +1624,25 @@ class VideoProcessor(QObject):
             # Fallback in case of an error
             return f"{total_seconds:.3f} seconds"
 
+    def _apply_job_timestamp_to_output_name(
+        self,
+        was_triggered_by_job: bool,
+        job_name: Optional[str],
+        use_job_name: bool,
+        output_file_name: Optional[str],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Appends the standard output timestamp to job-driven names."""
+        if not was_triggered_by_job:
+            return job_name, output_file_name
+
+        timestamp = datetime.now().strftime(r"%Y_%m_%d_%H_%M_%S")
+        if use_job_name and job_name:
+            job_name = f"{job_name}_{timestamp}"
+        elif output_file_name:
+            output_file_name = f"{output_file_name}_{timestamp}"
+
+        return job_name, output_file_name
+
     def _log_processing_summary(
         self, processing_time_sec: float, num_frames_processed: int
     ):
@@ -2428,6 +2447,13 @@ class VideoProcessor(QObject):
                     else None
                 )
 
+                job_name, output_file_name = self._apply_job_timestamp_to_output_name(
+                    was_triggered_by_job,
+                    job_name,
+                    use_job_name,
+                    output_file_name,
+                )
+
                 final_file_path = misc_helpers.get_output_file_path(
                     self.media_path,
                     self.main_window.control["OutputMediaFolder"],
@@ -3026,6 +3052,13 @@ class VideoProcessor(QObject):
             getattr(self.main_window, "output_file_name", None)
             if was_triggered_by_job
             else None
+        )
+
+        job_name, output_file_name = self._apply_job_timestamp_to_output_name(
+            was_triggered_by_job,
+            job_name,
+            use_job_name,
+            output_file_name,
         )
 
         final_file_path = misc_helpers.get_output_file_path(
