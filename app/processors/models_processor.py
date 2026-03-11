@@ -219,6 +219,11 @@ class ModelsProcessor(QtCore.QObject):
         self.main_window = main_window
         self.K = K  # Assign the module-level K to an instance attribute
         self.provider_name = "TensorRT"
+        # NOTE: internal_deep_copied_kv_map / internal_kv_map_source_filename were
+        # placeholder attributes for a planned per-session KV-map cache.  They are
+        # currently unused (never written after __init__).  If a future feature
+        # populates them, ensure a matching cleanup path is added to the force-unload
+        # path (delete_models_dfm / force_unload path) so the tensors are freed.
         self.internal_deep_copied_kv_map: Dict[str, Dict[str, torch.Tensor]] | None = (
             None
         )
@@ -328,8 +333,13 @@ class ModelsProcessor(QtCore.QObject):
         # NOTE: vae_scale_factor=1.0 is intentional for this model's specific VAE configuration
         self.vae_scale_factor = 1.0
 
-        # Cache for DDIM schedule tensors, keyed by (ddim_steps, ddim_eta)
-        self._ddim_schedule_cache: dict = {}
+        # Cache for DDIM schedule tensors, keyed by (ddim_steps, ddim_eta).
+        # Bounded LRU: each entry holds ~4 GPU tensors; at most 20 unique step/eta
+        # combos are expected in practice (steps 1–100, eta 0.0 or 1.0).
+        from collections import OrderedDict as _OD
+
+        self._ddim_schedule_cache: _OD = _OD()
+        self._DDIM_CACHE_MAX = 20
 
         self.clip_session: list = []
 
@@ -826,6 +836,8 @@ class ModelsProcessor(QtCore.QObject):
                     del model_instance
                     self.dfm_models.pop(model_name)
                     gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
                 self.dfm_models[dfm_model] = DFMModel(
                     self.main_window.dfm_model_manager.get_models_data()[dfm_model],
@@ -1088,6 +1100,10 @@ class ModelsProcessor(QtCore.QObject):
         self.providers = providers
         self.provider_name = provider_name
         self.lp_mask_crop = self.lp_mask_crop.to(self.device)
+        # Also move auxiliary tensors that are used alongside lp_mask_crop so
+        # they remain on the same device and do not cause device-mismatch errors.
+        self.lp_mask_crop_latent = self.lp_mask_crop_latent.to(self.device)
+        self.alphas_cumprod_torch = self.alphas_cumprod_torch.to(self.device)
 
         return self.provider_name
 
@@ -1880,7 +1896,8 @@ class ModelsProcessor(QtCore.QObject):
 
         ENABLE_COLOR_MATCH = True
 
-        DEBUG_DENOISER = False
+        # P2-04: enable debug output via env var: set VISOMASTER_DEBUG_DENOISER=1
+        DEBUG_DENOISER = os.environ.get("VISOMASTER_DEBUG_DENOISER", "0") == "1"
         unet_model_name = self.main_window.fixed_unet_model_name
         vae_encoder_name = "RefLDMVAEEncoder"
         vae_decoder_name = "RefLDMVAEDecoder"
@@ -2054,8 +2071,11 @@ class ModelsProcessor(QtCore.QObject):
                     num_ddpm_timesteps = self.alphas_cumprod_np.shape[0]
 
                     # MP-11: Cache the DDIM schedule to avoid recomputing on every call.
+                    # LRU-bounded: evict oldest entry when at capacity.
                     _ddim_cache_key = (denoiser_ddim_steps, denoiser_ddim_eta)
-                    if _ddim_cache_key not in self._ddim_schedule_cache:
+                    if _ddim_cache_key in self._ddim_schedule_cache:
+                        self._ddim_schedule_cache.move_to_end(_ddim_cache_key)
+                    else:
                         _ddim_raw_ddpm_timesteps_np = (
                             ModelsProcessor.make_ddim_timesteps(
                                 ddim_discr_method="uniform",
@@ -2086,6 +2106,8 @@ class ModelsProcessor(QtCore.QObject):
                         _ddim_sqrt_one_minus_alphas = torch.sqrt(
                             torch.clamp(1.0 - _ddim_alphas, min=0.0)
                         )
+                        if len(self._ddim_schedule_cache) >= self._DDIM_CACHE_MAX:
+                            self._ddim_schedule_cache.popitem(last=False)
                         self._ddim_schedule_cache[_ddim_cache_key] = (
                             _ddim_raw_ddpm_timesteps_np,
                             _ddim_sigmas,

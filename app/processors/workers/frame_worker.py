@@ -14,7 +14,6 @@ import kornia.geometry.transform as kgm
 
 from torchvision.transforms import v2
 import torchvision
-from torchvision import transforms
 
 import numpy as np
 import torch.nn.functional as F
@@ -62,6 +61,9 @@ class FrameWorker(threading.Thread):
 
     # Q-QUAL-03: EMA alpha for AutoColor reference statistics
     _COLOR_EMA_ALPHA: float = 0.30
+
+    # P3-06: reusable GaussianBlur for _fix_drift_and_texture (stateless, device-agnostic)
+    _DRIFT_TEXTURE_BLUR = v2.GaussianBlur(kernel_size=5, sigma=1.0)
 
     # Q-IMP-04: minimum face bounding-box side length (pixels) to process
     _MIN_FACE_PIXELS: int = 20
@@ -125,6 +127,11 @@ class FrameWorker(threading.Thread):
         self._gabor_kernels_cache: _OrderedDict = (
             _OrderedDict()
         )  # keyed by (kernel_size,sigma,lambd,gamma,psi,N,device_str)
+        # FW-MEM-02: resize-object cache — bounded LRU to avoid accumulating
+        # v2.Resize instances for every unique (H, W, interp) combination seen
+        # across variable-resolution inputs.
+        self._resize_cache: _OrderedDict = _OrderedDict()
+        self._RESIZE_CACHE_MAX = 16
 
         # --- Architecture References ---
         self.main_window = main_window
@@ -191,14 +198,14 @@ class FrameWorker(threading.Thread):
         # Dirty-check cache for set_scaling_transforms (FW-PERF-07)
         self._last_scaling_control: dict | None = None
 
-        # Resize object cache (FW-PERF-08)
-        self._resize_cache: dict = {}
-
         # Q-QUAL-01: EMA-smoothed keypoints to reduce detection-interval flicker
         self._smoothed_kps: dict[int, np.ndarray] = {}
 
-        # Q-QUAL-03: EMA over per-face AutoColor reference statistics to reduce flicker
-        self._color_stats_ema: dict[bytes, dict] = {}
+        # Q-QUAL-03: EMA over per-face AutoColor reference statistics to reduce flicker.
+        # Bounded LRU: keyed by embedding bytes (one entry per unique target face seen).
+        # Typical usage: 1–10 entries.  Cap at 32 to handle large session edge cases.
+        self._color_stats_ema: _OrderedDict = _OrderedDict()
+        self._COLOR_STATS_EMA_MAX = 32
 
         # --- OPTIMIZATION: Cached Convolution Kernels (VRAM) ---
         # Pre-allocating mathematical filters prevents massive CPU-to-GPU
@@ -339,6 +346,9 @@ class FrameWorker(threading.Thread):
         Processes self.frame using the configured parameters and emits the result signal.
         Does NOT interact with the task queue.
         """
+        # Snapshot original RGB frame BEFORE the try block so the except handler
+        # always has a valid fallback regardless of where the exception is thrown.
+        _fallback_frame_rgb = self.frame
         try:
             local_control_state = self.local_control_state_from_feeder
 
@@ -415,6 +425,29 @@ class FrameWorker(threading.Thread):
         except Exception as e:
             print(f"[ERROR] Error in {self.name} (frame {self.frame_number}): {e}")
             traceback.print_exc()
+            # Emit the original (unprocessed) frame as a fallback so the recording
+            # metronome is never blocked waiting for a frame that will never arrive.
+            # Only do this for pool/video mode — single-frame and webcam have their
+            # own error recovery paths.
+            if (
+                not self.stop_event.is_set()
+                and not self.is_single_frame
+                and self.video_processor.file_type != "webcam"
+                and isinstance(_fallback_frame_rgb, np.ndarray)
+            ):
+                try:
+                    fallback_bgr = np.ascontiguousarray(_fallback_frame_rgb[..., ::-1])
+                    fallback_pixmap = common_widget_actions.get_pixmap_from_frame(
+                        self.main_window, fallback_bgr
+                    )
+                    self.video_processor.frame_processed_signal.emit(
+                        self.frame_number, fallback_pixmap, fallback_bgr
+                    )
+                except Exception as fb_err:
+                    print(
+                        f"[WARN] Fallback emit also failed for frame "
+                        f"{self.frame_number}: {fb_err}"
+                    )
 
     def _apply_denoiser_pass(
         self,
@@ -1863,10 +1896,14 @@ class FrameWorker(threading.Thread):
                 new_h, new_w = 512, int(512 * img_w / img_h)
             # FW-ROBUST-2: respect the user's interpolation setting rather than
             # always using the default (NEAREST / BILINEAR depending on build)
-            # FW-PERF-08: cache v2.Resize objects keyed by (h, w, interp) to avoid
-            # re-constructing the same transform on every frame
+            # FW-PERF-08 / FW-MEM-02: LRU-bounded cache of v2.Resize objects to avoid
+            # re-constructing the same transform on every frame (max 16 entries).
             _up_key = (new_h, new_w, self.interpolation_scaleback, False)
-            if _up_key not in self._resize_cache:
+            if _up_key in self._resize_cache:
+                self._resize_cache.move_to_end(_up_key)
+            else:
+                if len(self._resize_cache) >= self._RESIZE_CACHE_MAX:
+                    self._resize_cache.popitem(last=False)
                 self._resize_cache[_up_key] = v2.Resize(
                     (new_h, new_w),
                     interpolation=self.interpolation_scaleback,
@@ -2249,9 +2286,13 @@ class FrameWorker(threading.Thread):
             )
         if scale_applied:
             # FW-QUAL-11: use renamed img_h/img_w variables
-            # FW-PERF-08: reuse cached Resize object for the scale-back transform
+            # FW-PERF-08 / FW-MEM-02: LRU-bounded cache for the scale-back transform.
             _down_key = (img_h, img_w, self.interpolation_scaleback, False)
-            if _down_key not in self._resize_cache:
+            if _down_key in self._resize_cache:
+                self._resize_cache.move_to_end(_down_key)
+            else:
+                if len(self._resize_cache) >= self._RESIZE_CACHE_MAX:
+                    self._resize_cache.popitem(last=False)
                 self._resize_cache[_down_key] = v2.Resize(
                     (img_h, img_w),
                     interpolation=self.interpolation_scaleback,
@@ -2859,9 +2900,8 @@ class FrameWorker(threading.Thread):
 
         H, W = gray_curr.shape[1], gray_curr.shape[2]
 
-        blur_op = v2.GaussianBlur(kernel_size=5, sigma=1.0)
-        gray_curr_blurred = blur_op(gray_curr)
-        gray_anchor_blurred = blur_op(gray_anchor)
+        gray_curr_blurred = self._DRIFT_TEXTURE_BLUR(gray_curr)
+        gray_anchor_blurred = self._DRIFT_TEXTURE_BLUR(gray_anchor)
 
         window_y = torch.hann_window(H, device=device).view(H, 1)
         window_x = torch.hann_window(W, device=device).view(1, W)
@@ -2901,9 +2941,9 @@ class FrameWorker(threading.Thread):
 
         # --- 2. TEXTURE & COLOR PRESERVATION ---
         if blend_texture and first_face is not None:
-            # --- NOUVEAU : Color & Luminance Lock (AdaIN) ---
-            # Calcule les statistiques de couleur de la TOUTE PREMIÈRE passe
-            # et force l'itération actuelle à respecter cette même distribution.
+            # --- Color & Luminance Lock (AdaIN) ---
+            # Compute colour statistics of the very first pass and force the
+            # current iteration to match that same distribution.
             # Cela bloque totalement l'effondrement vers des visages pâles/yeux bleus.
             mean_first = first_face.mean(dim=(1, 2), keepdim=True)
             std_first = first_face.std(dim=(1, 2), keepdim=True) + 1e-6
@@ -3310,12 +3350,17 @@ class FrameWorker(threading.Thread):
                 f"DFM model must return HWC RGB tensor, got shape {out_celeb.shape}"
             )
             # DFM is a single pass — prev_face fallback set before the if/elif chain is used
-            input_face_affined = out_celeb.clone()
-            output = out_celeb.clone()
+            input_face_affined = (
+                out_celeb.clone()
+            )  # HWC float [0,1] — becomes prev_face; scaled ×255 later in swap_core
+            output = (
+                out_celeb * 255.0
+            )  # BUG-01 fix: scale [0,1]→[0,255] to match all other swapper outputs
 
-        # FW-QUAL-08: warn when all tiles produced zero output (model returned blank)
-        if output.abs().max() < 1.0:
-            print("[WARN] All tiles failed for face — output is all-zero")
+        # FW-QUAL-08: warn when all tiles produced zero output (model returned blank).
+        # Threshold 30.0 works for the unified [0,255] scale used by all models (incl. DFM after fix above).
+        if output.abs().max() < 30.0:
+            print("[WARN] All tiles failed for face — output is near-zero")
 
         output = output.permute(2, 0, 1)
         swap = self.t512(output)
@@ -3336,13 +3381,11 @@ class FrameWorker(threading.Thread):
         right = 128 - parameters["BorderRightSlider"]
         bottom = 128 - parameters["BorderBottomSlider"]
 
-        # FW-BUG-12: validate border values to prevent silent tensor indexing bugs
-        assert 0 <= left <= right <= 128, (
-            f"Border mask left/right out of range: {left}, {right}"
-        )
-        assert 0 <= top <= bottom <= 128, (
-            f"Border mask top/bottom out of range: {top}, {bottom}"
-        )
+        # P3-02: clamp border values instead of assert (assert is disabled under -O)
+        left = max(0, min(left, 128))
+        right = max(left, min(right, 128))
+        top = max(0, min(top, 128))
+        bottom = max(top, min(bottom, 128))
 
         border_mask[:, :top, :] = 0
         border_mask[:, bottom:, :] = 0
@@ -3355,7 +3398,7 @@ class FrameWorker(threading.Thread):
         blur_kernel_size = blur_amount * 2 + 1
         if blur_kernel_size > 1:
             sigma_val = max(blur_amount * 0.15 + 0.1, 1e-6)
-            gauss = transforms.GaussianBlur(blur_kernel_size, sigma=sigma_val)
+            gauss = v2.GaussianBlur(blur_kernel_size, sigma=sigma_val)
             border_mask = gauss(border_mask)
         return border_mask, border_mask_calc
 
@@ -3482,9 +3525,7 @@ class FrameWorker(threading.Thread):
             if blur_value2 > 0:
                 kernel_size = 2 * blur_value2 + 1
                 sigma = blur_value2 * 0.1
-                gaussian_blur = transforms.GaussianBlur(
-                    kernel_size=kernel_size, sigma=sigma
-                )
+                gaussian_blur = v2.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
                 swap = gaussian_blur(swap_original2)
                 debug_info[debug_key] = f": {-blur_value2:.2f}"
             elif isinstance(alpha_auto2, torch.Tensor):
@@ -3938,7 +3979,7 @@ class FrameWorker(threading.Thread):
                 )(mask)
             swap_mask = torch.mul(swap_mask, mask)
 
-            gauss = transforms.GaussianBlur(
+            gauss = v2.GaussianBlur(
                 parameters["OccluderXSegBlurSlider"] * 2 + 1,
                 (parameters["OccluderXSegBlurSlider"] + 1) * 0.2,
             )
@@ -4060,7 +4101,7 @@ class FrameWorker(threading.Thread):
 
             if parameters.get("RestoreEyesMouthBlurSlider", 0) > 0:
                 b = parameters["RestoreEyesMouthBlurSlider"]
-                gauss = transforms.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
+                gauss = v2.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
                 img_swap_mask = gauss(img_swap_mask)
 
             if img_swap_mask.shape[-1] != swap_mask.shape[-1]:
@@ -4179,9 +4220,7 @@ class FrameWorker(threading.Thread):
             if blur_value > 0:
                 kernel_size = 2 * blur_value + 1
                 sigma = blur_value * 0.1
-                gaussian_blur = transforms.GaussianBlur(
-                    kernel_size=kernel_size, sigma=sigma
-                )
+                gaussian_blur = v2.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
                 swap = gaussian_blur(swap_original)
                 debug_info["Restore1"] = f": {-blur_value:.2f}"
             elif isinstance(alpha_auto, torch.Tensor):
@@ -4323,6 +4362,7 @@ class FrameWorker(threading.Thread):
             _curr_mean = _face_f.mean(dim=(1, 2), keepdim=True)
             _curr_std = _face_f.std(dim=(1, 2), keepdim=True) + 1e-6
             if _ema_key in self._color_stats_ema:
+                self._color_stats_ema.move_to_end(_ema_key)
                 _prev = self._color_stats_ema[_ema_key]
                 _ema_mean = (
                     self._COLOR_EMA_ALPHA * _curr_mean
@@ -4334,6 +4374,9 @@ class FrameWorker(threading.Thread):
                 )
             else:
                 _ema_mean, _ema_std = _curr_mean, _curr_std
+                # LRU eviction before inserting a new entry
+                if len(self._color_stats_ema) >= self._COLOR_STATS_EMA_MAX:
+                    self._color_stats_ema.popitem(last=False)
             self._color_stats_ema[_ema_key] = {
                 "mean": _ema_mean.detach(),
                 "std": _ema_std.detach(),
@@ -4431,7 +4474,7 @@ class FrameWorker(threading.Thread):
                 # Optional VGG specific blur
                 if parameters.get("TextureBlendAmountSlider", 0) > 0:
                     b = parameters["TextureBlendAmountSlider"]
-                    gauss = transforms.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
+                    gauss = v2.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
                     mask_vgg_512 = gauss(mask_vgg_512.float())
 
             # 3. Features Exclusion Logic (Eyes, Mouth, etc.)
@@ -4445,7 +4488,7 @@ class FrameWorker(threading.Thread):
                     if blur_val > 0:
                         kernel_size = int(blur_val * 2 + 1)
                         sigma = max((blur_val + 1) * 0.2, 1e-6)
-                        blur_op = transforms.GaussianBlur(kernel_size, sigma=sigma)
+                        blur_op = v2.GaussianBlur(kernel_size, sigma=sigma)
                         feature_mask = blur_op(feature_mask)
 
                 # Combine VGG mask with the spatial FaceParser mask
@@ -4479,7 +4522,7 @@ class FrameWorker(threading.Thread):
             #     orig_m = mask_final_512.clone()
             #     b_fp = parameters["FaceParserBlurTextureSlider"]
             #     kernel_size = int(b_fp * 2 + 1)
-            #     gauss = transforms.GaussianBlur(kernel_size, (b_fp + 1) * 0.2)
+            #     gauss = v2.GaussianBlur(kernel_size, (b_fp + 1) * 0.2)
             #     mask_final_512 = gauss(mask_final_512.type(torch.float32))
             #     # Restore sharp inner boundaries while softening the gradients
             #     mask_final_512 = torch.max(mask_final_512, orig_m).clamp(0.0, 1.0)
@@ -4538,7 +4581,7 @@ class FrameWorker(threading.Thread):
 
             if parameters["FaceParserBlurTextureSlider"] > 0:
                 orig = mask_final_512.clone()
-                gauss = transforms.GaussianBlur(
+                gauss = v2.GaussianBlur(
                     parameters["FaceParserBlurTextureSlider"] * 2 + 1,
                     (parameters["FaceParserBlurTextureSlider"] + 1) * 0.2,
                 )
@@ -4609,7 +4652,7 @@ class FrameWorker(threading.Thread):
             mask512 = t512_mask(piece)
             if parameters.get("DifferencingBlendAmountSlider", 0) > 0:
                 b = parameters["DifferencingBlendAmountSlider"]
-                gauss = transforms.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
+                gauss = v2.GaussianBlur(b * 2 + 1, (b + 1) * 0.2)
                 mask512 = gauss(mask512.float())
 
             mask512 = torch.max((mask512), 1 - calc_mask_dill)
@@ -4799,9 +4842,7 @@ class FrameWorker(threading.Thread):
             final_blur_strength = parameters["FinalBlendAmountSlider"]
             kernel_size = 2 * final_blur_strength + 1
             sigma = final_blur_strength * 0.1
-            gaussian_blur = transforms.GaussianBlur(
-                kernel_size=kernel_size, sigma=sigma
-            )
+            gaussian_blur = v2.GaussianBlur(kernel_size=kernel_size, sigma=sigma)
             swap = gaussian_blur(swap)
 
         # Artefacts: Jpeg
@@ -4873,7 +4914,7 @@ class FrameWorker(threading.Thread):
             return t512_mask(swap), t512_mask(swap_mask), None
 
         # Mask Post-Processing (Final Blend)
-        gauss = transforms.GaussianBlur(
+        gauss = v2.GaussianBlur(
             parameters["OverallMaskBlendAmountSlider"] * 2 + 1,
             (parameters["OverallMaskBlendAmountSlider"] + 1) * 0.2,
         )
@@ -5091,7 +5132,7 @@ class FrameWorker(threading.Thread):
         expand_cache_key = (*kernels.shape, C)
         if expand_cache_key not in self._gabor_kernels_cache:
             # FW-MEM-01: bound the LRU cache size
-            MAX_GABOR_CACHE = 32
+            MAX_GABOR_CACHE = 16
             if len(self._gabor_kernels_cache) >= MAX_GABOR_CACHE:
                 self._gabor_kernels_cache.popitem(last=False)
             self._gabor_kernels_cache[expand_cache_key] = kernels.repeat_interleave(
@@ -5218,9 +5259,9 @@ class FrameWorker(threading.Thread):
                 # FW-PERF-10: precompute GaussianBlur objects outside the scoring loop
                 blur_kernels_for_auto = [
                     (
-                        transforms.GaussianBlur(1, 1e-6)
+                        v2.GaussianBlur(1, 1e-6)
                         if bs == 0
-                        else transforms.GaussianBlur(2 * bs + 1, max(bs, 1e-6))
+                        else v2.GaussianBlur(2 * bs + 1, max(bs, 1e-6))
                     )
                     for bs in range(0, max_blur_strength + 1)
                 ]
@@ -5429,7 +5470,7 @@ class FrameWorker(threading.Thread):
         if smooth_kernel and smooth_kernel >= 3:
             k = smooth_kernel
             smap3 = smap.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-            gb = transforms.GaussianBlur(kernel_size=k, sigma=max(1, k // 2))
+            gb = v2.GaussianBlur(kernel_size=k, sigma=max(1, k // 2))
             smap = gb(smap3).squeeze(0).squeeze(0)
 
         return smap.clamp(0, 1)

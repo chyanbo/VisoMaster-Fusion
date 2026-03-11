@@ -59,7 +59,16 @@ class FaceReaging:
             return face_chw_uint8
 
         try:
-            face_float = face_chw_uint8.cpu().float() / 255.0  # (3, H, W) in [0,1]
+            # BUG-09: normalise to [0,1] float regardless of caller's tensor dtype/scale.
+            #   uint8        → divide by 255  (normal path)
+            #   float [0,1]  → use as-is      (already normalised)
+            #   float [0,255]→ divide by 255  (pipeline float tensors before paste step)
+            _f = face_chw_uint8.cpu().float()
+            if face_chw_uint8.dtype == torch.uint8 or _f.max() > 2.0:
+                face_float = _f / 255.0
+            else:
+                face_float = _f  # already in [0,1]
+            del _f
             _, h, w = face_float.shape
 
             src_ch = torch.full((1, h, w), source_age / 100.0, dtype=torch.float32)
@@ -76,7 +85,7 @@ class FaceReaging:
 
             delta = torch.from_numpy(out_np).squeeze(0)  # (3,H,W)
             aged = torch.clamp(face_float + delta, 0.0, 1.0)
-            return (aged * 255).to(torch.uint8)
+            return (aged * 255).to(torch.uint8).cpu()  # P3-05: always return on CPU
 
         except Exception as exc:
             print(f"[ERROR] FaceReaging.apply_reaging: {exc}")

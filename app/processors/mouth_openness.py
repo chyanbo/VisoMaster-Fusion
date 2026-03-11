@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 from dataclasses import dataclass, field
+import threading
 import numpy as np
 
 # Minimum pixel span of the mouth (corners) to trust the ratio calculation.
@@ -66,6 +67,10 @@ class MouthOpennessState:
     active: bool = False
     ema: float = 0.0
     none_streak: int = field(default=0, compare=False, repr=False)
+    # P2-06: guards concurrent access from multiple FrameWorker threads
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, compare=False, repr=False, init=False
+    )
 
     def update(
         self,
@@ -81,40 +86,43 @@ class MouthOpennessState:
         """
         deactivate_threshold = threshold * 0.75
 
-        if ratio is None:
-            # Rule 2: stay; manage occlusion timeout
-            if self.active:
-                self.none_streak += 1
-                if self.none_streak > OCCLUSION_TIMEOUT_FRAMES:
-                    # Slow EMA decay so the feature fades out instead of snapping off
-                    self.ema *= 0.92
-                    if self.ema < deactivate_threshold:
-                        self.active = False
-                        self.none_streak = 0
+        with self._lock:
+            if ratio is None:
+                # Rule 2: stay; manage occlusion timeout
+                if self.active:
+                    self.none_streak += 1
+                    if self.none_streak > OCCLUSION_TIMEOUT_FRAMES:
+                        # Slow EMA decay so the feature fades out instead of snapping off
+                        self.ema *= 0.92
+                        if self.ema < deactivate_threshold:
+                            self.active = False
+                            self.none_streak = 0
+                return self.active, self.ema
+
+            # Valid ratio received — reset occlusion counter
+            self.none_streak = 0
+
+            # Rule 1: immediate first-frame activation (skip cold-start ramp)
+            if not self.active and ratio >= threshold:
+                self.ema = ratio
+                self.active = True
+                return True, self.ema
+
+            # Normal EMA update
+            self.ema = alpha * ratio + (1.0 - alpha) * self.ema
+
+            # Hysteresis: activate at threshold, deactivate at threshold * 0.75
+            # (25% band prevents rapid on/off toggling near the boundary)
+            if not self.active and self.ema >= threshold:
+                self.active = True
+            elif self.active and self.ema < deactivate_threshold:
+                self.active = False
+
             return self.active, self.ema
-
-        # Valid ratio received — reset occlusion counter
-        self.none_streak = 0
-
-        # Rule 1: immediate first-frame activation (skip cold-start ramp)
-        if not self.active and ratio >= threshold:
-            self.ema = ratio
-            self.active = True
-            return True, self.ema
-
-        # Normal EMA update
-        self.ema = alpha * ratio + (1.0 - alpha) * self.ema
-
-        # Hysteresis: activate at threshold, deactivate at threshold * 0.75
-        if not self.active and self.ema >= threshold:
-            self.active = True
-        elif self.active and self.ema < deactivate_threshold:
-            self.active = False
-
-        return self.active, self.ema
 
     def reset(self) -> None:
         """Reset state to inactive (call when switching target faces or disabling)."""
-        self.active = False
-        self.ema = 0.0
-        self.none_streak = 0
+        with self._lock:
+            self.active = False
+            self.ema = 0.0
+            self.none_streak = 0

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 import numpy as np
 import pytest
 
@@ -418,3 +419,110 @@ class TestMouthOpennessState:
         )
         proportion2 = min(1.0, max(0.0, (ema2 - threshold) / ramp_range))
         assert proportion2 == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# UT-03: Occlusion decay is continuous — fires on every frame AFTER timeout
+# ---------------------------------------------------------------------------
+
+
+class TestOcclusionDecayContinuous:
+    """UT-03: Verify that EMA decay is applied on every frame past the timeout
+    (not just once at the boundary).  Continuous decay is the intended behaviour
+    to produce a smooth fade-out rather than a single step.
+    """
+
+    def test_decay_applied_on_every_frame_after_timeout(self):
+        state = MouthOpennessState(active=True, ema=0.5)
+        threshold = 0.20
+
+        # Advance exactly to the timeout boundary — decay should not fire yet
+        for _ in range(OCCLUSION_TIMEOUT_FRAMES):
+            state.update(ratio=None, alpha=0.4, threshold=threshold)
+        assert state.ema == pytest.approx(0.5)
+
+        # Each subsequent None frame should keep decaying
+        ema_prev = state.ema
+        for _ in range(5):
+            state.update(ratio=None, alpha=0.4, threshold=threshold)
+            assert state.ema < ema_prev, (
+                "EMA should decrease on each frame past timeout"
+            )
+            ema_prev = state.ema
+
+    def test_decay_not_applied_at_exact_timeout_boundary(self):
+        """none_streak == OCCLUSION_TIMEOUT_FRAMES: condition is >, so no decay yet."""
+        state = MouthOpennessState(active=True, ema=0.5)
+        # Feed exactly OCCLUSION_TIMEOUT_FRAMES None frames
+        for _ in range(OCCLUSION_TIMEOUT_FRAMES):
+            state.update(ratio=None, alpha=0.4, threshold=0.2)
+        # EMA must still be 0.5 — no decay at the boundary
+        assert state.ema == pytest.approx(0.5)
+
+    def test_ema_monotonically_decreases_after_timeout(self):
+        state = MouthOpennessState(active=True, ema=0.5)
+        emas = [0.5]
+        for _ in range(OCCLUSION_TIMEOUT_FRAMES + 30):
+            state.update(ratio=None, alpha=0.4, threshold=0.2)
+            emas.append(state.ema)
+
+        post_timeout = emas[OCCLUSION_TIMEOUT_FRAMES + 1 :]
+        for i in range(1, len(post_timeout)):
+            assert post_timeout[i] <= post_timeout[i - 1]
+
+
+# ---------------------------------------------------------------------------
+# UT-08: MouthOpennessState thread safety
+# ---------------------------------------------------------------------------
+
+
+class TestMouthOpennessStateThreadSafety:
+    """UT-08: Concurrent update() calls from two threads must not corrupt state."""
+
+    def test_concurrent_updates_do_not_raise(self):
+        """Two threads calling update() simultaneously should not raise exceptions."""
+        state = MouthOpennessState(active=True, ema=0.5)
+        errors: list = []
+
+        def worker(ratio_val):
+            try:
+                for _ in range(200):
+                    state.update(ratio=ratio_val, alpha=0.4, threshold=0.2)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = threading.Thread(target=worker, args=(0.3,))
+        t2 = threading.Thread(target=worker, args=(None,))
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f"Thread-safety violation: {errors}"
+
+    def test_concurrent_reset_and_update_do_not_raise(self):
+        state = MouthOpennessState(active=True, ema=0.8)
+        errors: list = []
+
+        def updater():
+            try:
+                for _ in range(200):
+                    state.update(ratio=0.3, alpha=0.4, threshold=0.2)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        def resetter():
+            try:
+                for _ in range(50):
+                    state.reset()
+            except Exception as exc:  # noqa: BLE001
+                errors.append(exc)
+
+        t1 = threading.Thread(target=updater)
+        t2 = threading.Thread(target=resetter)
+        t1.start()
+        t2.start()
+        t1.join()
+        t2.join()
+
+        assert errors == [], f"Thread-safety violation during reset: {errors}"

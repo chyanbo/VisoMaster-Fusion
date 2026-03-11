@@ -842,6 +842,19 @@ class TargetFaceCardButton(CardButton):
             main_window, self.face_id
         )  # Remove parameters for the face from all markers
         common_widget_actions.refresh_frame(self.main_window)
+
+        # Explicitly release large data before Qt schedules widget destruction.
+        # KV maps can be 10–100 MB; embeddings are smaller but numpy arrays that
+        # benefit from prompt deallocation.  deleteLater() only schedules the C++
+        # widget object; Python-side attributes survive until GC runs otherwise.
+        self.assigned_kv_map = None
+        self.aged_kv_map = None
+        self.assigned_input_embedding.clear()
+        self.aged_input_embedding.clear()
+        self.embedding_store.clear()
+        self.assigned_input_faces.clear()
+        self.assigned_merged_embeddings.clear()
+
         self.deleteLater()
 
     def remove_assigned_input_face(self, input_face_id):

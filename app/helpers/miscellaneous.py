@@ -2,7 +2,7 @@ import os
 import shutil
 import cv2
 import time
-from collections import UserDict
+from collections import UserDict, OrderedDict
 import hashlib
 import numpy as np
 from functools import wraps
@@ -22,8 +22,10 @@ lock = threading.Lock()
 
 # --- Global Scope ---
 
-# scaling transforms cache dictionary at the module level
-_transform_cache: Dict[tuple, tuple] = {}
+# Scaling transforms cache — bounded LRU so long sessions with many interpolation
+# setting changes cannot grow this indefinitely.  In practice 2–5 entries are used.
+_transform_cache: OrderedDict = OrderedDict()
+_TRANSFORM_CACHE_MAX = 32
 image_extensions = (
     ".jpg",
     ".jpeg",
@@ -281,6 +283,7 @@ def get_scaling_transforms(control_params: dict) -> tuple:
 
     # Performance check: If this exact configuration is already in the cache, return it immediately.
     if config_key in _transform_cache:
+        _transform_cache.move_to_end(config_key)  # refresh LRU position
         return _transform_cache[config_key]
 
     # --- If not cached, create the new set of transforms ---
@@ -368,6 +371,9 @@ def get_scaling_transforms(control_params: dict) -> tuple:
     )
 
     # Save the result in the cache before returning it.
+    # Evict the oldest entry first if the cache is at capacity (LRU).
+    if len(_transform_cache) >= _TRANSFORM_CACHE_MAX:
+        _transform_cache.popitem(last=False)
     _transform_cache[config_key] = result
 
     return result
@@ -879,7 +885,10 @@ def keypoints_adjustments(
         kps_5_adj[:, 1] *= 1 + parameters["KpsScaleSlider"] / 100.0
         kps_5_adj[:, 1] += 255
 
-    if parameters.get("LandmarksPositionAdjEnableToggle", False):
+    if (
+        parameters.get("LandmarksPositionAdjEnableToggle", False)
+        and kps_5_adj.shape[0] >= 5
+    ):
         kps_5_adj[0][0] += parameters["EyeLeftXAmountSlider"]
         kps_5_adj[0][1] += parameters["EyeLeftYAmountSlider"]
         kps_5_adj[1][0] += parameters["EyeRightXAmountSlider"]

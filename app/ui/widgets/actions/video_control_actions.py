@@ -1210,15 +1210,23 @@ def on_slider_released(main_window: "MainWindow"):
 
 
 def process_swap_faces(main_window: "MainWindow"):
-    """Triggers a single-frame re-process after the Swap Faces button state changes."""
+    """Triggers a single-frame re-process after the Swap Faces button state changes.
+
+    Runs synchronously so the processed result (including any required model loading)
+    is applied to the currently displayed frame before control returns to the UI,
+    matching the behaviour of the single-frame-step advance button.
+    """
     video_processor = main_window.video_processor
-    video_processor.process_current_frame()
+    video_processor.process_current_frame(synchronous=True)
 
 
 def process_edit_faces(main_window: "MainWindow"):
-    """Triggers a single-frame re-process after the Edit Faces button state changes."""
+    """Triggers a single-frame re-process after the Edit Faces button state changes.
+
+    Runs synchronously for the same reason as process_swap_faces.
+    """
     video_processor = main_window.video_processor
-    video_processor.process_current_frame()
+    video_processor.process_current_frame(synchronous=True)
 
 
 def process_compare_checkboxes(main_window: "MainWindow"):

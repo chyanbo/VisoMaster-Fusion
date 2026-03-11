@@ -631,8 +631,10 @@ def apply_face_reaging(main_window: "MainWindow", *_args) -> None:
         from app.processors.models_data import arcface_mapping_model_dict
 
         _valid_arcface_models: set = set(arcface_mapping_model_dict.values())
+        # P2-01: guard against None / empty assigned_input_embedding
+        _assigned = target_face.assigned_input_embedding
         models_to_compute = (
-            set(target_face.assigned_input_embedding.keys()) & _valid_arcface_models
+            (set(_assigned.keys()) & _valid_arcface_models) if _assigned else set()
         )
         if not models_to_compute:
             models_to_compute = _valid_arcface_models
@@ -673,6 +675,12 @@ def apply_face_reaging(main_window: "MainWindow", *_args) -> None:
                 target_face.aged_kv_map = None
         else:
             target_face.aged_kv_map = None
+
+        # P2-02: release GPU memory accumulated during re-aging + embedding + KV map passes
+        import torch as _torch
+
+        if _torch.cuda.is_available():
+            _torch.cuda.empty_cache()
 
         print(
             f"[INFO] apply_face_reaging: Applied (source={source_age}, target={target_age_val}) "

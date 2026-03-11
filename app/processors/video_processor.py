@@ -35,7 +35,8 @@ from app.helpers.typing_helper import ControlTypes, FacesParametersTypes
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
-TAIL_TOLERANCE = 10  # Reduced from 300 (VP-34) to allow seeking closer to EOF.
+TAIL_TOLERANCE = 30  # BUG-07: 10 was too tight — codec trailing B-frames can cause read
+# failures in the last ~10 frames on H.264/H.265 content, dropping valid end frames.
 MAX_CONSECUTIVE_ERRORS = (
     300  # Stop reading after this many consecutive frame read failures
 )
@@ -216,6 +217,17 @@ class VideoProcessor(QObject):
     def store_frame_to_display(self, frame_number, pixmap, frame):
         """Slot to store a processed video/image frame from a worker."""
         self.frames_to_display[frame_number] = (pixmap, frame)
+        # VP-22: Evict stale frames (already past next_frame_to_display) when the
+        # buffer exceeds the soft cap.  NEVER evict frames that the metronome still
+        # needs — doing so causes a permanent stall (metronome waits for a frame
+        # that no longer exists → recording freezes).
+        while len(self.frames_to_display) > self.max_frames_to_display_size:
+            oldest = min(self.frames_to_display)
+            if oldest >= self.next_frame_to_display:
+                # All stored frames are still needed; cannot evict safely.
+                break
+            pix, arr = self.frames_to_display.pop(oldest)
+            del pix, arr
 
     @Slot(QPixmap, numpy.ndarray)
     def store_webcam_frame_to_display(self, pixmap, frame):
@@ -1362,6 +1374,7 @@ class VideoProcessor(QObject):
         # VP-24: We clear the queue and then send poison pills to wake workers
         # blocked on queue.get().
         self.frames_to_display.clear()
+        self._seek_cached_frame = None  # release seek-preview frame (~6–25 MB at HD/4K)
         self.webcam_frames_to_display.queue.clear()
         with self.frame_queue.mutex:
             self.frame_queue.queue.clear()
@@ -1538,6 +1551,16 @@ class VideoProcessor(QObject):
 
         # 4. Clear the worker list
         self.worker_threads.clear()
+
+        # 5. Release GPU memory held by the now-dead workers (kernel tensors,
+        #    FrameEnhancers/FrameEdits helpers, etc.).  CPython's reference-counting
+        #    will free them eventually, but calling GC + empty_cache here ensures
+        #    VRAM is reclaimed before the next session allocates new workers.
+        import gc as _gc
+
+        _gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _reopen_video_capture(self, seek_frame: int = 0) -> bool:
         """
@@ -1794,6 +1817,24 @@ class VideoProcessor(QObject):
             try:
                 base_temp_dir = os.path.join(os.getcwd(), "temp_files", "default")
                 os.makedirs(base_temp_dir, exist_ok=True)
+
+                # Clean up orphaned temp files from previous crashed sessions.
+                # These are left behind when the application exits uncleanly during
+                # a recording.  Only remove files older than 24 hours to avoid
+                # accidentally deleting files from a recording that is still active
+                # in another instance.
+                try:
+                    _cutoff = time.time() - 86400  # 24 hours
+                    for _stale in Path(base_temp_dir).glob("temp_output_*.mp4"):
+                        try:
+                            if _stale.stat().st_mtime < _cutoff:
+                                _stale.unlink()
+                                print(f"[INFO] Removed stale temp file: {_stale.name}")
+                        except OSError:
+                            pass
+                except Exception:
+                    pass  # Non-critical; never block recording startup
+
                 self.temp_file = os.path.join(
                     base_temp_dir, f"temp_output_{date_and_time}.mp4"
                 )

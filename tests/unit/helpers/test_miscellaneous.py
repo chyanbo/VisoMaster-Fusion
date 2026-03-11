@@ -2,6 +2,7 @@
 MISC-* tests for pure utility functions in app.helpers.miscellaneous
 """
 
+import numpy as np
 import pytest
 from app.helpers.miscellaneous import (
     is_image_file,
@@ -168,3 +169,64 @@ def test_video_extensions_are_lowercase_dotted():
 
 def test_no_overlap_between_image_and_video_extensions():
     assert set(image_extensions).isdisjoint(set(video_extensions))
+
+
+# ---------------------------------------------------------------------------
+# UT-04: keypoints_adjustments — guard against fewer than 5 keypoints
+# ---------------------------------------------------------------------------
+
+from app.helpers.miscellaneous import keypoints_adjustments  # noqa: E402
+
+
+class TestKeypointsAdjustmentsGuard:
+    """UT-04: When LandmarksPositionAdjEnableToggle is True and fewer than 5
+    keypoints are present, keypoints_adjustments must return the input unchanged
+    rather than raising IndexError.
+    """
+
+    def _params_with_toggle(self) -> dict:
+        return {
+            "LandmarksPositionAdjEnableToggle": True,
+            "EyeLeftXAmountSlider": 5.0,
+            "EyeLeftYAmountSlider": 3.0,
+            "EyeRightXAmountSlider": -2.0,
+            "EyeRightYAmountSlider": 1.0,
+            "NoseXAmountSlider": 0.0,
+            "NoseYAmountSlider": 0.0,
+            "MouthLeftXAmountSlider": 0.0,
+            "MouthLeftYAmountSlider": 0.0,
+            "MouthRightXAmountSlider": 0.0,
+            "MouthRightYAmountSlider": 0.0,
+        }
+
+    def test_fewer_than_5_keypoints_returns_input_unchanged(self):
+        kps = np.array([[10.0, 20.0], [30.0, 40.0]], dtype=np.float32)  # only 2 points
+        params = self._params_with_toggle()
+        result = keypoints_adjustments(kps, params)
+        np.testing.assert_array_equal(result, kps)
+
+    def test_zero_keypoints_returns_input_unchanged(self):
+        kps = np.zeros((0, 2), dtype=np.float32)
+        params = self._params_with_toggle()
+        result = keypoints_adjustments(kps, params)
+        assert result.shape == (0, 2)
+
+    def test_exactly_4_keypoints_returns_input_unchanged(self):
+        kps = np.ones((4, 2), dtype=np.float32)
+        params = self._params_with_toggle()
+        result = keypoints_adjustments(kps, params)
+        np.testing.assert_array_equal(result, kps)
+
+    def test_exactly_5_keypoints_applies_adjustments(self):
+        kps = np.zeros((5, 2), dtype=np.float32)
+        params = self._params_with_toggle()
+        result = keypoints_adjustments(kps, params)
+        # EyeLeft X should be shifted by EyeLeftXAmountSlider=5
+        assert result[0][0] == pytest.approx(5.0)
+
+    def test_toggle_off_with_fewer_kps_does_not_raise(self):
+        """When toggle is off, the guard should not matter — confirm no crash."""
+        kps = np.array([[1.0, 2.0]], dtype=np.float32)
+        params = {"LandmarksPositionAdjEnableToggle": False}
+        result = keypoints_adjustments(kps, params)
+        np.testing.assert_array_equal(result, kps)
