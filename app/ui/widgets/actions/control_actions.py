@@ -855,6 +855,14 @@ def set_auto_mouth_threshold_from_frame(main_window: "MainWindow", *_args) -> No
             )
             return
 
+        # Warn if ratio looks too low — face may not have been open when button was pressed
+        if ratio < 0.05:
+            print(
+                "[WARN] set_auto_mouth_threshold_from_frame: measured ratio is very low "
+                f"({ratio:.4f}) — the face may not be open. Seek to a more open-mouth "
+                "frame and try again."
+            )
+
         # Clamp to slider range and apply
         clamped = max(0.05, min(0.60, ratio))
         threshold_widget = main_window.parameter_widgets.get(

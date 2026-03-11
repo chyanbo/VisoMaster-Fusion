@@ -7,6 +7,7 @@ import pytest
 
 from app.processors.mouth_openness import (
     MIN_MOUTH_SPAN_PX,
+    OCCLUSION_TIMEOUT_FRAMES,
     MouthOpennessState,
     compute_lip_open_ratio_203,
     compute_lip_open_ratio_68,
@@ -168,94 +169,252 @@ class TestMouthOpennessState:
         state = MouthOpennessState()
         assert state.ema == 0.0
 
-    # -- update: rule 1 — ratio >= threshold → activate --
+    def test_initial_none_streak_is_zero(self):
+        state = MouthOpennessState()
+        assert state.none_streak == 0
+
+    # -- update returns tuple --
+
+    def test_update_returns_tuple_of_bool_and_float(self):
+        state = MouthOpennessState()
+        result = state.update(ratio=0.5, alpha=1.0, threshold=0.2)
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+        active, ema = result
+        assert isinstance(active, bool)
+        assert isinstance(ema, float)
+
+    # -- immediate first-frame activation --
+
+    def test_immediate_activation_on_first_trigger(self):
+        """First valid ratio >= threshold activates instantly (no EMA ramp)."""
+        state = MouthOpennessState()
+        active, ema = state.update(ratio=0.30, alpha=0.40, threshold=0.12)
+        assert active is True
+        assert state.active is True
+        # EMA is set directly to ratio (not alpha-blended from 0)
+        assert ema == pytest.approx(0.30)
+
+    def test_immediate_activation_sets_ema_to_ratio_not_blended(self):
+        """Immediate activation bypasses the EMA formula for the first trigger."""
+        state = MouthOpennessState()
+        # With alpha=0.4 and ema_before=0, normal EMA would give 0.4*0.30 = 0.12
+        state.update(ratio=0.30, alpha=0.40, threshold=0.12)
+        assert state.ema == pytest.approx(0.30)  # not 0.12
+
+    def test_immediate_activation_does_not_fire_when_already_active(self):
+        """Subsequent frames go through normal EMA update, not immediate activation."""
+        state = MouthOpennessState(active=True, ema=0.30)
+        active, ema = state.update(ratio=0.30, alpha=0.40, threshold=0.12)
+        # EMA blended: 0.4*0.30 + 0.6*0.30 = 0.30
+        assert ema == pytest.approx(0.30)
+        assert active is True
+
+    # -- update: activation --
 
     def test_update_activates_when_ratio_above_threshold(self):
         state = MouthOpennessState()
-        result = state.update(ratio=0.5, alpha=1.0, threshold=0.2)
-        assert result is True
+        active, _ = state.update(ratio=0.5, alpha=1.0, threshold=0.2)
+        assert active is True
         assert state.active is True
 
     def test_update_activates_when_ratio_equals_threshold(self):
         state = MouthOpennessState()
-        # alpha=1.0 → ema = ratio immediately
-        result = state.update(ratio=0.2, alpha=1.0, threshold=0.2)
-        assert result is True
+        active, _ = state.update(ratio=0.2, alpha=1.0, threshold=0.2)
+        assert active is True
 
-    # -- update: rule 3 — ratio < threshold → deactivate --
+    # -- hysteresis: deactivation threshold is 75% of activation threshold --
 
-    def test_update_deactivates_when_ratio_below_threshold(self):
+    def test_deactivation_uses_hysteresis_threshold(self):
+        """Active state deactivates at threshold*0.75, not threshold."""
         state = MouthOpennessState(active=True, ema=0.5)
-        result = state.update(ratio=0.01, alpha=1.0, threshold=0.2)
-        assert result is False
+        threshold = 0.20
+        # deactivate_threshold = threshold * 0.75 = 0.15
+
+        # Ratio that would deactivate without hysteresis but not with it
+        # EMA after update: 1.0*0.16 = 0.16 → 0.16 >= 0.15 → stays active
+        active, _ = state.update(ratio=0.16, alpha=1.0, threshold=threshold)
+        assert active is True
+
+    def test_deactivates_when_ema_falls_below_hysteresis_threshold(self):
+        """Deactivation fires when EMA drops below threshold * 0.75."""
+        state = MouthOpennessState(active=True, ema=0.5)
+        threshold = 0.20
+        # EMA after: 1.0*0.10 = 0.10 → 0.10 < 0.15 → deactivate
+        active, _ = state.update(ratio=0.10, alpha=1.0, threshold=threshold)
+        assert active is False
         assert state.active is False
+
+    def test_deactivation_requires_multiple_frames_with_low_alpha(self):
+        """With alpha=0.5 and high starting EMA, it takes multiple frames to cross
+        the hysteresis threshold."""
+        state = MouthOpennessState(active=True, ema=0.40)
+        threshold = 0.20  # deactivate at 0.15
+        # Frame 1: ema = 0.5*0.0 + 0.5*0.40 = 0.20 → still above deactivate_threshold (0.15)
+        active, ema = state.update(ratio=0.0, alpha=0.5, threshold=threshold)
+        assert active is True
+        assert ema == pytest.approx(0.20)
+        # Frame 2: ema = 0.5*0.0 + 0.5*0.20 = 0.10 → 0.10 < 0.15 → deactivate
+        active, ema = state.update(ratio=0.0, alpha=0.5, threshold=threshold)
+        assert active is False
 
     # -- update: rule 2 — ratio=None → stay --
 
     def test_update_stays_active_when_ratio_is_none(self):
         state = MouthOpennessState(active=True, ema=0.5)
-        result = state.update(ratio=None, alpha=0.4, threshold=0.2)
-        assert result is True
+        active, _ = state.update(ratio=None, alpha=0.4, threshold=0.2)
+        assert active is True
         assert state.active is True
 
     def test_update_stays_inactive_when_ratio_is_none(self):
         state = MouthOpennessState(active=False, ema=0.0)
-        result = state.update(ratio=None, alpha=0.4, threshold=0.2)
-        assert result is False
+        active, _ = state.update(ratio=None, alpha=0.4, threshold=0.2)
+        assert active is False
         assert state.active is False
 
-    def test_update_none_does_not_change_ema(self):
+    def test_update_none_does_not_change_ema_before_timeout(self):
         state = MouthOpennessState(active=True, ema=0.5)
         state.update(ratio=None, alpha=0.4, threshold=0.2)
         assert state.ema == 0.5
 
+    def test_none_streak_increments_while_active_and_ratio_none(self):
+        state = MouthOpennessState(active=True, ema=0.5)
+        for i in range(3):
+            state.update(ratio=None, alpha=0.4, threshold=0.2)
+        assert state.none_streak == 3
+
+    def test_none_streak_does_not_increment_when_inactive(self):
+        state = MouthOpennessState(active=False, ema=0.0)
+        for _ in range(5):
+            state.update(ratio=None, alpha=0.4, threshold=0.2)
+        assert state.none_streak == 0
+
+    # -- occlusion timeout --
+
+    def test_occlusion_timeout_decays_ema_after_n_frames(self):
+        """After OCCLUSION_TIMEOUT_FRAMES of None while active, EMA starts decaying."""
+        # Start with ema well above deactivate threshold to make it non-trivial
+        state = MouthOpennessState(active=True, ema=0.5)
+        threshold = 0.20
+
+        # Feed exactly OCCLUSION_TIMEOUT_FRAMES None frames — no decay yet
+        for _ in range(OCCLUSION_TIMEOUT_FRAMES):
+            state.update(ratio=None, alpha=0.4, threshold=threshold)
+
+        ema_at_timeout = state.ema
+        assert ema_at_timeout == pytest.approx(0.5)  # no decay yet
+
+        # One more frame past timeout — decay starts
+        state.update(ratio=None, alpha=0.4, threshold=threshold)
+        assert state.ema < ema_at_timeout
+
+    def test_occlusion_timeout_eventually_deactivates(self):
+        """Enough None frames eventually cause deactivation via EMA decay."""
+        state = MouthOpennessState(active=True, ema=0.20)
+        threshold = 0.20  # deactivate at 0.15
+
+        # Feed many None frames past the timeout
+        for _ in range(OCCLUSION_TIMEOUT_FRAMES + 100):
+            state.update(ratio=None, alpha=0.4, threshold=threshold)
+
+        assert state.active is False
+
+    def test_none_streak_resets_when_valid_ratio_arrives(self):
+        """A valid ratio resets the none_streak counter."""
+        state = MouthOpennessState(active=True, ema=0.5)
+        for _ in range(10):
+            state.update(ratio=None, alpha=0.4, threshold=0.2)
+        assert state.none_streak == 10
+
+        # Valid ratio resets the streak
+        state.update(ratio=0.3, alpha=0.4, threshold=0.2)
+        assert state.none_streak == 0
+
     # -- EMA smoothing --
 
-    def test_ema_smoothing_with_alpha_one(self):
-        state = MouthOpennessState()
-        state.update(ratio=0.6, alpha=1.0, threshold=0.2)
-        assert state.ema == pytest.approx(0.6)
-
-    def test_ema_smoothing_with_alpha_half(self):
-        state = MouthOpennessState()
+    def test_ema_smoothing_formula_when_already_active(self):
+        """When already active, normal EMA formula is applied (no immediate activation)."""
+        state = MouthOpennessState(active=True, ema=0.0)
+        # alpha=0.5, ratio=0.8, ema_before=0.0 → 0.5*0.8 + 0.5*0.0 = 0.4
         state.update(ratio=0.8, alpha=0.5, threshold=0.2)
-        # ema = 0.5*0.8 + 0.5*0.0 = 0.4
         assert state.ema == pytest.approx(0.4)
+
+    def test_ema_smoothing_formula_when_ratio_below_threshold(self):
+        """When ratio < threshold and inactive, EMA is still updated (for approach tracking)."""
+        state = MouthOpennessState(active=False, ema=0.0)
+        # ratio=0.08 < threshold=0.9 → no immediate activation, normal EMA
+        # alpha=0.5: ema = 0.5*0.08 + 0.5*0.0 = 0.04
+        state.update(ratio=0.08, alpha=0.5, threshold=0.9)
+        assert state.ema == pytest.approx(0.04)
+
+    def test_ema_alpha_zero_freezes_ema_when_active(self):
+        """With alpha=0, EMA never changes (when already active, no immediate path)."""
+        state = MouthOpennessState(active=True, ema=0.5)
+        state.update(ratio=1.0, alpha=0.0, threshold=0.2)
+        assert state.ema == pytest.approx(0.5)
+        assert state.active is True
 
     def test_ema_accumulates_across_updates(self):
         state = MouthOpennessState()
-        state.update(ratio=0.8, alpha=0.5, threshold=0.9)  # ema=0.4, below threshold
+        # First update: ratio=0.08 < threshold=0.9 → no immediate activation
+        state.update(ratio=0.08, alpha=0.5, threshold=0.9)  # ema=0.04, below threshold
         assert state.active is False
-        state.update(ratio=0.8, alpha=0.5, threshold=0.5)  # ema=0.6, above threshold
+        # Second update: ratio=0.8 >= threshold=0.5 → immediate activation
+        state.update(ratio=0.8, alpha=0.5, threshold=0.5)
         assert state.active is True
 
-    def test_ema_decays_toward_zero(self):
+    def test_ema_decays_toward_zero_when_active(self):
         state = MouthOpennessState(active=True, ema=0.9)
         state.update(ratio=0.0, alpha=0.5, threshold=0.2)
         assert state.ema == pytest.approx(0.45)
 
-    # -- reset --
+    # -- ema value returned from update --
 
-    def test_reset_clears_active_and_ema(self):
-        state = MouthOpennessState(active=True, ema=0.8)
-        state.reset()
-        assert state.active is False
-        assert state.ema == 0.0
+    def test_update_returns_current_ema_value(self):
+        state = MouthOpennessState(active=True, ema=0.4)
+        _, ema = state.update(ratio=0.6, alpha=0.5, threshold=0.2)
+        # ema = 0.5*0.6 + 0.5*0.4 = 0.5
+        assert ema == pytest.approx(0.5)
 
-    # -- edge cases --
+    def test_update_returns_ema_unchanged_when_ratio_none(self):
+        state = MouthOpennessState(active=True, ema=0.4)
+        _, ema = state.update(ratio=None, alpha=0.5, threshold=0.2)
+        assert ema == pytest.approx(0.4)
 
-    def test_alpha_zero_ema_never_changes(self):
-        state = MouthOpennessState(ema=0.0)
-        state.update(ratio=1.0, alpha=0.0, threshold=0.2)
-        assert state.ema == pytest.approx(0.0)
-        assert state.active is False
+    # -- high threshold --
 
     def test_high_threshold_not_triggered_by_normal_ratio(self):
         state = MouthOpennessState()
-        state.update(ratio=0.15, alpha=1.0, threshold=0.50)
-        assert state.active is False
+        active, _ = state.update(ratio=0.15, alpha=1.0, threshold=0.50)
+        assert active is False
 
-    def test_returns_bool_not_generic_truthy(self):
+    # -- reset --
+
+    def test_reset_clears_active_ema_and_none_streak(self):
+        state = MouthOpennessState(active=True, ema=0.8)
+        state.none_streak = 15
+        state.reset()
+        assert state.active is False
+        assert state.ema == 0.0
+        assert state.none_streak == 0
+
+    # -- proportional strength helper --
+
+    def test_ema_enables_proportional_strength_calculation(self):
+        """The returned EMA value enables the caller to compute proportional strength."""
         state = MouthOpennessState()
-        result = state.update(ratio=0.5, alpha=1.0, threshold=0.2)
-        assert isinstance(result, bool)
+        threshold = 0.12
+        ramp_range = max(threshold * 0.5, 0.04)  # = 0.06
+
+        # EMA at threshold → proportion = 0 (just activated)
+        active, ema = state.update(ratio=threshold, alpha=1.0, threshold=threshold)
+        proportion = min(1.0, max(0.0, (ema - threshold) / ramp_range))
+        assert proportion == pytest.approx(0.0)
+
+        # EMA at threshold + ramp_range → proportion = 1.0 (full strength)
+        state2 = MouthOpennessState(active=True, ema=threshold + ramp_range)
+        active2, ema2 = state2.update(
+            ratio=threshold + ramp_range, alpha=1.0, threshold=threshold
+        )
+        proportion2 = min(1.0, max(0.0, (ema2 - threshold) / ramp_range))
+        assert proportion2 == pytest.approx(1.0)

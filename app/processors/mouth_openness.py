@@ -1,12 +1,16 @@
 """Auto-mouth: detect mouth openness from pipeline landmarks; maintain on/stay/off state."""
 
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import numpy as np
 
 # Minimum pixel span of the mouth (corners) to trust the ratio calculation.
-# Prevents divide-by-near-zero when a face is very small or partially out of frame.
-MIN_MOUTH_SPAN_PX: float = 8.0
+# Lowered to 4.0 (was 8.0) to handle small/distant faces without false None returns.
+MIN_MOUTH_SPAN_PX: float = 4.0
+
+# Number of consecutive None-ratio frames while active before starting EMA decay.
+# At 30 fps this is ~1.5 s of occlusion before the feature begins to fade out.
+OCCLUSION_TIMEOUT_FRAMES: int = 45
 
 
 def compute_lip_open_ratio_203(kps: np.ndarray | None) -> float | None:
@@ -48,27 +52,69 @@ def compute_lip_open_ratio_68(kps: np.ndarray | None) -> float | None:
 class MouthOpennessState:
     """Per-face EMA state for the Auto Mouth Expression feature.
 
-    Three update rules:
-      1. ratio >= threshold  → activate (set active=True)
-      2. ratio is None       → stay     (keep current active value unchanged)
-      3. ratio <  threshold  → deactivate (set active=False)
+    Update rules:
+      1. ratio >= threshold AND not yet active → activate immediately (no cold-start ramp)
+      2. ratio is None → stay in current state; increment occlusion counter; after
+         OCCLUSION_TIMEOUT_FRAMES decay EMA until it drops below the deactivate threshold
+      3. ratio >= threshold (already active) → keep active; update EMA normally
+      4. ratio < deactivate_threshold (= threshold * 0.75) → deactivate  (hysteresis band)
 
-    Rule 2 handles occlusion (object covering the mouth, e.g. spoon/fork/food)
-    by keeping the feature enabled rather than falsely turning it off.
+    Hysteresis prevents rapid on/off oscillation when the ratio hovers at the threshold.
+    Occlusion timeout prevents the feature from staying stuck active after tracking is lost.
     """
 
     active: bool = False
     ema: float = 0.0
+    none_streak: int = field(default=0, compare=False, repr=False)
 
-    def update(self, ratio: float | None, alpha: float, threshold: float) -> bool:
-        """Update EMA and state. Returns the new active flag."""
+    def update(
+        self,
+        ratio: float | None,
+        alpha: float,
+        threshold: float,
+    ) -> tuple[bool, float]:
+        """Update EMA and activation state.
+
+        Returns:
+            (active, ema) — current activation flag and smoothed EMA value.
+            The EMA value is used by the caller for proportional strength scaling.
+        """
+        deactivate_threshold = threshold * 0.75
+
         if ratio is None:
-            return self.active  # rule 2 — stay
+            # Rule 2: stay; manage occlusion timeout
+            if self.active:
+                self.none_streak += 1
+                if self.none_streak > OCCLUSION_TIMEOUT_FRAMES:
+                    # Slow EMA decay so the feature fades out instead of snapping off
+                    self.ema *= 0.92
+                    if self.ema < deactivate_threshold:
+                        self.active = False
+                        self.none_streak = 0
+            return self.active, self.ema
+
+        # Valid ratio received — reset occlusion counter
+        self.none_streak = 0
+
+        # Rule 1: immediate first-frame activation (skip cold-start ramp)
+        if not self.active and ratio >= threshold:
+            self.ema = ratio
+            self.active = True
+            return True, self.ema
+
+        # Normal EMA update
         self.ema = alpha * ratio + (1.0 - alpha) * self.ema
-        self.active = self.ema >= threshold
-        return self.active
+
+        # Hysteresis: activate at threshold, deactivate at threshold * 0.75
+        if not self.active and self.ema >= threshold:
+            self.active = True
+        elif self.active and self.ema < deactivate_threshold:
+            self.active = False
+
+        return self.active, self.ema
 
     def reset(self) -> None:
         """Reset state to inactive (call when switching target faces or disabling)."""
         self.active = False
         self.ema = 0.0
+        self.none_streak = 0

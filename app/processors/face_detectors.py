@@ -560,13 +560,11 @@ class FaceDetectors:
             with self._tracker_lock:
                 if self.tracker is not None:
                     img_hw = (int(img.shape[1]), int(img.shape[2]))
-                    active_before_skip = len(self.tracker.tracked_stracks)
                     online_targets = self.tracker.update(
                         np.empty((0, 5)), img_hw, img_hw
                     )
                 else:
                     online_targets = []
-                    active_before_skip = 0
 
             # Build return arrays from coasted tracks (Kalman-predicted positions
             # with last known landmarks) — same logic as the main ByteTrack path below
@@ -574,9 +572,6 @@ class FaceDetectors:
             tracked_kpss_5: list = []
             tracked_kpss_all: list = []
             tracked_scores: list = []
-            current_frame_num_skip = getattr(
-                self.models_processor, "current_frame_number", 0
-            )
             for t in online_targets:
                 tlwh = t.tlwh
                 tid = t.track_id

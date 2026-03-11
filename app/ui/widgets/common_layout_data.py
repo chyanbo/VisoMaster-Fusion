@@ -653,7 +653,7 @@ COMMON_LAYOUT_DATA: Any = {
             "label": "Open Threshold",
             "min_value": "0.05",
             "max_value": "0.60",
-            "default": "0.20",
+            "default": "0.12",
             "decimals": 2,
             "step": 0.01,
             "parentToggle": "AutoMouthExpressionEnableToggle",
@@ -677,7 +677,7 @@ COMMON_LAYOUT_DATA: Any = {
             "label": "EMA Smoothing",
             "min_value": "0.05",
             "max_value": "1.00",
-            "default": "0.40",
+            "default": "0.65",
             "decimals": 2,
             "step": 0.01,
             "parentToggle": "AutoMouthExpressionEnableToggle",
@@ -694,13 +694,29 @@ COMMON_LAYOUT_DATA: Any = {
             "label": "Expression Strength",
             "min_value": "0.10",
             "max_value": "1.50",
-            "default": "0.80",
+            "default": "1.00",
             "decimals": 2,
             "step": 0.01,
             "parentToggle": "AutoMouthExpressionEnableToggle",
             "requiredToggleValue": True,
             "enable_refresh_frame": False,
-            "help": "FriendlyFactor applied to lips when auto-mouth is active.",
+            "help": (
+                "Base expression factor applied to lips when auto-mouth is active. "
+                "Actual strength is scaled proportionally with how far above the "
+                "threshold the detected ratio is (smooth ramp-in)."
+            ),
+        },
+        "AutoMouthAnimationRegionSelection": {
+            "level": 2,
+            "label": "Animation Region",
+            "options": ["lips", "all"],
+            "default": "lips",
+            "parentToggle": "AutoMouthExpressionEnableToggle",
+            "requiredToggleValue": True,
+            "help": (
+                "'lips' transfers only mouth motion (recommended). "
+                "'all' also includes eyes, matching full Simple-mode expression restorer."
+            ),
         },
         "AutoMouthNormalizeLipsToggle": {
             "level": 2,
@@ -708,7 +724,10 @@ COMMON_LAYOUT_DATA: Any = {
             "default": True,
             "parentToggle": "AutoMouthExpressionEnableToggle",
             "requiredToggleValue": True,
-            "help": "Enable lip-ratio normalisation when auto-mouth is active.",
+            "help": (
+                "Enable lip-ratio normalisation (uses lp_retarget_lip) for better "
+                "lip shape accuracy when auto-mouth is active."
+            ),
         },
     },
 }
