@@ -77,7 +77,7 @@ class FaceRestorers:
         try:
             # ⚠️ This is a critical synchronization point.
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 # This handles synchronization for other execution providers (e.g., DirectML)
                 # by synchronizing with a placeholder vector.

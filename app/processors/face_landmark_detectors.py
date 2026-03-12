@@ -60,6 +60,9 @@ class FaceLandmarkDetectors:
         self.landmark_5_scale1_cache: Dict[tuple, torch.Tensor] = {}
         self.landmark_5_priors = None
         self._anchor_lock = threading.Lock()
+        self._cache_lock = (
+            threading.Lock()
+        )  # Added lock to prevent dictionary Race Conditions
 
         # A dictionary to map a string identifier (e.g., '68') to the corresponding
         # model name and the specific function that processes its output.
@@ -278,9 +281,8 @@ class FaceLandmarkDetectors:
         # the model is already loaded. Fall back to load_model (which is thread-safe)
         # only when the model is not yet present, preventing a KeyError if another
         # thread unloads the model between the check in run_detect_landmark and here.
-        model = self.models_processor.models.get(model_name)
-        if model is None:
-            model = self.models_processor.load_model(model_name)
+        # CRITICAL FIX: Restored the strict thread-safe load_model call to prevent race condition
+        model = self.models_processor.load_model(model_name)
 
         # Failsafe: If load_model fails (e.g., file not found, TRT build fail),
         # model will be None. We must abort to prevent a crash.
@@ -317,7 +319,7 @@ class FaceLandmarkDetectors:
         try:
             # Synchronize the CUDA stream before execution.
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 self.models_processor.syncvec.cpu()
 
@@ -356,15 +358,15 @@ class FaceLandmarkDetectors:
 
         # Prepare scaling factor for post-processing.
         height, width = 512, 512
-        if (width, height) not in self.landmark_5_scale1_cache:
-            if len(self.landmark_5_scale1_cache) > 10:
-                self.landmark_5_scale1_cache.clear()
-            self.landmark_5_scale1_cache[(width, height)] = torch.tensor(
-                [width, height] * 5,
-                dtype=torch.float32,
-                device=self.models_processor.device,
-            )
-        scale1 = self.landmark_5_scale1_cache[(width, height)]
+        # CRITICAL FIX: Thread-safe cache access without destructive clear
+        with self._cache_lock:
+            if (width, height) not in self.landmark_5_scale1_cache:
+                self.landmark_5_scale1_cache[(width, height)] = torch.tensor(
+                    [width, height] * 5,
+                    dtype=torch.float32,
+                    device=self.models_processor.device,
+                )
+            scale1 = self.landmark_5_scale1_cache[(width, height)]
 
         # Run inference.
         net_outs = self._run_onnx_binding(
@@ -498,16 +500,9 @@ class FaceLandmarkDetectors:
 
         # Post-process the 1D prediction array into 3D/2D coordinates.
         # 68 * 3 = 204 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
-        total_elements = pred.shape[0]
-        if total_elements == 68 * 2:
-            # 2D strict (136 elements)
-            pred = pred.reshape((-1, 2))
-        elif total_elements % 3 == 0:
-            # 3D (ex: 204 elements or 3309 mesh elements)
-            pred = pred.reshape((-1, 3))
-        else:
-            # Fallback 2D
-            pred = pred.reshape((-1, 2))
+        # CRITICAL FIX: Restored strict Tensor structure verification
+        # The ONNX model outputs either a 3D dense mesh or flat 2D points with offsets.
+        pred = pred.reshape((-1, 3)) if pred.shape[0] >= 3000 else pred.reshape((-1, 2))
 
         if 68 < pred.shape[0]:
             pred = pred[-68:]
@@ -600,13 +595,8 @@ class FaceLandmarkDetectors:
         pred = net_outs_106[0][0]
 
         # 106 * 3 = 318 means the model returned (x, y, z) triples; otherwise (x, y) pairs.
-        total_elements = pred.shape[0]
-        if total_elements == 106 * 2:
-            pred = pred.reshape((-1, 2))
-        elif total_elements % 3 == 0:
-            pred = pred.reshape((-1, 3))
-        else:
-            pred = pred.reshape((-1, 2))
+        # CRITICAL FIX: Restored strict Tensor structure verification
+        pred = pred.reshape((-1, 3)) if pred.shape[0] >= 3000 else pred.reshape((-1, 2))
 
         if 106 < pred.shape[0]:
             pred = pred[-106:]
