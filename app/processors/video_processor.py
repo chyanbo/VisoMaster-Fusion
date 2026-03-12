@@ -1832,6 +1832,30 @@ class VideoProcessor(QObject):
                                 print(f"[INFO] Removed stale temp file: {_stale.name}")
                         except OSError:
                             pass
+
+                    _stale_audio_dir = Path(base_temp_dir) / "temp_audio"
+                    if _stale_audio_dir.is_dir():
+                        for _stale_audio_file in _stale_audio_dir.iterdir():
+                            try:
+                                if _stale_audio_file.stat().st_mtime < _cutoff:
+                                    if _stale_audio_file.is_dir():
+                                        shutil.rmtree(_stale_audio_file, ignore_errors=True)
+                                    else:
+                                        _stale_audio_file.unlink()
+                                    print(
+                                        f"[INFO] Removed stale temp audio artifact: {_stale_audio_file.name}"
+                                    )
+                            except OSError:
+                                pass
+
+                        try:
+                            next(_stale_audio_dir.iterdir())
+                        except StopIteration:
+                            try:
+                                _stale_audio_dir.rmdir()
+                                print("[INFO] Removed empty stale temp audio directory")
+                            except OSError:
+                                pass
                 except Exception:
                     pass  # Non-critical; never block recording startup
 
@@ -2324,6 +2348,10 @@ class VideoProcessor(QObject):
         Returns: Path to concatenated audio file, or None if failed
         """
 
+        if not audio_files:
+            print("[ERROR] No audio segments to concatenate")
+            return None
+
         if len(audio_files) == 1:
             # Only one segment, return it directly
             print("[INFO] Only one audio segment, no concatenation needed")
@@ -2336,7 +2364,8 @@ class VideoProcessor(QObject):
                 for audio_file in audio_files:
                     # FFmpeg concat demuxer expects absolute paths
                     abs_path = os.path.abspath(audio_file)
-                    f.write(f"file '{abs_path}'\n")
+                    formatted_path = abs_path.replace("\\", "/")
+                    f.write(f"file '{formatted_path}'\n")
             print(f"[INFO] Created concat manifest with {len(audio_files)} segments")
         except OSError as e:
             print(f"[ERROR] Failed to create concat manifest: {e}")
@@ -2378,6 +2407,7 @@ class VideoProcessor(QObject):
     def _finalize_default_style_recording(self):
         """Finalizes a successful default-style recording (adds audio, cleans up)."""
         print("[INFO] Finalizing default-style recording...")
+        temp_audio_dir: str | None = None
 
         # Check if processing stopped due to error limit
         if self.stopped_by_error_limit:
@@ -2451,11 +2481,17 @@ class VideoProcessor(QObject):
             end_frame_for_calc = min(
                 self.next_frame_to_display, self.max_frame_number + 1
             )
+            # Use frames actually written to FFmpeg for robust A/V timing.
+            actual_frames_processed = max(0, int(self.frames_written))
             self.play_end_time = (
-                float(end_frame_for_calc / float(self.fps)) if self.fps > 0 else 0.0
+                self.play_start_time + float(actual_frames_processed / float(self.fps))
+                if self.fps > 0
+                else self.play_start_time
             )
             print(
-                f"[INFO] Calculated recording end time: {self.play_end_time:.3f}s (Frame {end_frame_for_calc})"
+                f"[INFO] Calculated recording end time: {self.play_end_time:.3f}s "
+                f"(Frame {end_frame_for_calc}, skipped {self.total_skipped_frames}, "
+                f"actual {actual_frames_processed})"
             )
 
             # 8. Audio Merging
@@ -2527,31 +2563,89 @@ class VideoProcessor(QObject):
 
                 # 5b. Run FFmpeg audio merge command
                 print("[INFO] Adding audio (default-style merge)...")
-                args = [
-                    "ffmpeg",
-                    "-hide_banner",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    self.temp_file,
-                    "-ss",
-                    str(self.play_start_time),
-                    "-to",
-                    str(self.play_end_time),
-                    "-i",
-                    self.media_path,
-                    "-c:v",
-                    "copy",
-                    "-map",
-                    "0:v:0",
-                    "-map",
-                    "1:a:0?",
-                    "-shortest",
-                    "-af",
-                    "aresample=async=1000",
-                    final_file_path,
-                ]
                 try:
+                    if self.total_skipped_frames > 0:
+                        temp_audio_root = os.path.join(
+                            os.path.dirname(self.temp_file), "temp_audio"
+                        )
+                        temp_audio_dir = os.path.join(
+                            temp_audio_root,
+                            f"{Path(self.temp_file).stem}_{uuid.uuid4().hex}",
+                        )
+                        os.makedirs(temp_audio_dir, exist_ok=True)
+
+                        # Convert skipped frame map into keep-ranges, then extract and concat audio.
+                        start_frame_for_calc = (
+                            getattr(self, "processing_start_frame", 0) or 0
+                        )
+                        actual_end_frame = (
+                            self.last_displayed_frame
+                            if self.last_displayed_frame is not None
+                            else end_frame_for_calc - 1
+                        )
+                        if actual_end_frame < start_frame_for_calc:
+                            raise RuntimeError(
+                                f"invalid frame boundaries: start={start_frame_for_calc}, end={actual_end_frame}"
+                            )
+                        segments = self._identify_frame_segments(actual_end_frame)
+                        audio_ok, audio_files = self._extract_audio_segments(
+                            segments, temp_audio_dir
+                        )
+                        if not audio_ok or not audio_files:
+                            raise RuntimeError("failed to extract segmented audio")
+
+                        final_audio_path = self._concatenate_audio_segments(
+                            audio_files, temp_audio_dir
+                        )
+                        if not final_audio_path:
+                            raise RuntimeError("failed to concatenate segmented audio")
+
+                        args = [
+                            "ffmpeg",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            self.temp_file,
+                            "-i",
+                            final_audio_path,
+                            "-c:v",
+                            "copy",
+                            "-c:a",
+                            "copy",
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0",
+                            "-shortest",
+                            final_file_path,
+                        ]
+                    else:
+                        args = [
+                            "ffmpeg",
+                            "-hide_banner",
+                            "-loglevel",
+                            "error",
+                            "-i",
+                            self.temp_file,
+                            "-ss",
+                            str(self.play_start_time),
+                            "-to",
+                            str(self.play_end_time),
+                            "-i",
+                            self.media_path,
+                            "-c:v",
+                            "copy",
+                            "-map",
+                            "0:v:0",
+                            "-map",
+                            "1:a:0?",
+                            "-shortest",
+                            "-af",
+                            "aresample=async=1000",
+                            final_file_path,
+                        ]
+
                     subprocess.run(args, check=True)
                     print(
                         f"[INFO] --- Successfully created final video: {final_file_path} ---"
@@ -2565,6 +2659,12 @@ class VideoProcessor(QObject):
                         except OSError:
                             pass
                     self.temp_file = ""
+                    if temp_audio_dir and os.path.isdir(temp_audio_dir):
+                        try:
+                            shutil.rmtree(temp_audio_dir, ignore_errors=True)
+                        except OSError:
+                            pass
+                    temp_audio_dir = None
 
             # 6. Final Timing and Logging
             self.end_time = time.perf_counter()
