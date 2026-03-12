@@ -210,6 +210,11 @@ class FrameWorker(threading.Thread):
         # Mouth action detection score (set per-face call in _detect_mouth_action_score)
         self._mouth_action_score: float = 0.0
 
+        # Precalculater bboxes and kps from the video_processor in chronological order
+        self.precomputed_bboxes = None
+        self.precomputed_kpss_5 = None
+        self.precomputed_kpss = None
+
         # --- OPTIMIZATION: Cached Convolution Kernels (VRAM) ---
         # Pre-allocating mathematical filters prevents massive CPU-to-GPU
         # allocation overheads during the binary search loops (sharpness_score).
@@ -280,12 +285,15 @@ class FrameWorker(threading.Thread):
                         # Stopped while waiting, discard task
                         break  # 'finally' will call task_done()
 
-                    # Unpack the task which includes frame and specific parameters
+                    # Unpack the task which includes frame, specific parameters AND precomputed detections
                     (
                         self.frame_number,
                         self.frame,
                         local_params_from_feeder,
                         local_control_from_feeder,
+                        self.precomputed_bboxes,
+                        self.precomputed_kpss_5,
+                        self.precomputed_kpss,
                     ) = task
 
                     # Store them locally in the worker
@@ -1923,95 +1931,50 @@ class FrameWorker(threading.Thread):
                 expand=True,
             )
 
-        # Detection Setup
-        use_landmark, landmark_mode, from_points = (
-            control["LandmarkDetectToggle"],
-            control["LandmarkDetectModelSelection"],
-            control["DetectFromPointsToggle"],
-        )
-        if edit_button_is_checked_global:
-            use_landmark, landmark_mode, from_points = True, "203", True
-
-        # --- Tracking Logic ---
-        detection_interval = int(control.get("FaceDetectionIntervalSlider", 1))
-        previous_faces_arg = None
-
-        # FW-RACE-03: read last_detected_faces / last_processed_frame_number under lock
-        with self.lock:
-            _last_detected = self.last_detected_faces
-            _last_frame_no = self.last_processed_frame_number
+        # --- DETECTION PHASE ---
+        # The workers are now "Stateless Render Engines". They no longer track time or state.
+        # They consume perfectly sequenced and EMA-smoothed detections from the Feeder thread.
 
         if (
-            len(_last_detected) > 0
-            and self.frame_number % detection_interval != 0
-            and self.frame_number == _last_frame_no + 1
+            getattr(self, "precomputed_bboxes", None) is not None
+            and getattr(self, "precomputed_kpss_5", None) is not None
         ):
-            previous_faces_arg = _last_detected
+            # 1. Primary Path (Video/Webcam): Use the sequentially precomputed detections
+            bboxes = self.precomputed_bboxes
+            kpss_5 = self.precomputed_kpss_5
+            kpss = self.precomputed_kpss
+        else:
+            # 2. Fallback Path (Single-Frame Mode / Static Images)
+            use_landmark, landmark_mode, from_points = (
+                control.get("LandmarkDetectToggle", True),
+                control.get("LandmarkDetectModelSelection", "203"),
+                control.get("DetectFromPointsToggle", False),
+            )
+            if edit_button_is_checked_global:
+                use_landmark, landmark_mode, from_points = True, "203", True
 
-        bboxes, kpss_5, kpss = self.models_processor.run_detect(
-            img,
-            control["DetectorModelSelection"],
-            max_num=control["MaxFacesToDetectSlider"],
-            score=control["DetectorScoreSlider"] / 100.0,
-            input_size=(512, 512),
-            use_landmark_detection=use_landmark,
-            landmark_detect_mode=landmark_mode,
-            landmark_score=control["LandmarkDetectScoreSlider"] / 100.0,
-            from_points=from_points,
-            rotation_angles=[0]
-            if not control["AutoRotationToggle"]
-            else [0, 90, 180, 270],
-            use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
-            previous_detections=previous_faces_arg,
-        )
-
-        # Update State for next frame
-        detected_for_state = []
-        if isinstance(bboxes, np.ndarray) and bboxes.shape[0] > 0:
-            for i in range(len(bboxes)):
-                detected_for_state.append(
-                    {
-                        "bbox": bboxes[i],
-                        "score": 1.0,
-                    }
-                )
-
-        # FW-RACE-03: write last_detected_faces / last_processed_frame_number under lock
-        with self.lock:
-            self.last_detected_faces = detected_for_state
-            self.last_processed_frame_number = self.frame_number
+            # Run detection strictly for this single image
+            bboxes, kpss_5, kpss = self.models_processor.run_detect(
+                img,
+                control.get("DetectorModelSelection", "RetinaFace"),
+                max_num=control.get("MaxFacesToDetectSlider", 1),
+                score=control.get("DetectorScoreSlider", 50) / 100.0,
+                input_size=(512, 512),
+                use_landmark_detection=use_landmark,
+                landmark_detect_mode=landmark_mode,
+                landmark_score=control.get("LandmarkDetectScoreSlider", 50) / 100.0,
+                from_points=from_points,
+                rotation_angles=[0]
+                if not control.get("AutoRotationToggle", False)
+                else [0, 90, 180, 270],
+                use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
+                previous_detections=None,  # No historical tracking for single images
+                bypass_bytetrack=True,  # Bypassing ByteTrack to avoid corrupting the global Kalman filter state
+            )
 
         img_h_for_kps = img.shape[-2]
         img_w_for_kps = img.shape[-1]
 
-        # Q-QUAL-01: Apply EMA to keypoints to smooth detection-interval jumps.
-        # IMPORTANT: validate each raw kps BEFORE blending into the EMA state.
-        # If a bad detection (NaN/Inf/OOB) is blended in, the EMA is permanently
-        # contaminated and that pool worker stops swapping faces on every subsequent
-        # frame — causing the "constant swapping/unswapping" flicker bug.
-        if isinstance(kpss_5, np.ndarray) and kpss_5.shape[0] > 0:
-            kpss_5 = kpss_5.copy()  # ensure mutable before EMA writes
-            n_faces = kpss_5.shape[0]
-            if len(self._smoothed_kps) != n_faces:
-                self._smoothed_kps = {}
-            for _i in range(n_faces):
-                _raw = kpss_5[_i]
-                if not self._is_kps_valid(_raw, img_h_for_kps, img_w_for_kps):
-                    # Bad raw detection — do NOT contaminate the EMA state.
-                    # Fall back to the last good smoothed position so this face
-                    # is still processed rather than silently dropped.
-                    if _i in self._smoothed_kps:
-                        kpss_5[_i] = self._smoothed_kps[_i]
-                    # else: leave kpss_5[_i] as-is; _is_kps_valid below will skip it
-                    continue
-                if _i in self._smoothed_kps:
-                    self._smoothed_kps[_i] = (
-                        self._KPS_EMA_ALPHA * _raw
-                        + (1.0 - self._KPS_EMA_ALPHA) * self._smoothed_kps[_i]
-                    )
-                else:
-                    self._smoothed_kps[_i] = _raw.copy()
-                kpss_5[_i] = self._smoothed_kps[_i]
         if (
             isinstance(kpss_5, np.ndarray)
             and kpss_5.shape[0] > 0

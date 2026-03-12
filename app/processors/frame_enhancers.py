@@ -83,7 +83,7 @@ class FrameEnhancers:
             # work before we run the model. This is vital in a multithreaded
             # environment to prevent race conditions or memory access errors.
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 # This handles synchronization for other execution providers (e.g., DirectML)
                 # by synchronizing the custom sync vector.

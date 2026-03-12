@@ -433,7 +433,7 @@ class FaceDetectors:
         try:
             # ⚠️ This is a critical synchronization point for CUDA execution.
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
 
             ort_session.run_with_iobinding(io_binding)
             net_outs = io_binding.copy_outputs_to_cpu()

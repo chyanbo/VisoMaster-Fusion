@@ -24,9 +24,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
-_PROJECT_ROOT = os.path.normpath(
-    os.path.join(os.path.dirname(__file__), "..", "..")
-)
+_PROJECT_ROOT = os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
 _MODEL_DIR = os.path.join(_PROJECT_ROOT, "model_assets", "mouth_action_detector")
 _MODEL_PATH = os.path.join(_MODEL_DIR, "model.pb")
 
@@ -56,8 +54,8 @@ class MouthActionDetector:
 
     # ------------------------------------------------------------------
     def __init__(self) -> None:
-        self._graph = None        # tf.Graph once loaded
-        self._session = None      # tf.compat.v1.Session once loaded
+        self._graph = None  # tf.Graph once loaded
+        self._session = None  # tf.compat.v1.Session once loaded
         self._inp_tensor = None
         self._boxes_tensor = None
         self._scores_tensor = None
@@ -99,14 +97,14 @@ class MouthActionDetector:
         tf.get_logger().setLevel("ERROR")
         try:
             import absl.logging as _absl_log
+
             _absl_log.set_verbosity(_absl_log.ERROR)
         except Exception:  # noqa: BLE001
             pass
 
         if not os.path.isfile(_MODEL_PATH):
             self._load_error = (
-                f"Mouth action model not found at {_MODEL_PATH}. "
-                "Detection disabled."
+                f"Mouth action model not found at {_MODEL_PATH}. Detection disabled."
             )
             logger.warning(self._load_error)
             return
