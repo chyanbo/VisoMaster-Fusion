@@ -667,26 +667,19 @@ class ModelsProcessor(QtCore.QObject):
                                     ),
                                 )
 
-                                # MP-01: Release model_lock before starting the probe subprocess
-                                # so other threads are not blocked during the potentially long build.
-                                self.model_lock.release()
+                                # CRITICAL FIX: Removed self.model_lock.release()
+                                # Releasing the RLock here causes severe race conditions where multiple threads
+                                # load models simultaneously, permanently corrupting TensorRT bindings (erratic KPS).
                                 try:
                                     probe_process.start()
-                                    # MP-19: set build_was_triggered only after start() succeeds
                                     build_was_triggered = True
 
-                                    # Run a local event loop to keep the GUI responsive.
-                                    while probe_process.is_alive():
-                                        QtCore.QCoreApplication.processEvents()
-                                        time.sleep(
-                                            0.02
-                                        )  # Yield to other threads/processes
-
-                                    # MP-24: join the probe process after the spin loop
+                                    # CRITICAL FIX: Removed the while loop with QtCore.QCoreApplication.processEvents()
+                                    # Calling processEvents in a worker thread causes re-entrancy and crashes the app.
+                                    # Using standard synchronous join instead.
                                     probe_process.join()
-                                finally:
-                                    # MP-01: Re-acquire model_lock after probe finishes
-                                    self.model_lock.acquire()
+                                except Exception as e:
+                                    print(f"[ERROR] Process execution failed: {e}")
 
                                 # Process finished, get exit code
                                 exitcode = probe_process.exitcode
@@ -704,12 +697,8 @@ class ModelsProcessor(QtCore.QObject):
                                     )
                                     if attempt < max_retries - 1:
                                         print("[INFO] Retrying in 2 seconds...")
-                                        # time.sleep(2) would freeze the GUI.
-                                        # We run a 2-second processEvents loop instead.
-                                        start_time = time.time()
-                                        while time.time() - start_time < 2.0:
-                                            QtCore.QCoreApplication.processEvents()
-                                            time.sleep(0.02)
+                                        # CRITICAL FIX: Safe sleep, no processEvents
+                                        time.sleep(2.0)
 
                             if not probe_successful:
                                 raise RuntimeError(
@@ -906,10 +895,8 @@ class ModelsProcessor(QtCore.QObject):
                         )
 
                         build_process.start()
-                        # MP-27: non-blocking join to keep GUI responsive during build
-                        while build_process.is_alive():
-                            QtCore.QCoreApplication.processEvents()
-                            time.sleep(0.02)
+                        # CRITICAL FIX: Removed non-blocking while loop with processEvents().
+                        # processEvents in this context disrupts the execution flow.
                         build_process.join()
 
                         if build_process.exitcode != 0:
@@ -2070,59 +2057,35 @@ class ModelsProcessor(QtCore.QObject):
                 with torch.cuda.stream(torch.cuda.current_stream()):
                     num_ddpm_timesteps = self.alphas_cumprod_np.shape[0]
 
-                    # MP-11: Cache the DDIM schedule to avoid recomputing on every call.
-                    # LRU-bounded: evict oldest entry when at capacity.
-                    _ddim_cache_key = (denoiser_ddim_steps, denoiser_ddim_eta)
-                    if _ddim_cache_key in self._ddim_schedule_cache:
-                        self._ddim_schedule_cache.move_to_end(_ddim_cache_key)
-                    else:
-                        _ddim_raw_ddpm_timesteps_np = (
-                            ModelsProcessor.make_ddim_timesteps(
-                                ddim_discr_method="uniform",
-                                num_ddim_timesteps=denoiser_ddim_steps,
-                                num_ddpm_timesteps=num_ddpm_timesteps,
-                                verbose=DEBUG_DENOISER,
-                            )
+                    # CRITICAL FIX: Removed the faulty _ddim_schedule_cache.
+                    # Caching CUDA tensors globally across multiple thread inferences causes memory corruption
+                    # and device mismatch errors if the stream or context changes.
+                    _ddim_raw_ddpm_timesteps_np = ModelsProcessor.make_ddim_timesteps(
+                        ddim_discr_method="uniform",
+                        num_ddim_timesteps=denoiser_ddim_steps,
+                        num_ddpm_timesteps=num_ddpm_timesteps,
+                        verbose=DEBUG_DENOISER,
+                    )
+                    _ddim_sigmas_np, _ddim_alphas_np, _ddim_alphas_prev_np = (
+                        ModelsProcessor.make_ddim_sampling_parameters(
+                            alphacums=self.alphas_cumprod_np,
+                            ddim_timesteps=_ddim_raw_ddpm_timesteps_np,
+                            eta=denoiser_ddim_eta,
+                            verbose=DEBUG_DENOISER,
                         )
-                        _ddim_sigmas_np, _ddim_alphas_np, _ddim_alphas_prev_np = (
-                            ModelsProcessor.make_ddim_sampling_parameters(
-                                alphacums=self.alphas_cumprod_np,
-                                ddim_timesteps=_ddim_raw_ddpm_timesteps_np,
-                                eta=denoiser_ddim_eta,
-                                verbose=DEBUG_DENOISER,
-                            )
-                        )
-                        _ddim_sigmas = (
-                            torch.from_numpy(_ddim_sigmas_np).float().to(self.device)
-                        )
-                        _ddim_alphas = (
-                            torch.from_numpy(_ddim_alphas_np).float().to(self.device)
-                        )
-                        _ddim_alphas_prev = (
-                            torch.from_numpy(_ddim_alphas_prev_np)
-                            .float()
-                            .to(self.device)
-                        )
-                        _ddim_sqrt_one_minus_alphas = torch.sqrt(
-                            torch.clamp(1.0 - _ddim_alphas, min=0.0)
-                        )
-                        if len(self._ddim_schedule_cache) >= self._DDIM_CACHE_MAX:
-                            self._ddim_schedule_cache.popitem(last=False)
-                        self._ddim_schedule_cache[_ddim_cache_key] = (
-                            _ddim_raw_ddpm_timesteps_np,
-                            _ddim_sigmas,
-                            _ddim_alphas,
-                            _ddim_alphas_prev,
-                            _ddim_sqrt_one_minus_alphas,
-                        )
-
-                    (
-                        _ddim_raw_ddpm_timesteps_np,
-                        ddim_sigmas,
-                        ddim_alphas,
-                        ddim_alphas_prev,
-                        ddim_sqrt_one_minus_alphas,
-                    ) = self._ddim_schedule_cache[_ddim_cache_key]
+                    )
+                    ddim_sigmas = (
+                        torch.from_numpy(_ddim_sigmas_np).float().to(self.device)
+                    )
+                    ddim_alphas = (
+                        torch.from_numpy(_ddim_alphas_np).float().to(self.device)
+                    )
+                    ddim_alphas_prev = (
+                        torch.from_numpy(_ddim_alphas_prev_np).float().to(self.device)
+                    )
+                    ddim_sqrt_one_minus_alphas = torch.sqrt(
+                        torch.clamp(1.0 - ddim_alphas, min=0.0)
+                    )
 
                     current_latent_xt_scaled = torch.randn(
                         lq_latent_x0_scaled_for_unet.shape,
@@ -2133,48 +2096,25 @@ class ModelsProcessor(QtCore.QObject):
                     time_range_ddpm_indices = np.flip(_ddim_raw_ddpm_timesteps_np)
                     total_steps = len(time_range_ddpm_indices)
 
-                    # MP-10: Pre-allocate loop-invariant-shape buffers outside the loop
-                    latent_shape = lq_latent_x0_scaled_for_unet.shape
-                    e_t_cond = torch.empty(
-                        latent_shape, dtype=torch.float32, device=self.device
+                    # CRITICAL FIX: Reverted to out-of-place memory allocation.
+                    # In-place assignments combined with TensorRT async execution causes severe
+                    # CUDA memory corruption resulting in visual artifacts and lagging.
+                    pred_x0_scaled_current_step = torch.empty_like(
+                        lq_latent_x0_scaled_for_unet
                     )
-                    unet_input_cond = torch.empty(
-                        (
-                            latent_shape[0],
-                            latent_shape[1] * 2,
-                            latent_shape[2],
-                            latent_shape[3],
-                        ),
-                        dtype=torch.float32,
-                        device=self.device,
-                    )
-                    pred_x0_scaled_current_step = torch.empty(
-                        latent_shape, dtype=torch.float32, device=self.device
-                    )
-                    # Pre-allocate CFG buffers only if needed
-                    if denoiser_cfg_scale != 1.0:
-                        e_t_uncond = torch.empty(
-                            latent_shape, dtype=torch.float32, device=self.device
-                        )
-                        unet_input_uncond = torch.empty_like(unet_input_cond)
-                        uncond_flag_tensor = torch.tensor(
-                            [False], dtype=torch.bool, device=self.device
-                        ).contiguous()
-                    else:
-                        e_t_uncond = None
-                        unet_input_uncond = None
-                        uncond_flag_tensor = None
 
                     for i, step_ddpm_idx in enumerate(time_range_ddpm_indices):
                         index_for_schedules = total_steps - 1 - i
                         ts_unet = torch.full(
                             (1,), step_ddpm_idx, device=self.device, dtype=torch.int64
                         )
-                        # MP-10: reuse pre-allocated buffer via in-place cat equivalent
-                        unet_input_cond[:, : latent_shape[1]] = current_latent_xt_scaled
-                        unet_input_cond[:, latent_shape[1] :] = (
-                            lq_latent_x0_scaled_for_unet
+
+                        # CRITICAL FIX: Use torch.cat to create clean tensors instead of reusing buffers (MP-10 issue).
+                        unet_input_cond = torch.cat(
+                            [current_latent_xt_scaled, lq_latent_x0_scaled_for_unet],
+                            dim=1,
                         )
+                        e_t_cond = torch.empty_like(lq_latent_x0_scaled_for_unet)
 
                         self.face_restorers.run_ref_ldm_unet(
                             x_noisy_plus_lq_latent=unet_input_cond,
@@ -2187,18 +2127,21 @@ class ModelsProcessor(QtCore.QObject):
                         e_t = e_t_cond
 
                         if denoiser_cfg_scale != 1.0:
-                            # MP-10: reuse pre-allocated uncond buffer
-                            unet_input_uncond[:, : latent_shape[1]] = (
-                                current_latent_xt_scaled
+                            unet_input_uncond = torch.cat(
+                                [
+                                    current_latent_xt_scaled,
+                                    lq_latent_x0_scaled_for_unet,
+                                ],
+                                dim=1,
                             )
-                            unet_input_uncond[:, latent_shape[1] :] = (
-                                lq_latent_x0_scaled_for_unet
-                            )
+                            e_t_uncond = torch.empty_like(lq_latent_x0_scaled_for_unet)
                             self.face_restorers.run_ref_ldm_unet(
                                 x_noisy_plus_lq_latent=unet_input_uncond,
                                 timesteps_tensor=ts_unet,
                                 is_ref_flag_tensor=is_ref_flag_tensor_for_unet,
-                                use_reference_exclusive_path_globally_tensor=uncond_flag_tensor,
+                                use_reference_exclusive_path_globally_tensor=torch.tensor(
+                                    [False], dtype=torch.bool, device=self.device
+                                ).contiguous(),
                                 kv_tensor_map=None,
                                 output_unet_tensor=e_t_uncond,
                             )
@@ -2230,11 +2173,10 @@ class ModelsProcessor(QtCore.QObject):
                             current_latent_xt_scaled.shape,
                         )
 
-                        # MP-10: reuse pre-allocated pred_x0 buffer in-place
-                        pred_x0_scaled_current_step.copy_(
-                            (current_latent_xt_scaled - sqrt_one_minus_a_t * e_t)
-                            / torch.sqrt(a_t).clamp(min=1e-8)
-                        )
+                        pred_x0_scaled_current_step = (
+                            current_latent_xt_scaled - sqrt_one_minus_a_t * e_t
+                        ) / torch.sqrt(a_t).clamp(min=1e-8)
+
                         dir_xt = (
                             torch.sqrt(torch.clamp(1.0 - a_prev - sigma_t**2, min=1e-8))
                             * e_t
@@ -2250,29 +2192,8 @@ class ModelsProcessor(QtCore.QObject):
                             + dir_xt
                             + noise_ddim
                         )
-                        # MP-16: del intermediate tensors each iteration to free memory
-                        del (
-                            dir_xt,
-                            noise_ddim,
-                            a_t,
-                            a_prev,
-                            sigma_t,
-                            sqrt_one_minus_a_t,
-                            schedule_idx_tensor,
-                        )
 
-                    final_denoised_latent_x0_scaled = (
-                        pred_x0_scaled_current_step.clone()
-                    )
-                    # MP-16: del DDIM loop buffers after loop ends
-                    del (
-                        current_latent_xt_scaled,
-                        e_t_cond,
-                        unet_input_cond,
-                        pred_x0_scaled_current_step,
-                    )
-                    if e_t_uncond is not None:
-                        del e_t_uncond, unet_input_uncond
+                    final_denoised_latent_x0_scaled = pred_x0_scaled_current_step
             else:
                 print(
                     f"[ERROR] Denoiser: Unknown mode '{denoiser_mode}'. Skipping denoiser pass."

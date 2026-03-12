@@ -187,7 +187,7 @@ class FaceEditors:
         try:
             # Ensure CUDA stream is synchronized before running the model.
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 self.models_processor.syncvec.cpu()
             model.run_with_iobinding(io_binding)

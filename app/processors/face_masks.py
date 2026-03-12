@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Dict
 
 import torch
+import threading
 import numpy as np
 from torchvision import transforms
 from torchvision.transforms import v2
@@ -28,6 +29,12 @@ class FaceMasks:
         self._morph_kernels: Dict[tuple, torch.Tensor] = {}
         self._kernel_cache: Dict[str, torch.Tensor] = {}
         self._meshgrid_cache: Dict[tuple, tuple[torch.Tensor, torch.Tensor]] = {}
+
+        # --- Thread safety locks for caches and lazy loading ---
+        self._morph_cache_lock = threading.Lock()
+        self._kernel_cache_lock = threading.Lock()
+        self._meshgrid_cache_lock = threading.Lock()
+        self._clip_load_lock = threading.Lock()
 
         self.clip_model_loaded = False
         self.active_models: set[str] = set()
@@ -92,7 +99,7 @@ class FaceMasks:
 
         try:
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 self.models_processor.syncvec.cpu()
             ort_session.run_with_iobinding(io)
@@ -653,9 +660,13 @@ class FaceMasks:
 
     def _get_circle_kernel(self, r: int, device: str) -> torch.Tensor:
         key = (int(r), str(device))
-        k = self._morph_kernels.get(key)
-        if k is not None:
-            return k
+
+        # Thread-safe read
+        with self._morph_cache_lock:
+            k = self._morph_kernels.get(key)
+            if k is not None:
+                return k
+
         rr = int(r)
 
         ys, xs = torch.meshgrid(
@@ -664,7 +675,11 @@ class FaceMasks:
             indexing="ij",
         )
         kernel = ((xs * xs + ys * ys) <= rr * rr).float().unsqueeze(0).unsqueeze(0)
-        self._morph_kernels[key] = kernel
+
+        # Thread-safe write
+        with self._morph_cache_lock:
+            self._morph_kernels[key] = kernel
+
         return kernel
 
     def _dilate_binary(
@@ -759,13 +774,14 @@ class FaceMasks:
 
         # Standard Morphology (Size Slider)
         if amount > 0:
-            if "3x3" not in self._kernel_cache:
-                self._kernel_cache["3x3"] = torch.ones(
-                    (1, 1, 3, 3),
-                    dtype=torch.float32,
-                    device=self.models_processor.device,
-                )
-            kernel = self._kernel_cache["3x3"]
+            with self._kernel_cache_lock:
+                if "3x3" not in self._kernel_cache:
+                    self._kernel_cache["3x3"] = torch.ones(
+                        (1, 1, 3, 3),
+                        dtype=torch.float32,
+                        device=self.models_processor.device,
+                    )
+                kernel = self._kernel_cache["3x3"]
 
             for _ in range(int(amount)):
                 outpred = torch.nn.functional.conv2d(outpred, kernel, padding=(1, 1))
@@ -837,7 +853,7 @@ class FaceMasks:
 
         try:
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 self.models_processor.syncvec.cpu()
             ort_session.run_with_iobinding(io_binding)
@@ -1048,7 +1064,7 @@ class FaceMasks:
 
         try:
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 self.models_processor.syncvec.cpu()
             ort_session.run_with_iobinding(io_binding)
@@ -1098,7 +1114,7 @@ class FaceMasks:
 
         try:
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             else:
                 self.models_processor.syncvec.cpu()
 
@@ -1111,16 +1127,24 @@ class FaceMasks:
 
     def run_CLIPs(self, img, CLIPText, CLIPAmount):
         device = img.device
+        # --- OPTIMIZATION: Double-Checked Locking Pattern ---
+        # Ensures the model is only loaded ONCE in VRAM, preventing Memory Leaks.
+        # The first 'if' avoids lock overhead for 99% of frames.
         if not self.models_processor.clip_session:
-            self.models_processor.clip_session = CLIPDensePredT(
-                version="ViT-B/16", reduce_dim=64, complex_trans_conv=True
-            )
-            self.models_processor.clip_session.eval()
-            self.models_processor.clip_session.load_state_dict(
-                torch.load(f"{models_dir}/rd64-uni-refined.pth", weights_only=True),
-                strict=False,
-            )
-            self.models_processor.clip_session.to(device)
+            with self._clip_load_lock:
+                # Check again inside the lock in case another thread already loaded it
+                if not self.models_processor.clip_session:
+                    self.models_processor.clip_session = CLIPDensePredT(
+                        version="ViT-B/16", reduce_dim=64, complex_trans_conv=True
+                    )
+                    self.models_processor.clip_session.eval()
+                    self.models_processor.clip_session.load_state_dict(
+                        torch.load(
+                            f"{models_dir}/rd64-uni-refined.pth", weights_only=True
+                        ),
+                        strict=False,
+                    )
+                    self.models_processor.clip_session.to(device)
 
         clip_mask = torch.ones((352, 352), device=device)
 
@@ -1166,15 +1190,18 @@ class FaceMasks:
         # FM-09: include device in the cache key and create tensors on the correct device
         _device = device if device is not None else self.models_processor.device
         cache_key = (height, width, str(_device))
-        if cache_key in self._meshgrid_cache:
-            y, x = self._meshgrid_cache[cache_key]
-        else:
-            y, x = torch.meshgrid(
-                torch.arange(height, device=_device),
-                torch.arange(width, device=_device),
-                indexing="ij",
-            )
-            self._meshgrid_cache[cache_key] = (y, x)
+
+        # Thread-safe read and write
+        with self._meshgrid_cache_lock:
+            if cache_key in self._meshgrid_cache:
+                y, x = self._meshgrid_cache[cache_key]
+            else:
+                y, x = torch.meshgrid(
+                    torch.arange(height, device=_device),
+                    torch.arange(width, device=_device),
+                    indexing="ij",
+                )
+                self._meshgrid_cache[cache_key] = (y, x)
 
         normalized_distance = torch.sqrt(
             ((x - center[0]) / radius_x) ** 2 + ((y - center[1]) / radius_y) ** 2

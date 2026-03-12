@@ -1,4 +1,5 @@
 import torch
+import threading
 from skimage import transform as trans
 from torchvision.transforms import v2
 from app.processors.utils import faceutil
@@ -17,6 +18,7 @@ class FaceSwappers:
         self.current_swapper_model = None
         self.current_arcface_model = None
         self._session_io_name_cache: dict = {}  # FS-PERF-02: cache input/output names keyed by session id
+        self._io_cache_lock = threading.Lock()
         self.resize_112 = v2.Resize(
             (112, 112), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
         )
@@ -91,7 +93,7 @@ class FaceSwappers:
         try:
             # ⚠️ This is a critical synchronization point.
             if self.models_processor.device == "cuda":
-                torch.cuda.synchronize()
+                torch.cuda.current_stream().synchronize()
             elif self.models_processor.device != "cpu":
                 # This handles synchronization for other execution providers (e.g., DirectML)
                 self.models_processor.syncvec.cpu()
@@ -235,14 +237,17 @@ class FaceSwappers:
         img = torch.unsqueeze(img, 0).contiguous()
 
         # FS-PERF-02: cache input/output names by session id to avoid repeated ONNX introspection
+        # Lock prevents 'dictionary changed size during iteration' crashes when multiple
+        # workers encounter a new model ID simultaneously.
         session_id = id(ort_session)
-        if session_id not in self._session_io_name_cache:
-            self._session_io_name_cache[session_id] = {
-                "input": ort_session.get_inputs()[0].name,
-                "outputs": [o.name for o in ort_session.get_outputs()],
-            }
-        input_name = self._session_io_name_cache[session_id]["input"]
-        output_names = self._session_io_name_cache[session_id]["outputs"]
+        with self._io_cache_lock:
+            if session_id not in self._session_io_name_cache:
+                self._session_io_name_cache[session_id] = {
+                    "input": ort_session.get_inputs()[0].name,
+                    "outputs": [o.name for o in ort_session.get_outputs()],
+                }
+            input_name = self._session_io_name_cache[session_id]["input"]
+            output_names = self._session_io_name_cache[session_id]["outputs"]
 
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
@@ -604,12 +609,13 @@ class FaceSwappers:
 
         # FS-ROBUST-02: introspect output name dynamically instead of hardcoding node IDs
         session_id = id(ghostfaceswap_model)
-        if session_id not in self._session_io_name_cache:
-            self._session_io_name_cache[session_id] = {
-                "input": ghostfaceswap_model.get_inputs()[0].name,
-                "outputs": [o.name for o in ghostfaceswap_model.get_outputs()],
-            }
-        output_name = self._session_io_name_cache[session_id]["outputs"][0]
+        with self._io_cache_lock:
+            if session_id not in self._session_io_name_cache:
+                self._session_io_name_cache[session_id] = {
+                    "input": ghostfaceswap_model.get_inputs()[0].name,
+                    "outputs": [o.name for o in ghostfaceswap_model.get_outputs()],
+                }
+            output_name = self._session_io_name_cache[session_id]["outputs"][0]
 
         io_binding = ghostfaceswap_model.io_binding()
         io_binding.bind_input(
