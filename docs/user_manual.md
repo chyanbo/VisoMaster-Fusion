@@ -545,6 +545,17 @@ The Job Manager lets you save the current workspace as a job, reload saved jobs,
 | **Use job name for output file name** | When saving a job, uses the job name as the output filename. |
 | **Output File Name** | Lets you choose a custom output filename when the job-name option is turned off. |
 
+### 11.1 Basic Workflow
+
+Use the Job Manager when you want to prepare several jobs first and process them later as a batch.
+
+1. Set up your workspace as you normally would before recording. Choose the target media, assign source faces, and adjust the settings you want to save with the job.
+2. In the Job Manager, click **Save Job**.
+3. Enter a job name. You can also choose whether to use that name for the final output file.
+4. Repeat this for any additional jobs you want to queue.
+5. When you are ready to process, select one or more jobs and click **Process Selected**, or click **Process All** to run the full queue.
+6. Processing starts automatically. When the queue finishes, the app shows a completion message.
+
 ---
 
 ## 12. Presets
