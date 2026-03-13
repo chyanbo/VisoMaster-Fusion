@@ -546,9 +546,9 @@ class FaceDetectors:
                 return None, None, None
 
         return (
-            np.array(tracked_det),
-            np.array(tracked_kpss, dtype=object),
-            np.array(tracked_scores),
+            np.array(tracked_det, dtype=np.float32),
+            np.array(tracked_kpss, dtype=np.float32),
+            np.array(tracked_scores, dtype=np.float32),
         )
 
     def run_detect(
@@ -660,7 +660,7 @@ class FaceDetectors:
                         **kwargs,
                     )
                     return det_r, kpss_5_r, kpss_r
-                return t_det, t_kpss, t_scores
+                return t_det, t_kpss, t_kpss
 
         # FULL DETECTION FALLBACK
         # If no previous detections or tracking failed, run the heavy model
