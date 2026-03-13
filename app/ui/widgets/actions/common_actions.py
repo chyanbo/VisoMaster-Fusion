@@ -504,7 +504,7 @@ def clear_gpu_memory(main_window: "MainWindow"):
     main_window.videoSeekSlider.update()
 
 
-def extract_frame_as_pixmap(
+def extract_frame_as_image(
     main_window: "MainWindow",
     media_file_path,
     file_type,
@@ -512,20 +512,23 @@ def extract_frame_as_pixmap(
     webcam_backend=False,
 ):
     """
-    Extracts a frame from a media file and converts it to a QPixmap for thumbnails.
-    It now uses the ThumbnailManager to efficiently cache and retrieve thumbnails.
+    Extracts a frame from a media file and converts it to a QImage for thumbnails.
+    Returns a thread-safe QImage to avoid GUI/GPU crashes from background workers.
+    It uses the ThumbnailManager to efficiently cache and retrieve thumbnails.
     """
 
-    # This helper function converts a numpy frame to a scaled QPixmap.
-    def convert_frame_to_pixmap(frame):
+    # This helper function converts a numpy frame to a scaled QImage safely.
+    def convert_frame_to_image(frame):
         height, width, _ = frame.shape
         bytes_per_line = 3 * width
+
+        # Format_RGB888 strictly respects PySide6 enums
         q_img = QtGui.QImage(
-            frame.data, width, height, bytes_per_line, QtGui.QImage.Format_RGB888
+            frame.data, width, height, bytes_per_line, QtGui.QImage.Format.Format_RGB888
         ).rgbSwapped()
-        pixmap = QtGui.QPixmap.fromImage(q_img)
-        # The final scaling for display is consistent.
-        return pixmap.scaled(70, 70, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
+
+        # .scaled() returns a deep copy, completely decoupling from the numpy array memory!
+        return q_img.scaled(70, 70, QtCore.Qt.AspectRatioMode.KeepAspectRatio)
 
     # For images and videos, first check for a cached thumbnail.
     if file_type in ["image", "video"]:
@@ -537,14 +540,14 @@ def extract_frame_as_pixmap(
         if thumbnail_path:
             frame = misc_helpers.read_image_file(thumbnail_path)
             if frame is not None:
-                return convert_frame_to_pixmap(frame)
+                return convert_frame_to_image(frame)
 
     # If no cache is found, or for webcams, generate the frame from source.
     frame = None
     if file_type == "image":
         frame = misc_helpers.read_image_file(media_file_path)
     elif file_type == "video":
-        # MODIFICATION: Get rotation for thumbnail
+        # Get rotation for thumbnail
         rotation_angle = get_video_rotation(media_file_path)
         cap = cv2.VideoCapture(media_file_path)
         if cap.isOpened():
@@ -556,7 +559,7 @@ def extract_frame_as_pixmap(
     elif file_type == "webcam":
         camera = cv2.VideoCapture(webcam_index, webcam_backend)
         if camera.isOpened():
-            # MODIFICATION: Pass 0 for webcam rotation
+            # Pass 0 for webcam rotation
             ret, frame = misc_helpers.read_frame(camera, 0)
             camera.release()  # Release camera immediately after grabbing one frame
 
@@ -565,8 +568,8 @@ def extract_frame_as_pixmap(
         if file_type != "webcam":
             main_window.thumbnail_manager.create_thumbnail(frame, media_file_path)
 
-        # Return the generated pixmap.
-        return convert_frame_to_pixmap(frame)
+        # Return the generated thread-safe QImage.
+        return convert_frame_to_image(frame)
 
     return None  # Return None if everything failed.
 

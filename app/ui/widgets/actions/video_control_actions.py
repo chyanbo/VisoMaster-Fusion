@@ -486,7 +486,7 @@ def remove_all_markers(main_window: "MainWindow"):
         main_window.job_marker_pairs.clear()
 
 
-def advance_video_slider_by_n_frames(main_window: "MainWindow", n=30):
+def advance_video_slider_by_n_frames(main_window: "MainWindow", n=None):
     """
     Advances the seek slider forward by *n* frames (clamped to the last frame).
 
@@ -495,6 +495,9 @@ def advance_video_slider_by_n_frames(main_window: "MainWindow", n=30):
     """
     video_processor = main_window.video_processor
     if video_processor.media_capture:
+        if n is None:
+            n = int(main_window.control.get("FrameSkipStepSlider", 30))
+
         current_position = int(main_window.videoSeekSlider.value())
         new_position = current_position + n
         if new_position > video_processor.max_frame_number:
@@ -514,7 +517,7 @@ def advance_video_slider_by_n_frames(main_window: "MainWindow", n=30):
         )
 
 
-def rewind_video_slider_by_n_frames(main_window: "MainWindow", n=30):
+def rewind_video_slider_by_n_frames(main_window: "MainWindow", n=None):
     """
     Rewinds the seek slider backward by *n* frames (clamped to frame 0).
 
@@ -523,6 +526,9 @@ def rewind_video_slider_by_n_frames(main_window: "MainWindow", n=30):
     """
     video_processor = main_window.video_processor
     if video_processor.media_capture:
+        if n is None:
+            n = int(main_window.control.get("FrameSkipStepSlider", 30))
+
         current_position = int(main_window.videoSeekSlider.value())
         new_position = current_position - n
         if new_position < 0:
@@ -1795,6 +1801,10 @@ def toggle_theatre_mode(main_window: "MainWindow"):
 
         # 0. Save the exact state of all docks and toolbars (sizes, proportions, splitters)
         main_window._saved_window_state = main_window.saveState()
+        main_window._was_maximized = main_window.isMaximized()
+        main_window._was_custom_fullscreen = getattr(
+            main_window, "is_full_screen", False
+        )
 
         # 1. Save state and hide Docks, MenuBar
         main_window._saved_dock_states = {
@@ -1892,6 +1902,7 @@ def toggle_theatre_mode(main_window: "MainWindow"):
     else:
         # --- EXIT THEATRE MODE ---
         main_window.is_theatre_mode = False
+        main_window.setUpdatesEnabled(False)
 
         if hasattr(main_window, "theatre_hover_timer"):
             main_window.theatre_hover_timer.stop()
@@ -1956,7 +1967,15 @@ def toggle_theatre_mode(main_window: "MainWindow"):
             main_window.facesPanelGroupBox.setMinimumHeight(hint_height)
 
         # Exit Fullscreen mode
-        main_window.showNormal()
+        was_custom_fullscreen = getattr(main_window, "_was_custom_fullscreen", False)
+        was_maximized = getattr(main_window, "_was_maximized", False)
+
+        if was_custom_fullscreen:
+            main_window.showFullScreen()
+        elif was_maximized:
+            main_window.showMaximized()
+        else:
+            main_window.showNormal()
 
         # Restores the exact layout state of docks (fixes the Input Faces / Target Video sizing)
         if hasattr(main_window, "_saved_window_state"):
@@ -1969,5 +1988,7 @@ def toggle_theatre_mode(main_window: "MainWindow"):
         # Release the minimum height lock so the UI is dynamically responsive again
         if states.get("facesPanelGroupBox"):
             main_window.facesPanelGroupBox.setMinimumHeight(0)
+
+        main_window.setUpdatesEnabled(True)
 
     layout_actions.fit_image_to_view_onchange(main_window)

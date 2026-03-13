@@ -36,10 +36,12 @@ class MasterData(TypedDict):
     embeddings_data: dict[str, dict[str, Any]]
 
 
-# --- Constants ---
+def get_jobs_dir(main_window: "MainWindow") -> Path:
+    """Helper function to get the correct 'jobs' directory using pathlib."""
+    jobs_dir = main_window.project_root_path / "jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    return jobs_dir
 
-jobs_dir = os.path.join(os.getcwd(), "jobs")
-os.makedirs(jobs_dir, exist_ok=True)  # Ensure the directory exists
 
 # --- Parameter Conversion Helpers ---
 
@@ -133,11 +135,12 @@ def save_job(
     This is a wrapper for save_job_workspace.
     """
     try:
-        data_filename = os.path.join(jobs_dir, f"{job_name}")
+        jobs_dir = get_jobs_dir(main_window)
+        data_filename = str(jobs_dir / f"{job_name}")
         save_job_workspace(
             main_window, data_filename, use_job_name_for_output, output_file_name
         )
-        print(f"[INFO] Job saved: {data_filename}")
+        print(f"[INFO] Job saved: {data_filename}.json")
         common_widget_actions.create_and_show_toast_message(
             main_window, "Job Saved", f"Job '{job_name}' has been saved."
         )
@@ -148,12 +151,13 @@ def save_job(
         )
 
 
-def list_jobs() -> list[str]:
+def list_jobs(main_window: "MainWindow") -> list[str]:
     """Lists all saved jobs (JSON files) from the 'jobs' directory."""
-    if not os.path.exists(jobs_dir):
+    jobs_dir = get_jobs_dir(main_window)
+    if not jobs_dir.exists():
         return []
-    # Return job names without the .json extension
-    return [f.replace(".json", "") for f in os.listdir(jobs_dir) if f.endswith(".json")]
+    # Return job names without the .json extension using Pathlib
+    return [f.stem for f in jobs_dir.glob("*.json")]
 
 
 def delete_job(main_window: "MainWindow") -> bool:
@@ -181,11 +185,12 @@ def delete_job(main_window: "MainWindow") -> bool:
         return False
 
     deleted_any = False
+    jobs_dir = get_jobs_dir(main_window)
     for job_name in selected_jobs:
-        job_file = os.path.join(jobs_dir, f"{job_name}.json")
-        if os.path.exists(job_file):
+        job_file = jobs_dir / f"{job_name}.json"
+        if job_file.exists():
             try:
-                send2trash(job_file)  # Use send2trash for safety
+                send2trash(str(job_file))  # Use send2trash for safety
                 print(f"[INFO] Job moved to trash: {job_file}")
                 deleted_any = True
             except Exception as e:
@@ -678,8 +683,10 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
     """
 
     print("[INFO] Loading job workspace...")
-    data_filename = os.path.join(jobs_dir, f"{job_name}.json")
-    if not Path(data_filename).is_file():
+    jobs_dir = get_jobs_dir(main_window)
+    data_filename = jobs_dir / f"{job_name}.json"
+
+    if not data_filename.is_file():
         print(f"[ERROR] No valid file found for job: {job_name}.")
         QMessageBox.critical(
             main_window, "Load Error", f"Job file not found:\n{data_filename}"
@@ -1318,7 +1325,7 @@ def refresh_job_list(main_window: "MainWindow"):
     """Updates the job queue list widget with the latest job files."""
     if main_window.jobQueueList:
         main_window.jobQueueList.clear()
-        job_names = list_jobs()
+        job_names = list_jobs(main_window)
         main_window.jobQueueList.addItems(job_names)
         update_job_manager_buttons(main_window)
 
@@ -1709,13 +1716,15 @@ class JobProcessor(QThread):
         """
         super().__init__()
         self.main_window = main_window
-        self.jobs_dir = os.path.join(os.getcwd(), "jobs")
-        self.completed_dir = os.path.join(self.jobs_dir, "completed")
+
+        # Use pathlib
+        self.jobs_dir = main_window.project_root_path / "jobs"
+        self.completed_dir = self.jobs_dir / "completed"
 
         if jobs_to_process is not None:
             self.jobs = jobs_to_process
         else:
-            self.jobs = list_jobs()  # Get all current jobs
+            self.jobs = list_jobs(main_window)
 
         self.current_job_name = None
         self.batch_succeeded = (
@@ -1723,8 +1732,7 @@ class JobProcessor(QThread):
         )
         self.skipped_jobs: list[str] = []  # Store jobs that fail pre-flight checks
 
-        if not os.path.exists(self.completed_dir):
-            os.makedirs(self.completed_dir)
+        self.completed_dir.mkdir(parents=True, exist_ok=True)
 
         # --- Encapsulated Threading Events ---
         self.master_assets_loaded_event = threading.Event()
@@ -1775,8 +1783,8 @@ class JobProcessor(QThread):
 
     def _read_job_file(self, job_name: str) -> dict | None:
         """Reads and parses a job's JSON file."""
-        data_filename = os.path.join(self.jobs_dir, f"{job_name}.json")
-        if not Path(data_filename).is_file():
+        data_filename = self.jobs_dir / f"{job_name}.json"
+        if not data_filename.is_file():
             print(f"[ERROR] No valid file found for job: {job_name}.")
             self.job_failed_signal.emit(
                 job_name, f"Job file not found: {data_filename}"

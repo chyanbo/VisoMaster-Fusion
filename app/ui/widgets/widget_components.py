@@ -382,11 +382,11 @@ class TargetMediaCardButton(CardButton):
                 # Windows - use full path to explorer.exe to avoid PATH issues
                 try:
                     # Method 1: Using subprocess without shell (more secure and reliable)
-                    subprocess.Popen(["explorer", "/select,", normalized_path])
+                    subprocess.Popen(["explorer", f"/select,{normalized_path}"])
                 except FileNotFoundError:
                     # Fallback: Use full path to explorer.exe
                     subprocess.Popen(
-                        [r"C:\Windows\explorer.exe", "/select,", normalized_path]
+                        [r"C:\Windows\explorer.exe", f"/select,{normalized_path}"]
                     )
             elif sys.platform == "darwin":
                 # macOS
@@ -1109,11 +1109,11 @@ class InputFaceCardButton(CardButton):
                 # Windows - use full path to explorer.exe to avoid PATH issues
                 try:
                     # Method 1: Using subprocess without shell (more secure and reliable)
-                    subprocess.Popen(["explorer", "/select,", normalized_path])
+                    subprocess.Popen(["explorer", f"/select,{normalized_path}"])
                 except FileNotFoundError:
                     # Fallback: Use full path to explorer.exe
                     subprocess.Popen(
-                        [r"C:\Windows\explorer.exe", "/select,", normalized_path]
+                        [r"C:\Windows\explorer.exe", f"/select,{normalized_path}"]
                     )
             elif sys.platform == "darwin":
                 # macOS
@@ -1896,9 +1896,7 @@ class ParameterSlider(QtWidgets.QSlider, ParametersWidget):
 
     def mousePressEvent(self, event):
         """Handle the mouse press event to update the slider value immediately."""
-        if (
-            event.button() == QtCore.Qt.LeftButton
-        ):  # Verifica che sia il pulsante sinistro del mouse
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
             self.setValue(self.pos_to_value(event.pos().x()))
 
         # Chiama il metodo della classe base per gestire il resto dell'evento
@@ -2062,10 +2060,7 @@ class ParameterDecimalSlider(QtWidgets.QSlider, ParametersWidget):
 
     def mousePressEvent(self, event):
         """Handle the mouse press event to update the slider value immediately."""
-        if (
-            event.button() == QtCore.Qt.LeftButton
-        ):  # Verifica che sia il pulsante sinistro del mouse
-            # Aggiorna immediatamente il valore dello slider
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
             self.setValue(self.pos_to_value(event.pos().x()))
 
         # Chiama il metodo della classe base per gestire il resto dell'evento

@@ -623,9 +623,14 @@ def show_hide_theatre_mode_panels(main_window: "MainWindow", checked):
 
 
 def fit_image_to_view_onchange(main_window: "MainWindow", *args):
-    pixmap_items = main_window.scene.items()
-    if pixmap_items:
-        pixmap_item = pixmap_items[0]
+    pixmap_item = None
+    # Secure image search
+    for item in main_window.scene.items():
+        if isinstance(item, QtWidgets.QGraphicsPixmapItem):
+            pixmap_item = item
+            break
+
+    if pixmap_item:
         scene_rect = pixmap_item.boundingRect()
         QtCore.QTimer.singleShot(
             0,
@@ -724,13 +729,25 @@ def set_all_parameters_and_control_widgets_enabled(
     for _, target_face_button in main_window.target_faces.items():
         target_face_button.setDisabled(disabled)
 
-    # Parameters and controls dict widgets
+    # Parameters and controls dict widgets - SECURED
     for _, widget in main_window.parameter_widgets.items():
+        if not widget:
+            continue
+
         widget.setDisabled(disabled)
-        widget.reset_default_button.setDisabled(disabled)
-        widget.label_widget.setDisabled(disabled)
-        if widget.line_edit:
-            widget.line_edit.setDisabled(disabled)
+
+        # Check safely if the attributes exist before disabling them
+        reset_btn = getattr(widget, "reset_default_button", None)
+        if reset_btn:
+            reset_btn.setDisabled(disabled)
+
+        label_w = getattr(widget, "label_widget", None)
+        if label_w:
+            label_w.setDisabled(disabled)
+
+        line_e = getattr(widget, "line_edit", None)
+        if line_e:
+            line_e.setDisabled(disabled)
 
 
 def disable_all_parameters_and_control_widget(main_window: "MainWindow"):

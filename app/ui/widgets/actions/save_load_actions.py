@@ -267,11 +267,9 @@ def load_saved_workspace(
             # before continuing, ensuring UI elements are fully instantiated.
             QtWidgets.QApplication.processEvents()
 
-            # Select target media
-            selected_media_id = data["selected_media_id"]
-            if selected_media_id is not False and main_window.target_videos.get(
-                selected_media_id
-            ):
+            # Select target media (Secured with .get to prevent KeyError on older workspaces)
+            selected_media_id = data.get("selected_media_id", False)
+            if selected_media_id and main_window.target_videos.get(selected_media_id):
                 main_window.target_videos[selected_media_id].click()
 
             # Add input faces (imgs)
@@ -616,20 +614,21 @@ def save_current_workspace(
     # --- Serialize Input Faces ---
     for face_id, input_face in main_window.input_faces.items():
         kv_map_path = None
-        if is_denoiser_enabled and hasattr(input_face, "kv_map") and input_face.kv_map:
-            kv_data_dir = str(
+        if is_denoiser_enabled and getattr(input_face, "kv_map", None) is not None:
+            # Use Pathlib
+            kv_data_dir = (
                 main_window.project_root_path / "model_assets" / "reference_kv_data"
             )
-            os.makedirs(kv_data_dir, exist_ok=True)
-            kv_map_path = os.path.join(kv_data_dir, f"input_{input_face.face_id}.pt")
+            kv_data_dir.mkdir(parents=True, exist_ok=True)
+            kv_map_file = kv_data_dir / f"input_{input_face.face_id}.pt"
             try:
                 payload = {"kv_map": input_face.kv_map}
-                torch.save(payload, kv_map_path)
+                torch.save(payload, str(kv_map_file))
+                kv_map_path = str(kv_map_file)
             except Exception as e:
                 print(
-                    f"[ERROR] Error saving K/V map for input face {input_face.face_id} to {kv_map_path}: {e}"
+                    f"[ERROR] Error saving K/V map for input face {input_face.face_id} to {kv_map_file}: {e}"
                 )
-                kv_map_path = None
         input_faces_data[face_id] = {
             "media_path": input_face.media_path,
             "kv_map": kv_map_path,
@@ -767,8 +766,10 @@ def save_current_job(main_window: "MainWindow"):
             main_window, "Error", "No target faces detected or assigned.", main_window
         )
         return
+
+    # Check on Dict to prevent crash
     if not any(
-        tf.get_assigned_total_input_faces() for tf in main_window.target_faces.values()
+        len(tf.assigned_input_faces) > 0 for tf in main_window.target_faces.values()
     ):
         common_widget_actions.create_and_show_messagebox(
             main_window,
@@ -804,20 +805,21 @@ def save_current_job(main_window: "MainWindow"):
     input_faces_data = {}
     for face_id, input_face in main_window.input_faces.items():
         kv_map_path = None
-        if is_denoiser_enabled and hasattr(input_face, "kv_map") and input_face.kv_map:
-            kv_data_dir = str(
+        if is_denoiser_enabled and getattr(input_face, "kv_map", None) is not None:
+            # Use Pathlib
+            kv_data_dir = (
                 main_window.project_root_path / "model_assets" / "reference_kv_data"
             )
-            os.makedirs(kv_data_dir, exist_ok=True)
-            kv_map_path = os.path.join(kv_data_dir, f"input_{input_face.face_id}.pt")
+            kv_data_dir.mkdir(parents=True, exist_ok=True)
+            kv_map_file = kv_data_dir / f"input_{input_face.face_id}.pt"
             try:
                 payload = {"kv_map": input_face.kv_map}
-                torch.save(payload, kv_map_path)
+                torch.save(payload, str(kv_map_file))
+                kv_map_path = str(kv_map_file)
             except Exception as e:
                 print(
-                    f"[ERROR] Error saving K/V map for input face {input_face.face_id} to {kv_map_path}: {e}"
+                    f"[ERROR] Error saving K/V map for input face {input_face.face_id} to {kv_map_file}: {e}"
                 )
-                kv_map_path = None
         input_faces_data[face_id] = {
             "media_path": input_face.media_path,
             "kv_map": kv_map_path,
@@ -857,31 +859,43 @@ def save_current_job(main_window: "MainWindow"):
         ),
         "control": main_window.control.copy(),
         "job_marker_pairs": main_window.job_marker_pairs,
-        "current_widget_parameters": main_window.current_widget_parameters.data.copy(),
+        "current_widget_parameters": main_window.current_widget_parameters.data.copy()
+        if isinstance(
+            main_window.current_widget_parameters, misc_helpers.ParametersDict
+        )
+        else main_window.current_widget_parameters.copy(),
         "last_target_media_folder_path": main_window.last_target_media_folder_path,
         "last_input_media_folder_path": main_window.last_input_media_folder_path,
     }
 
     # Serialize target face specifics for the job
     for face_id, target_face in main_window.target_faces.items():
+        # Security to handle either custom ParametersDict or native dict
+        params_source = main_window.parameters.get(
+            str(face_id), main_window.default_parameters
+        )
+        params_to_save = (
+            params_source.data.copy()
+            if isinstance(params_source, misc_helpers.ParametersDict)
+            else params_source.copy()
+        )
+
         job_data["target_faces_data"][face_id] = {
             "cropped_face": target_face.cropped_face.tolist(),
             "embedding_store": {
                 m: e.tolist() for m, e in target_face.embedding_store.items()
             },
-            "parameters": main_window.parameters.get(
-                str(face_id), main_window.default_parameters
-            ).data.copy(),
+            "parameters": params_to_save,
             "assigned_input_faces": list(target_face.assigned_input_faces.keys()),
             "assigned_merged_embeddings": list(
                 target_face.assigned_merged_embeddings.keys()
             ),
         }
 
-    # Define save path
-    jobs_dir = str(main_window.project_root_path / ".jobs")
-    os.makedirs(jobs_dir, exist_ok=True)
-    save_path = os.path.join(jobs_dir, f"{job_name}.json")
+    # Use pathlib
+    jobs_dir = main_window.project_root_path / ".jobs"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    save_path = jobs_dir / f"{job_name}.json"
 
     # Save the job file
     try:
