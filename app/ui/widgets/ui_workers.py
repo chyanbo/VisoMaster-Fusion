@@ -7,7 +7,7 @@ import os
 import torch
 import numpy
 from PySide6 import QtCore as qtc
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QImage
 
 from app.helpers import miscellaneous as misc_helpers
 from app.ui.widgets.actions import common_actions as common_widget_actions
@@ -19,11 +19,11 @@ if TYPE_CHECKING:
 
 
 class TargetMediaLoaderWorker(qtc.QThread):
-    # Define signals to emit when loading is done or if there are updates
+    # Define signals to emit when loading is done or if there are updates - changed to QImage
     thumbnail_ready = qtc.Signal(
-        str, QPixmap, str, str
-    )  # Signal with media path and QPixmap and file_type, media_id
-    webcam_thumbnail_ready = qtc.Signal(str, QPixmap, str, str, int, int)
+        str, QImage, str, str
+    )  # Signal with media path and QImage and file_type, media_id
+    webcam_thumbnail_ready = qtc.Signal(str, QImage, str, str, int, int)
     finished = qtc.Signal()  # Signal to indicate completion
 
     def __init__(
@@ -57,12 +57,11 @@ class TargetMediaLoaderWorker(qtc.QThread):
         self.main_window.placeholder_update_signal.emit(
             self.main_window.targetVideosList, True
         )
-        video_files = misc_helpers.get_video_files(
-            folder_name, self.main_window.control["TargetMediaFolderRecursiveToggle"]
+        recursive_toggle = self.main_window.control.get(
+            "TargetMediaFolderRecursiveToggle", False
         )
-        image_files = misc_helpers.get_image_files(
-            folder_name, self.main_window.control["TargetMediaFolderRecursiveToggle"]
-        )
+        video_files = misc_helpers.get_video_files(folder_name, recursive_toggle)
+        image_files = misc_helpers.get_image_files(folder_name, recursive_toggle)
 
         i = 0
         media_files = video_files + image_files
@@ -74,16 +73,15 @@ class TargetMediaLoaderWorker(qtc.QThread):
                 break
             media_file_path = os.path.join(folder_name, media_file)
             file_type = misc_helpers.get_file_type(media_file_path)
-            pixmap = common_widget_actions.extract_frame_as_pixmap(
+            q_image = common_widget_actions.extract_frame_as_image(
                 self.main_window, media_file_path, file_type
             )
-            if self.media_ids:
-                media_id = self.media_ids[i]
-            else:
-                media_id = str(uuid.uuid1().int)
-            if pixmap:
+
+            media_id = self.media_ids[i] if self.media_ids else str(uuid.uuid1().int)
+
+            if q_image:
                 # Emit the signal to update GUI
-                self.thumbnail_ready.emit(media_file_path, pixmap, file_type, media_id)
+                self.thumbnail_ready.emit(media_file_path, q_image, file_type, media_id)
             i += 1
         # Show/Hide the placeholder text based on the number of items in ListWidget
         self.main_window.placeholder_update_signal.emit(
@@ -110,29 +108,29 @@ class TargetMediaLoaderWorker(qtc.QThread):
             if not os.path.exists(media_file_path):
                 continue
             file_type = misc_helpers.get_file_type(media_file_path)
-            pixmap = common_widget_actions.extract_frame_as_pixmap(
+            q_image = common_widget_actions.extract_frame_as_image(
                 self.main_window, media_file_path, file_type=file_type
             )
-            if pixmap:
+            if q_image:
                 # Emit the signal to update GUI
-                self.thumbnail_ready.emit(media_file_path, pixmap, file_type, media_id)
+                self.thumbnail_ready.emit(media_file_path, q_image, file_type, media_id)
 
         self.main_window.placeholder_update_signal.emit(
             self.main_window.targetVideosList, False
         )
 
-    def load_webcams(
-        self,
-    ):
+    def load_webcams(self):
         self.main_window.placeholder_update_signal.emit(
             self.main_window.targetVideosList, True
         )
         camera_backend = CAMERA_BACKENDS[
-            self.main_window.control["WebcamBackendSelection"]
+            self.main_window.control.get("WebcamBackendSelection", "DirectShow")
         ]
-        for i in range(int(self.main_window.control["WebcamMaxNoSelection"])):
+        max_no = int(self.main_window.control.get("WebcamMaxNoSelection", 1))
+
+        for i in range(max_no):
             try:
-                pixmap = common_widget_actions.extract_frame_as_pixmap(
+                q_image = common_widget_actions.extract_frame_as_image(
                     self.main_window,
                     media_file_path=f"Webcam {i}",
                     file_type="webcam",
@@ -141,19 +139,20 @@ class TargetMediaLoaderWorker(qtc.QThread):
                 )
                 media_id = str(uuid.uuid1().int)
 
-                if pixmap:
+                if q_image:
                     # Emit the signal to update GUI
                     self.webcam_thumbnail_ready.emit(
-                        f"Webcam {i}", pixmap, "webcam", media_id, i, camera_backend
+                        f"Webcam {i}", q_image, "webcam", media_id, i, camera_backend
                     )
-            except Exception:  # pylint: disable=broad-exception-caught
+            except Exception:
                 traceback.print_exc()
+
         self.main_window.placeholder_update_signal.emit(
             self.main_window.targetVideosList, False
         )
 
     def stop(self):
-        """Stop the thread by setting the running flag to False."""
+        # Stop the thread by setting the running flag to False.
         self._running = False
         self.quit()
         self.wait(1000)
@@ -162,8 +161,8 @@ class TargetMediaLoaderWorker(qtc.QThread):
 
 
 class InputFacesLoaderWorker(qtc.QThread):
-    # Define signals to emit when loading is done or if there are updates
-    thumbnail_ready = qtc.Signal(str, numpy.ndarray, object, QPixmap, str)
+    # Define signals to emit when loading is done or if there are updates - Changed to QImage
+    thumbnail_ready = qtc.Signal(str, numpy.ndarray, object, QImage, str)
     finished = qtc.Signal()  # Signal to indicate completion
 
     def __init__(
@@ -181,6 +180,11 @@ class InputFacesLoaderWorker(qtc.QThread):
         self.files_list = files_list or []
         self.face_ids = face_ids or []
         self._running = True  # Flag to control the running state
+
+        # SNAPSHOT : get parameters in main thread before run()
+        self.control_snapshot = (
+            main_window.control.copy() if getattr(main_window, "control", None) else {}
+        )
 
     def run(self):
         """
@@ -203,7 +207,8 @@ class InputFacesLoaderWorker(qtc.QThread):
             self.finished.emit()
 
     def load_faces(self, folder_name=False, files_list=None):
-        control = self.main_window.control.copy()
+        # Use the snapshot - thread-safe
+        control = self.control_snapshot
         files_list = files_list or []
 
         # OPTIMIZED: Pair the file paths with their correct IDs before any processing
@@ -213,7 +218,7 @@ class InputFacesLoaderWorker(qtc.QThread):
         if folder_name:
             image_files = misc_helpers.get_image_files(
                 self.folder_name,
-                self.main_window.control["InputFacesFolderRecursiveToggle"],
+                control.get("InputFacesFolderRecursiveToggle", False),
             )
             image_files.sort()  # Safe to sort here, IDs are generated fresh
             for path in image_files:
@@ -243,18 +248,19 @@ class InputFacesLoaderWorker(qtc.QThread):
                 self.main_window.models_processor.device
             )
             img = img.permute(2, 0, 1)
+
             _, kpss_5, _ = self.main_window.models_processor.run_detect(
                 img,
-                control["DetectorModelSelection"],
+                control.get("DetectorModelSelection", "RetinaFace"),
                 max_num=1,
-                score=control["DetectorScoreSlider"] / 100.0,
+                score=control.get("DetectorScoreSlider", 50) / 100.0,
                 input_size=(512, 512),
-                use_landmark_detection=control["LandmarkDetectToggle"],
-                landmark_detect_mode=control["LandmarkDetectModelSelection"],
-                landmark_score=control["LandmarkDetectScoreSlider"] / 100.0,
-                from_points=control["DetectFromPointsToggle"],
+                use_landmark_detection=control.get("LandmarkDetectToggle", False),
+                landmark_detect_mode=control.get("LandmarkDetectModelSelection", "203"),
+                landmark_score=control.get("LandmarkDetectScoreSlider", 50) / 100.0,
+                from_points=control.get("DetectFromPointsToggle", False),
                 rotation_angles=[0]
-                if not control["AutoRotationToggle"]
+                if not control.get("AutoRotationToggle", False)
                 else [0, 90, 180, 270],
             )
 
@@ -264,12 +270,14 @@ class InputFacesLoaderWorker(qtc.QThread):
             face_kps = kpss_5[0]
             if face_kps.any():
                 # Calculate embedding ONLY for the selected recognition model
-                selected_recognition_model = control["RecognitionModelSelection"]
+                selected_recognition_model = control.get(
+                    "RecognitionModelSelection", "Inswapper128ArcFace"
+                )
                 face_emb, cropped_img = (
                     self.main_window.models_processor.run_recognize_direct(
                         img,
                         face_kps,
-                        control["SimilarityTypeSelection"],
+                        control.get("SimilarityTypeSelection", "Optimal"),
                         selected_recognition_model,  # Use selected model
                     )
                 )
@@ -280,9 +288,13 @@ class InputFacesLoaderWorker(qtc.QThread):
                 cropped_img_np = cropped_img.cpu().numpy()
                 # Swap channels from RGB to BGR for pixmap creation
                 face_img = numpy.ascontiguousarray(cropped_img_np[..., ::-1])
-                pixmap = common_widget_actions.get_pixmap_from_frame(
-                    self.main_window, face_img
-                )
+
+                # QIMAGE THREAD-SAFE
+                height, width, channel = face_img.shape
+                bytes_per_line = 3 * width
+                q_image = QImage(
+                    face_img.data, width, height, bytes_per_line, QImage.Format_BGR888
+                ).copy()
 
                 embedding_store: Dict[str, numpy.ndarray] = {
                     selected_recognition_model: face_emb,
@@ -290,13 +302,13 @@ class InputFacesLoaderWorker(qtc.QThread):
                 }
 
                 self.thumbnail_ready.emit(
-                    image_file_path, face_img, embedding_store, pixmap, face_id
+                    image_file_path, face_img, embedding_store, q_image, face_id
                 )
 
-        torch.cuda.empty_cache()
+        # torch.cuda.empty_cache()  removed to not block main thread
 
     def stop(self):
-        """Stop the thread by setting the running flag to False."""
+        # Stop the thread by setting the running flag to False.
         self._running = False
         self.quit()
         self.wait(1000)
@@ -327,9 +339,7 @@ class FilterWorker(qtc.QThread):
             )
         )
 
-    def get_list_widget(
-        self,
-    ):
+    def get_list_widget(self):
         list_widget = False
         if self.filter_list == "target_videos":
             list_widget = self.main_window.targetVideosList
@@ -339,9 +349,7 @@ class FilterWorker(qtc.QThread):
             list_widget = self.main_window.inputEmbeddingsList
         return list_widget
 
-    def run(
-        self,
-    ):
+    def run(self):
         if self.filter_list == "target_videos":
             self.filter_target_videos()
         elif self.filter_list == "input_faces":

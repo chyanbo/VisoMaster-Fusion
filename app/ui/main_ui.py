@@ -1,6 +1,5 @@
 from typing import Dict, Optional
 from pathlib import Path
-import os
 from functools import partial
 import copy
 
@@ -47,6 +46,9 @@ from app.processors.models_data import (
     models_dir as global_models_dir,
 )  # For UNet model discovery
 
+# --- Constants ---
+DENOISER_MODE_SINGLE_STEP = "Single Step (Fast)"
+DENOISER_MODE_FULL_RESTORE = "Full Restore (DDIM)"
 
 ParametersWidgetTypes = Dict[
     str,
@@ -448,15 +450,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             "DenoiserModeSelectionBefore"
         )
         if denoiser_mode_before_combo:
-            # Pass the new text (current_mode_text) from the signal to the handler
             denoiser_mode_before_combo.currentTextChanged.connect(
-                lambda text, ps="Before": (
-                    self.update_denoiser_controls_visibility_for_pass(ps, text)
-                )
+                partial(self.update_denoiser_controls_visibility_for_pass, "Before")
             )
-            # Initial call using the value from self.control, which should be the default
             initial_mode_before = self.control.get(
-                "DenoiserModeSelectionBefore", "Single Step (Fast)"
+                "DenoiserModeSelectionBefore", DENOISER_MODE_SINGLE_STEP
             )
             self.update_denoiser_controls_visibility_for_pass(
                 "Before", initial_mode_before
@@ -467,12 +465,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         if denoiser_mode_after_first_combo:
             denoiser_mode_after_first_combo.currentTextChanged.connect(
-                lambda text, ps="AfterFirst": (
-                    self.update_denoiser_controls_visibility_for_pass(ps, text)
-                )
+                partial(self.update_denoiser_controls_visibility_for_pass, "AfterFirst")
             )
             initial_mode_after_first = self.control.get(
-                "DenoiserModeSelectionAfterFirst", "Single Step (Fast)"
+                "DenoiserModeSelectionAfterFirst", DENOISER_MODE_SINGLE_STEP
             )
             self.update_denoiser_controls_visibility_for_pass(
                 "AfterFirst", initial_mode_after_first
@@ -483,12 +479,10 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         if denoiser_mode_after_combo:
             denoiser_mode_after_combo.currentTextChanged.connect(
-                lambda text, ps="After": (
-                    self.update_denoiser_controls_visibility_for_pass(ps, text)
-                )
+                partial(self.update_denoiser_controls_visibility_for_pass, "After")
             )
             initial_mode_after = self.control.get(
-                "DenoiserModeSelectionAfter", "Single Step (Fast)"
+                "DenoiserModeSelectionAfter", DENOISER_MODE_SINGLE_STEP
             )
             self.update_denoiser_controls_visibility_for_pass(
                 "After", initial_mode_after
@@ -544,23 +538,27 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     widget_instance.line_edit.setVisible(is_visible)
 
         # Set visibility for Single Step controls
-        is_single_step_mode = current_mode == "Single Step (Fast)"
+        is_single_step_mode = current_mode == DENOISER_MODE_SINGLE_STEP
         set_widget_visibility(single_step_widget, is_single_step_mode)
 
         # Set visibility for Full Restore (DDIM) controls
-        is_full_restore_mode = current_mode == "Full Restore (DDIM)"
+        is_full_restore_mode = current_mode == DENOISER_MODE_FULL_RESTORE
         set_widget_visibility(ddim_steps_widget, is_full_restore_mode)
         set_widget_visibility(cfg_scale_widget, is_full_restore_mode)
 
     def _populate_model_file_selection_widget(
-        self, widget_name: str, scan_dir: str, prefix: str, ext: str
+        self, widget_name: str, scan_dir: Path, prefix: str, ext: str
     ):
         """Helper that scans scan_dir for files matching prefix+ext, populates a SelectionBox widget."""
         model_files = []
-        if os.path.exists(scan_dir):
-            for f_name in os.listdir(scan_dir):
-                if (not prefix or f_name.startswith(prefix)) and f_name.endswith(ext):
-                    model_files.append(f_name)
+        if scan_dir.exists() and scan_dir.is_dir():
+            for f_path in scan_dir.iterdir():
+                if f_path.is_file():
+                    f_name = f_path.name
+                    if (not prefix or f_name.startswith(prefix)) and f_name.endswith(
+                        ext
+                    ):
+                        model_files.append(f_name)
         model_files.sort()
 
         selection_widget = self.parameter_widgets.get(widget_name)
@@ -586,13 +584,13 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def _populate_denoiser_unet_models(self):
         self._populate_model_file_selection_widget(
             widget_name="DenoiserUNetModelSelection",
-            scan_dir=global_models_dir,
+            scan_dir=self.actual_models_dir_path,
             prefix="ref_ldm_unet_",
             ext=".onnx",
         )
 
     def _populate_reference_kv_tensors(self):
-        kv_tensors_dir = os.path.join(global_models_dir, "reference_kv_data")
+        kv_tensors_dir = self.actual_models_dir_path / "reference_kv_data"
         self._populate_model_file_selection_widget(
             widget_name="ReferenceKVTensorsSelection",
             scan_dir=kv_tensors_dir,
@@ -725,9 +723,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             case QtCore.Qt.Key_C:
                 video_control_actions.rewind_video_slider_by_n_frames(self, n=1)
             case QtCore.Qt.Key_D:
-                video_control_actions.advance_video_slider_by_n_frames(self, n=30)
+                video_control_actions.advance_video_slider_by_n_frames(self)
             case QtCore.Qt.Key_A:
-                video_control_actions.rewind_video_slider_by_n_frames(self, n=30)
+                video_control_actions.rewind_video_slider_by_n_frames(self)
             case QtCore.Qt.Key_Z:
                 self.videoSeekSlider.setValue(0)
             case QtCore.Qt.Key_Space:
@@ -779,23 +777,21 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self._populate_denoiser_unet_models()
             self._populate_reference_kv_tensors()
 
-    def save_last_workspace(self):
-        pass
-
     @QtCore.Slot(bool)
     def _on_faces_panel_toggled(self, checked: bool):
-        # checked=True  -> Faces-Panel sichtbar  -> alles zurück ins Panel
-        # checked=False -> Faces-Panel aus       -> Liste + Buttons nach rechts
+        """
+        Handles the visibility toggle of the Faces Panel.
+        Moves the list and buttons safely using Qt's automatic layout reparenting.
+        """
         if checked:
-            # zurück ins Panel
             if getattr(self, "_rightFacesStrip", None):
                 self._restore_faces_strip_to_panel()
         else:
-            # nach rechts ziehen
             self._ensure_right_faces_strip()
             self._move_faces_strip_to_right()
 
     def _ensure_right_faces_strip(self):
+        """Initializes the right faces strip container once."""
         if getattr(self, "_rightFacesStrip", None) is not None:
             return
 
@@ -804,133 +800,75 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         stripLayout.setContentsMargins(0, 0, 0, 0)
         stripLayout.setSpacing(6)
 
-        # Faces oben
         self._rightFacesFacesHolder = QtWidgets.QVBoxLayout()
         self._rightFacesFacesHolder.setContentsMargins(0, 0, 0, 0)
         self._rightFacesFacesHolder.setSpacing(0)
         stripLayout.addLayout(self._rightFacesFacesHolder)
 
-        # Buttons unten nebeneinander
-        self._rightFacesButtonsRow = QtWidgets.QHBoxLayout()
+        self._rightFacesButtonsRowContainer = QtWidgets.QWidget(self._rightFacesStrip)
+        self._rightFacesButtonsRow = QtWidgets.QHBoxLayout(
+            self._rightFacesButtonsRowContainer
+        )
         self._rightFacesButtonsRow.setContentsMargins(0, 0, 0, 0)
         self._rightFacesButtonsRow.setSpacing(8)
-        stripLayout.addLayout(self._rightFacesButtonsRow)
 
-        # unter den Tabs im rechten Dock
+        # Add a permanent stretch to push buttons to the left safely without memory leaks
+        self._rightFacesButtonsRow.addStretch(1)
+
+        stripLayout.addWidget(self._rightFacesButtonsRowContainer)
         self.gridLayout_5.addWidget(self._rightFacesStrip, 2, 0, 1, 1)
 
-        # ---- Höhe & Policies für den Strip kompakt setzen ----
         sp_strip = self._rightFacesStrip.sizePolicy()
         sp_strip.setVerticalPolicy(QtWidgets.QSizePolicy.Fixed)
         self._rightFacesStrip.setSizePolicy(sp_strip)
 
-        # Max-Höhen: Liste + Buttons zusammen ~170px
-        # -> Liste (Thumbnails)
-        try:
-            self.targetFacesList.setMaximumHeight(
-                _FACE_STRIP_LIST_HEIGHT
-            )  # kompakte Thumbnail-Zeile
-        except Exception as e:
-            print(f"[WARN] Layout operation failed: {e}")
-
-        # Buttons-Reihe: optional per Container fixieren
-        self._rightFacesButtonsRowContainer = getattr(
-            self, "_rightFacesButtonsRowContainer", None
-        )
-        if self._rightFacesButtonsRowContainer is None:
-            self._rightFacesButtonsRowContainer = QtWidgets.QWidget(
-                self._rightFacesStrip
-            )
-            lay = QtWidgets.QHBoxLayout(self._rightFacesButtonsRowContainer)
-            lay.setContentsMargins(0, 0, 0, 0)
-            lay.setSpacing(8)
-            # alten Row-Layout-Inhalt in den Container umziehen
-            while self._rightFacesButtonsRow.count():
-                item = self._rightFacesButtonsRow.takeAt(0)
-                w = item.widget()
-                if w:
-                    lay.addWidget(w)
-            # alten Row durch Container ersetzen
-            parent_v = self._rightFacesStrip.layout()
-            parent_v.removeItem(self._rightFacesButtonsRow)
-            parent_v.addWidget(self._rightFacesButtonsRowContainer)
-            self._rightFacesButtonsRow = lay
-
+        self.targetFacesList.setMaximumHeight(_FACE_STRIP_LIST_HEIGHT)
         self._rightFacesButtonsRowContainer.setFixedHeight(_FACE_STRIP_BUTTONS_HEIGHT)
-
-        # Gesamthöhe des Strips hart deckeln
         self._rightFacesStrip.setMaximumHeight(_FACE_STRIP_MAX_HEIGHT)
 
-        # ---- Layout-Gewichte: Tabs (Zeile 1) kriegen alles, Strip (Zeile 2) nichts ----
-        self.gridLayout_5.setRowStretch(1, 1)  # Tabs
-        self.gridLayout_5.setRowStretch(2, 0)  # Faces-Strip
+        self.gridLayout_5.setRowStretch(1, 1)
+        self.gridLayout_5.setRowStretch(2, 0)
 
     def _move_faces_strip_to_right(self):
-        # targetFacesList aus Faces-Panel lösen
-        try:
-            self.gridLayout_2.removeWidget(self.targetFacesList)
-        except Exception as e:
-            print(f"[WARN] Layout operation failed: {e}")
-
-        self.targetFacesList.setParent(self._rightFacesStrip)
-        sp = self.targetFacesList.sizePolicy()
-        sp.setVerticalStretch(1)  # Liste füllt den oberen Bereich
-        self.targetFacesList.setSizePolicy(sp)
+        """
+        Moves widgets to the right strip.
+        Adding a widget to a new layout automatically removes it from the old one in Qt.
+        """
         self._rightFacesFacesHolder.addWidget(self.targetFacesList)
 
-        # Buttons aus der linken Column nehmen
+        sp = self.targetFacesList.sizePolicy()
+        sp.setVerticalStretch(1)
+        self.targetFacesList.setSizePolicy(sp)
+
         btns = [
-            self.findTargetFacesButton,
-            self.clearTargetFacesButton,
-            self.swapfacesButton,
-            self.editFacesButton,
+            (self.findTargetFacesButton, "Find"),
+            (self.clearTargetFacesButton, "Clear"),
+            (self.swapfacesButton, "Swap"),
+            (self.editFacesButton, "Edit"),
         ]
 
-        # Originaltexte einmalig merken
-        if not hasattr(self, "_faceButtonsOriginalTexts"):
-            self._faceButtonsOriginalTexts = {}
-        if not self._faceButtonsOriginalTexts:
-            for b in btns:
-                self._faceButtonsOriginalTexts[b.objectName()] = b.text()
+        # Save original texts once
+        if getattr(self, "_faceButtonsOriginalTexts", None) is None:
+            self._faceButtonsOriginalTexts = {
+                btn.objectName(): btn.text() for btn, _ in btns
+            }
 
-        try:
-            for b in btns:
-                self.controlButtonsLayout.removeWidget(b)
-        except Exception as e:
-            print(f"[WARN] Layout operation failed: {e}")
+        for i, (btn, short_text) in enumerate(btns):
+            # Insert before the stretch item (which is at the end)
+            self._rightFacesButtonsRow.insertWidget(i, btn)
+            btn.setText(short_text)
+            btn.setFlat(True)
 
-        # Kurzlabels setzen und unten nebeneinander einsetzen
-        short_map = {
-            "findTargetFacesButton": "Find",
-            "clearTargetFacesButton": "Clear",
-            "swapfacesButton": "Swap",
-            "editFacesButton": "Edit",
-        }
-        for b in btns:
-            b.setParent(self._rightFacesStrip)
-            b.setText(short_map.get(b.objectName(), b.text()))
-            b.setFlat(True)
-            self._rightFacesButtonsRow.addWidget(b)
-
-        self._rightFacesButtonsRow.addStretch(1)
-        # Kompakte Darstellung erzwingen
         self.targetFacesList.setViewMode(QtWidgets.QListView.IconMode)
         self.targetFacesList.setWrapping(True)
         self.targetFacesList.setSpacing(4)
         self.targetFacesList.setMinimumHeight(60)
-        self.targetFacesList.setMaximumHeight(_FACE_STRIP_LIST_HEIGHT)  # wichtig
+        self.targetFacesList.setMaximumHeight(_FACE_STRIP_LIST_HEIGHT)
 
     def _restore_faces_strip_to_panel(self):
-        # Liste zurück ins Faces-Panel (Originalzelle 1,1,1,1 – wie in deiner .ui)
-        try:
-            self._rightFacesFacesHolder.removeWidget(self.targetFacesList)
-        except Exception as e:
-            print(f"[WARN] Layout operation failed: {e}")
-
-        self.targetFacesList.setParent(self.facesPanelGroupBox)
+        """Restores widgets to their original left panel seamlessly."""
         self.gridLayout_2.addWidget(self.targetFacesList, 1, 1, 1, 1)
 
-        # Buttons zurück in die linke, vertikale Spalte (untereinander)
         btns = [
             self.findTargetFacesButton,
             self.clearTargetFacesButton,
@@ -938,35 +876,23 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             self.editFacesButton,
         ]
 
-        try:
-            for b in btns:
-                self._rightFacesButtonsRow.removeWidget(b)
-        except Exception as e:
-            print(f"[WARN] Layout operation failed: {e}")
-
-        for b in btns:
-            b.setParent(self.facesButtonsWidget)
-            # Originaltext wiederherstellen
+        for btn in btns:
+            self.controlButtonsLayout.addWidget(btn)
             if hasattr(self, "_faceButtonsOriginalTexts"):
-                orig = self._faceButtonsOriginalTexts.get(b.objectName())
+                orig = self._faceButtonsOriginalTexts.get(btn.objectName())
                 if orig:
-                    b.setText(orig)
-            b.setFlat(True)
-            self.controlButtonsLayout.addWidget(b)
+                    btn.setText(orig)
+            btn.setFlat(True)
 
-        # Limits zurücksetzen
         self.targetFacesList.setMaximumHeight(16777215)
         if hasattr(self, "_rightFacesStrip"):
             self._rightFacesStrip.setMaximumHeight(16777215)
-        if (
-            hasattr(self, "_rightFacesButtonsRowContainer")
-            and self._rightFacesButtonsRowContainer
-        ):
+        if getattr(self, "_rightFacesButtonsRowContainer", None):
             self._rightFacesButtonsRowContainer.setMaximumHeight(16777215)
 
-        # Tabs/Strip-Stretches optional neutralisieren (nicht zwingend)
-        self.gridLayout_5.setRowStretch(1, 0)
-        self.gridLayout_5.setRowStretch(2, 0)
+        # VERY IMPORTANT: Restore the list mode so it looks normal again on the left
+        self.targetFacesList.setViewMode(QtWidgets.QListView.ListMode)
+        self.targetFacesList.setMinimumHeight(0)
 
     def open_embedding_editor(self):
         if self.embedding_editor_window is None:

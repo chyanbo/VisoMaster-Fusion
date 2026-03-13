@@ -105,6 +105,17 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": "Auto start over when video playing to the end.(Not work for recording)",
         },
+        "FrameSkipStepSlider": {
+            "level": 1,
+            "label": "Frame Skip Step",
+            "min_value": "1",
+            "max_value": "300",
+            "default": "30",
+            "step": "1",
+            "help": "Number of frames to skip when using forward/rewind buttons or the mouse wheel.",
+            "exec_function": control_actions.update_video_slider_step,
+            "exec_function_args": [],
+        },
         "LiveSoundVolumeDecimalSlider": {
             "level": 1,
             "label": "Audio Playback Volume",

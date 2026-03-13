@@ -6,7 +6,7 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 
-def filter_target_videos(main_window: "MainWindow", search_text: str = ""):
+def filter_target_videos(main_window: "MainWindow", *args):
     main_window.target_videos_filter_worker.stop_thread()
 
     # Capture all Qt widget data in the main thread before starting the worker
@@ -34,7 +34,7 @@ def filter_target_videos(main_window: "MainWindow", search_text: str = ""):
     worker.start()
 
 
-def filter_input_faces(main_window: "MainWindow", search_text: str = ""):
+def filter_input_faces(main_window: "MainWindow", *args):
     main_window.input_faces_filter_worker.stop_thread()
 
     # Capture all Qt widget data in the main thread before starting the worker
@@ -53,7 +53,7 @@ def filter_input_faces(main_window: "MainWindow", search_text: str = ""):
     worker.start()
 
 
-def filter_merged_embeddings(main_window: "MainWindow", search_text: str = ""):
+def filter_merged_embeddings(main_window: "MainWindow", *args):
     main_window.merged_embeddings_filter_worker.stop_thread()
 
     # Capture all Qt widget data in the main thread before starting the worker
@@ -78,14 +78,19 @@ def update_filtered_list(
     visible_indices: list,
     snapshot_size: int = 0,
 ):
-    # Only manage items that existed at snapshot time; items added after the
-    # snapshot was captured (index >= snapshot_size) are left visible so they
-    # are not accidentally hidden by a stale filter result.
-    limit = snapshot_size if snapshot_size > 0 else filter_list_widget.count()
-    for i in range(min(limit, filter_list_widget.count())):
-        filter_list_widget.item(i).setHidden(True)
+    filter_list_widget.setUpdatesEnabled(False)
 
-    # Show only the items in the visible_indices list
-    for i in visible_indices:
-        if i < filter_list_widget.count():
-            filter_list_widget.item(i).setHidden(False)
+    try:
+        # Only manage items that existed at snapshot time; items added after the
+        # snapshot was captured (index >= snapshot_size) are left visible so they
+        # are not accidentally hidden by a stale filter result.
+        limit = snapshot_size if snapshot_size > 0 else filter_list_widget.count()
+        for i in range(min(limit, filter_list_widget.count())):
+            filter_list_widget.item(i).setHidden(True)
+
+        # Show only the items in the visible_indices list
+        for i in visible_indices:
+            if i < filter_list_widget.count():
+                filter_list_widget.item(i).setHidden(False)
+    finally:
+        filter_list_widget.setUpdatesEnabled(True)
