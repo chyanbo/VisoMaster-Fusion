@@ -32,24 +32,35 @@ Usage
 from __future__ import annotations
 import os
 import pathlib
+import sys as _sys_module
+from typing import Callable
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+
+_sys_platform = _sys_module.platform
+
+
+def _has_cl_exe() -> bool:
+    """Return True if cl.exe (MSVC) is available on PATH."""
+    import shutil
+
+    return shutil.which("cl") is not None or shutil.which("cl.exe") is not None
+
 
 # ---------------------------------------------------------------------------
 # Triton kernel (preferred — no MSVC required, works on Windows)
 # ---------------------------------------------------------------------------
 try:
     from custom_kernels.triton_ops import (
-        TRITON_AVAILABLE     as _TRITON_AVAILABLE,
-        triton_adain         as _triton_adain,
+        TRITON_AVAILABLE as _TRITON_AVAILABLE,
+        triton_adain as _triton_adain,
         triton_im2col_reflect as _triton_im2col_reflect,
     )
 except Exception:
-    _TRITON_AVAILABLE    = False
-    _triton_adain        = None
-    _triton_im2col_reflect = None
+    _TRITON_AVAILABLE = False
+    _triton_adain = None  # type: ignore[assignment]
+    _triton_im2col_reflect = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # 0. cuBLASLt HGEMM extension (Phase 3)
@@ -256,7 +267,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
 
 _styleblock_ext = None
-_styleblock_op  = None   # False = unavailable
+_styleblock_op = None  # False = unavailable
 
 
 def _get_styleblock_ext():
@@ -277,8 +288,10 @@ def _get_styleblock_ext():
         return _styleblock_op
 
     _add_torch_dll_dirs()
-    _ext_name  = "style_block_ext"
-    shared_dir = pathlib.Path(__file__).parent.parent.parent / "model_assets" / "custom_kernels"
+    _ext_name = "style_block_ext"
+    shared_dir = (
+        pathlib.Path(__file__).parent.parent.parent / "model_assets" / "custom_kernels"
+    )
     shared_dir.mkdir(parents=True, exist_ok=True)
     legacy_dir = pathlib.Path(__file__).parent / "_styleblock_build"
 
@@ -289,8 +302,10 @@ def _get_styleblock_ext():
             return None
         try:
             spec = importlib.util.spec_from_file_location(_ext_name, str(pyd))
-            mod  = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            assert spec is not None
+            mod = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
             print(f"[InSwapperTorch] Style-block extension loaded ({tag}).")
             return mod
         except Exception as e:
@@ -304,14 +319,17 @@ def _get_styleblock_ext():
         mod = _try(path, tag)
         if mod is not None:
             _styleblock_ext = mod
-            _styleblock_op  = mod
+            _styleblock_op = mod
             return mod
 
     # JIT compile
     try:
-        print("[InSwapperTorch] Compiling cuBLASLt style-block extension "
-              "(requires MSVC + CUDA toolkit)...")
+        print(
+            "[InSwapperTorch] Compiling cuBLASLt style-block extension "
+            "(requires MSVC + CUDA toolkit)..."
+        )
         from torch.utils.cpp_extension import load_inline
+
         ldflags = ["cublasLt.lib"] if os.name == "nt" else ["-lcublasLt"]
         mod = load_inline(
             name=_ext_name,
@@ -325,11 +343,13 @@ def _get_styleblock_ext():
         )
         print("[InSwapperTorch] Style-block extension compiled successfully.")
         _styleblock_ext = mod
-        _styleblock_op  = mod
+        _styleblock_op = mod
         return mod
     except Exception as e:
-        print(f"[InSwapperTorch] Style-block extension unavailable: {e}\n"
-              "  -> Falling back to torch.mm GEMM (Tier 8).")
+        print(
+            f"[InSwapperTorch] Style-block extension unavailable: {e}\n"
+            "  -> Falling back to torch.mm GEMM (Tier 8)."
+        )
         _styleblock_op = False
         return None
 
@@ -522,6 +542,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 # 2. Build / load the CUDA extension (cached after first compile)
 # ---------------------------------------------------------------------------
 
+
 def _add_torch_dll_dirs():
     """Add torch's lib/ directory to the DLL search path (Windows only)."""
     if os.name != "nt":
@@ -551,8 +572,10 @@ def _load_adain_ext():
 
     _add_torch_dll_dirs()
 
-    _ext_name  = "adain_fp16_ext"
-    shared_dir = pathlib.Path(__file__).parent.parent.parent / "model_assets" / "custom_kernels"
+    _ext_name = "adain_fp16_ext"
+    shared_dir = (
+        pathlib.Path(__file__).parent.parent.parent / "model_assets" / "custom_kernels"
+    )
     shared_dir.mkdir(parents=True, exist_ok=True)
     legacy_dir = pathlib.Path(__file__).parent / "_adain_build"
 
@@ -561,8 +584,10 @@ def _load_adain_ext():
             return None
         try:
             spec = importlib.util.spec_from_file_location(_ext_name, str(pyd))
-            mod  = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
+            assert spec is not None
+            mod = importlib.util.module_from_spec(spec)
+            assert spec.loader is not None
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
             print(f"[InSwapperTorch] AdaIN extension loaded ({tag}).")
             return mod
         except Exception as e:
@@ -579,9 +604,22 @@ def _load_adain_ext():
     if mod is not None:
         return mod
 
-    # 3. JIT compile for current GPU only (saves to shared dir)
-    print("[InSwapperTorch] Compiling AdaIN extension for current GPU (requires MSVC)...")
+    # 3. JIT compile (fallback — requires MSVC on Windows / GCC on Linux)
+    if _sys_platform == "win32" and not _has_cl_exe():
+        print(
+            "[InSwapperTorch] AdaIN CUDA extension not found and CL.exe is unavailable.\n"
+            "  Run: python custom_kernels/build_kernels.py  (requires Visual Studio Build Tools)\n"
+            "  Or download pre-built binaries for your PyTorch version.\n"
+            "  -> Using Triton / pure-PyTorch AdaIN fallback."
+        )
+        raise RuntimeError(
+            "AdaIN extension unavailable: no pre-built .pyd and no CL.exe"
+        )
+    print(
+        "[InSwapperTorch] Compiling AdaIN extension for current GPU (requires MSVC)..."
+    )
     from torch.utils.cpp_extension import load_inline
+
     return load_inline(
         name=_ext_name,
         cpp_sources=_CPP_SRC,
@@ -594,7 +632,8 @@ def _load_adain_ext():
 
 
 _adain_ext = None
-_adain_op  = None   # torch.library custom op (callable), False = unavailable
+_adain_op = None  # torch.library custom op (callable), False = unavailable
+
 
 def _get_fn():
     """
@@ -612,11 +651,13 @@ def _get_fn():
     if _adain_op is None:
         try:
             build_dir = pathlib.Path(__file__).parent / "_adain_build"
-            pyd_path  = build_dir / "adain_fp16_ext.pyd"
+            pyd_path = build_dir / "adain_fp16_ext.pyd"
             if pyd_path.exists():
                 print("[InSwapperTorch] Loading pre-built AdaIN CUDA extension...")
             else:
-                print("[InSwapperTorch] Compiling custom AdaIN CUDA extension (first run)...")
+                print(
+                    "[InSwapperTorch] Compiling custom AdaIN CUDA extension (first run)..."
+                )
             _adain_ext = _load_adain_ext()
             print("[InSwapperTorch] Extension ready.")
 
@@ -626,9 +667,11 @@ def _get_fn():
 
             _OP_NAME = "inswapper::fused_adain_fp16"
             try:
+
                 @tl.custom_op(_OP_NAME, mutates_args=())
-                def _op(x: torch.Tensor, scale: torch.Tensor,
-                        bias: torch.Tensor, eps: float) -> torch.Tensor:
+                def _op(
+                    x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor, eps: float
+                ) -> torch.Tensor:
                     return _adain_ext.fused_adain_fp16(x, scale, bias, eps)
 
                 @_op.register_fake
@@ -641,9 +684,11 @@ def _get_fn():
             _adain_op = _op
 
         except Exception as e:
-            print(f"[InSwapperTorch] Custom CUDA kernel unavailable: {e}\n"
-                  "  -> Falling back to pure PyTorch ops (slightly slower).")
-            _adain_op = False   # sentinel: don't retry
+            print(
+                f"[InSwapperTorch] Custom CUDA kernel unavailable: {e}\n"
+                "  -> Falling back to pure PyTorch ops (slightly slower)."
+            )
+            _adain_op = False  # sentinel: don't retry
 
     return _adain_op if _adain_op is not False else None
 
@@ -667,16 +712,21 @@ class _ReflectionPadConv2d(nn.Module):
     Call ``enable_gemm_mode()`` after the module is on its target device and
     dtype (i.e. after ``.cuda().eval()`` and weight loading).
     """
-    def __init__(self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True):
+
+    def __init__(
+        self, in_channels, out_channels, kernel_size, stride=1, padding=0, bias=True
+    ):
         super().__init__()
         self.pad = padding
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride=stride, padding=0, bias=bias)
+        self.conv = nn.Conv2d(
+            in_channels, out_channels, kernel_size, stride=stride, padding=0, bias=bias
+        )
         self._use_gemm: bool = False
-        self._use_fused_im2col: bool = False   # Triton fused reflect+im2col path
-        self._use_cublaslt: bool = False       # Phase 3: cuBLASLt HGEMM
-        self._cublaslt_id: int = -1            # handle returned by create_hgemm_*_op
-        self._cublaslt_n: int = 0              # expected HW size for B=1 cuBLASLt op
-        self._gemm_k: int = 0       # kernel_size stored for unfold
+        self._use_fused_im2col: bool = False  # Triton fused reflect+im2col path
+        self._use_cublaslt: bool = False  # Phase 3: cuBLASLt HGEMM
+        self._cublaslt_id: int = -1  # handle returned by create_hgemm_*_op
+        self._cublaslt_n: int = 0  # expected HW size for B=1 cuBLASLt op
+        self._gemm_k: int = 0  # kernel_size stored for unfold
 
     # ------------------------------------------------------------------
     def enable_gemm_mode(self) -> None:
@@ -690,10 +740,10 @@ class _ReflectionPadConv2d(nn.Module):
 
         Idempotent: calling multiple times is safe.
         """
-        w = self.conv.weight.data                      # [C_out, C_in, kH, kW]
+        w = self.conv.weight.data  # [C_out, C_in, kH, kW]
         C_out = w.shape[0]
-        self._gemm_k = w.shape[2]                      # assumes square kernel
-        w_flat = w.reshape(C_out, -1).contiguous()     # [C_out, C_in*kH*kW]
+        self._gemm_k = w.shape[2]  # assumes square kernel
+        w_flat = w.reshape(C_out, -1).contiguous()  # [C_out, C_in*kH*kW]
         # Register so it is device/dtype-aware (participates in .to() etc.)
         if hasattr(self, "_w_flat"):
             self._w_flat.copy_(w_flat)
@@ -704,9 +754,7 @@ class _ReflectionPadConv2d(nn.Module):
         # has padding (style blocks with pad=1).  The fused kernel eliminates the
         # intermediate padded tensor and handles any batch size B.
         self._use_fused_im2col = (
-            _TRITON_AVAILABLE
-            and _triton_im2col_reflect is not None
-            and self.pad > 0
+            _TRITON_AVAILABLE and _triton_im2col_reflect is not None and self.pad > 0
         )
 
     # ------------------------------------------------------------------
@@ -732,9 +780,9 @@ class _ReflectionPadConv2d(nn.Module):
         if not self._use_gemm:
             self.enable_gemm_mode()
 
-        M = self._w_flat.shape[0]   # C_out
-        K = self._w_flat.shape[1]   # C_in * kH * kW
-        N = hw                       # H * W (fixed for B=1)
+        M = self._w_flat.shape[0]  # C_out
+        K = self._w_flat.shape[1]  # C_in * kH * kW
+        N = hw  # H * W (fixed for B=1)
 
         bias = self.conv.bias
         if bias is not None:
@@ -742,7 +790,7 @@ class _ReflectionPadConv2d(nn.Module):
         else:
             self._cublaslt_id = ext.create_hgemm_op(M, K, N)
 
-        self._cublaslt_n  = N
+        self._cublaslt_n = N
         self._use_cublaslt = True
 
     # ------------------------------------------------------------------
@@ -774,7 +822,7 @@ class _ReflectionPadConv2d(nn.Module):
         k = self._gemm_k
         if self._use_fused_im2col:
             x_col = _triton_im2col_reflect(x, k=k, pad=self.pad)  # [1, K, HW]
-            x_col_2d = x_col.squeeze(0)                            # [K, HW]
+            x_col_2d = x_col.squeeze(0)  # [K, HW]
         else:
             xp = F.pad(x, (self.pad,) * 4, mode="reflect") if self.pad > 0 else x
             x_col_2d = F.unfold(xp.contiguous(), kernel_size=k).squeeze(0)  # [K, HW]
@@ -806,24 +854,24 @@ class _ReflectionPadConv2d(nn.Module):
         B = x.shape[0]
 
         # x shape: [B, C_in, H', W']  (reflection padding already applied)
-        x_col = F.unfold(x.contiguous(), kernel_size=k)   # [B, K_in, HW]
+        x_col = F.unfold(x.contiguous(), kernel_size=k)  # [B, K_in, HW]
 
         if B == 1:
-            x_col = x_col.squeeze(0)                      # [K_in, HW]
-            out = torch.mm(self._w_flat, x_col)           # [C_out, HW]
+            x_col = x_col.squeeze(0)  # [K_in, HW]
+            out = torch.mm(self._w_flat, x_col)  # [C_out, HW]
             if self.conv.bias is not None:
                 out = out + self.conv.bias.unsqueeze(1)
             HW = x_col.shape[1]
-            H = W = int(HW ** 0.5)
+            H = W = int(HW**0.5)
             return out.reshape(1, -1, H, W)
 
         # Batched GEMM: [C_out, K_in] × [B, K_in, HW] → [B, C_out, HW]
         # torch.matmul broadcasts w_flat across batch dimension.
         out = torch.matmul(self._w_flat, x_col)
         if self.conv.bias is not None:
-            out = out + self.conv.bias.unsqueeze(1)        # [C_out, 1] broadcasts
+            out = out + self.conv.bias.unsqueeze(1)  # [C_out, 1] broadcasts
         HW = x_col.shape[2]
-        H = W = int(HW ** 0.5)
+        H = W = int(HW**0.5)
         return out.reshape(B, -1, H, W)
 
     # ------------------------------------------------------------------
@@ -854,8 +902,8 @@ class _ReflectionPadConv2d(nn.Module):
         x_col = _triton_im2col_reflect(x, k=k, pad=self.pad)
 
         if B == 1:
-            x_col = x_col.squeeze(0)                      # [K_in, HW]
-            out = torch.mm(self._w_flat, x_col)           # [C_out, HW]
+            x_col = x_col.squeeze(0)  # [K_in, HW]
+            out = torch.mm(self._w_flat, x_col)  # [C_out, HW]
             if self.conv.bias is not None:
                 out = out + self.conv.bias.unsqueeze(1)
             return out.reshape(1, -1, H, W)
@@ -907,18 +955,18 @@ class InSwapperTorch(torch.nn.Module):
         super().__init__()
         self.use_custom_kernel = use_custom_kernel
         self.emap = None
-        
+
         # Build modules for better graph tracing and cuDNN optimization
         self.enc0 = _ReflectionPadConv2d(3, 128, 7, padding=3)
         self.enc1 = nn.Conv2d(128, 256, 3, padding=1)
         self.enc2 = nn.Conv2d(256, 512, 3, stride=2, padding=1)
         self.enc3 = nn.Conv2d(512, 1024, 3, stride=2, padding=1)
-        
+
         self.dec0 = nn.Conv2d(1024, 512, 3, padding=1)
         self.dec1 = nn.Conv2d(512, 256, 3, padding=1)
         self.dec2 = nn.Conv2d(256, 128, 3, padding=1)
         self.dec3 = _ReflectionPadConv2d(128, 3, 7, padding=3)
-        
+
         for i in range(self.N_BLOCKS):
             setattr(self, f"s{i}_c1", _ReflectionPadConv2d(1024, 1024, 3, padding=1))
             setattr(self, f"s{i}_c2", _ReflectionPadConv2d(1024, 1024, 3, padding=1))
@@ -1005,15 +1053,20 @@ class InSwapperTorch(torch.nn.Module):
         from onnx import numpy_helper
 
         model = onnx.load(onnx_path)
-        w = {i.name: torch.from_numpy(numpy_helper.to_array(i).copy())
-             for i in model.graph.initializer}
+        w = {
+            i.name: torch.from_numpy(numpy_helper.to_array(i).copy())
+            for i in model.graph.initializer
+        }
 
         def _assign(module, w_key, b_key):
             module.weight.data = w[w_key].half()
             module.bias.data = w[b_key].half()
 
-        self._eps_val: float = float(numpy_helper.to_array(
-            next(i for i in model.graph.initializer if i.name == "onnx::Add_164")))
+        self._eps_val: float = float(
+            numpy_helper.to_array(
+                next(i for i in model.graph.initializer if i.name == "onnx::Add_164")
+            )
+        )
 
         # Encoder
         _assign(self.enc0.conv, "onnx::Conv_833", "onnx::Conv_834")
@@ -1023,8 +1076,16 @@ class InSwapperTorch(torch.nn.Module):
 
         # Style blocks
         for i in range(self.N_BLOCKS):
-            _assign(getattr(self, f"s{i}_c1").conv, f"styles.{i}.conv1.1.weight", f"styles.{i}.conv1.1.bias")
-            _assign(getattr(self, f"s{i}_c2").conv, f"styles.{i}.conv2.1.weight", f"styles.{i}.conv2.1.bias")
+            _assign(
+                getattr(self, f"s{i}_c1").conv,
+                f"styles.{i}.conv1.1.weight",
+                f"styles.{i}.conv1.1.bias",
+            )
+            _assign(
+                getattr(self, f"s{i}_c2").conv,
+                f"styles.{i}.conv2.1.weight",
+                f"styles.{i}.conv2.1.bias",
+            )
 
         # Batched Gemm
         style_ws = []
@@ -1048,12 +1109,17 @@ class InSwapperTorch(torch.nn.Module):
         else:
             # Fallback to last initializer as per models_processor logic
             last_init = model.graph.initializer[-1]
-            self.emap = numpy_helper.to_array(last_init)
+            self.emap = numpy_helper.to_array(last_init)  # type: ignore[assignment]
 
     # ------------------------------------------------------------------
-    def _adain(self, x: torch.Tensor, scale: torch.Tensor, bias: torch.Tensor,
-               fuse_relu: bool = False,
-               residual: torch.Tensor | None = None) -> torch.Tensor:
+    def _adain(
+        self,
+        x: torch.Tensor,
+        scale: torch.Tensor,
+        bias: torch.Tensor,
+        fuse_relu: bool = False,
+        residual: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """Fused AdaIN: y = scale * (x - mu) / sigma + bias  [+ residual].
 
         When ``residual`` is provided the add is fused into the Triton kernel,
@@ -1061,15 +1127,16 @@ class InSwapperTorch(torch.nn.Module):
         Priority: Triton > pure PyTorch.
         """
         if _TRITON_AVAILABLE:
-            return _triton_adain(x, scale, bias, self._eps_val,
-                                 fuse_relu=fuse_relu, residual=residual)
+            return _triton_adain(
+                x, scale, bias, self._eps_val, fuse_relu=fuse_relu, residual=residual
+            )
 
         # Pure PyTorch fallback
-        eps  = self._eps_val
+        eps = self._eps_val
         mean = x.float().mean(dim=(2, 3), keepdim=True)
-        var  = ((x.float() - mean) ** 2).mean(dim=(2, 3), keepdim=True)
-        x_n  = ((x.float() - mean) / (var + eps).sqrt()).half()
-        out  = scale * x_n + bias
+        var = ((x.float() - mean) ** 2).mean(dim=(2, 3), keepdim=True)
+        x_n = ((x.float() - mean) / (var + eps).sqrt()).half()
+        out = scale * x_n + bias
         if residual is not None:
             out = out + residual
         return F.relu(out, inplace=True) if fuse_relu else out
@@ -1097,8 +1164,8 @@ class InSwapperTorch(torch.nn.Module):
         if _nhwc:
             x = target.to(dtype=torch.float16, memory_format=torch.channels_last)
         else:
-            x = target.half()          # [B, 3, 128, 128]
-        src = source.half()            # [1, 512]
+            x = target.half()  # [B, 3, 128, 128]
+        src = source.half()  # [1, 512]
 
         # ---- Encoder ----
         x = F.leaky_relu(self.enc0(x), 0.2, inplace=True)
@@ -1108,16 +1175,17 @@ class InSwapperTorch(torch.nn.Module):
 
         # ---- Style residual blocks ----
         all_s = F.linear(src, self.all_style_w, self.all_style_b).view(
-            self.N_BLOCKS * 2, 1, 2048)
+            self.N_BLOCKS * 2, 1, 2048
+        )
 
         for i in range(self.N_BLOCKS):
             c1 = getattr(self, f"s{i}_c1")
             c2 = getattr(self, f"s{i}_c2")
 
-            s1  = all_s[i * 2]                       # [1, 2048]
-            sc1 = s1[:, :1024, None, None]            # [1, 1024, 1, 1]
-            bi1 = s1[:, 1024:, None, None]            # [1, 1024, 1, 1]
-            s2  = all_s[i * 2 + 1]
+            s1 = all_s[i * 2]  # [1, 2048]
+            sc1 = s1[:, :1024, None, None]  # [1, 1024, 1, 1]
+            bi1 = s1[:, 1024:, None, None]  # [1, 1024, 1, 1]
+            s2 = all_s[i * 2 + 1]
             sc2 = s2[:, :1024, None, None]
             bi2 = s2[:, 1024:, None, None]
 
@@ -1150,10 +1218,10 @@ class InSwapperTorch(torch.nn.Module):
 # 4. Optimized runner (with torch.compile fusion)
 # ---------------------------------------------------------------------------
 def build_cuda_graph_runner(
-        model: InSwapperTorch,
-        target_example: torch.Tensor,
-        source_example: torch.Tensor,
-) -> callable:
+    model: InSwapperTorch,
+    target_example: torch.Tensor,
+    source_example: torch.Tensor,
+) -> Callable[..., torch.Tensor]:
     """
     Captures the model into a CUDA graph for zero-overhead repeated inference.
 
@@ -1187,20 +1255,27 @@ def build_cuda_graph_runner(
     torch.cuda.synchronize()
     print("[InSwapperTorch] CUDA graph captured.")
 
+    # BUG-C02 fix: determine memory format once at build time so the per-frame
+    # _runner closure avoids a layout check on every single call.
+    _out_is_channels_last = static_out[0].is_contiguous(
+        memory_format=torch.channels_last
+    )
+
     def _runner(target: torch.Tensor, source: torch.Tensor) -> torch.Tensor:
         static_target.copy_(target)
         static_source.copy_(source)
         graph.replay()
-        # contiguous() converts channels-last output to standard NCHW if
-        # the model was switched to NHWC mode via to_channels_last(); it is
-        # a no-op when the output is already NCHW-contiguous.
-        return static_out[0].contiguous().clone()
+        out = static_out[0]
+        if _out_is_channels_last:
+            # Model runs in NHWC mode — convert to standard NCHW for callers.
+            return out.contiguous().clone()
+        return out.clone()
 
     return _runner
 
 
 # Kept for backwards-compat
-def build_compiled_runner(model: InSwapperTorch) -> callable:
+def build_compiled_runner(model: InSwapperTorch) -> Callable[..., torch.Tensor]:
     return torch.compile(model, mode="max-autotune")
 
 
@@ -1208,15 +1283,22 @@ def build_compiled_runner(model: InSwapperTorch) -> callable:
 # 5. Quick self-test (run this file directly)
 # ---------------------------------------------------------------------------
 if __name__ == "__main__":
-    import sys, time
-    MODEL_PATH = pathlib.Path(__file__).parent.parent / "model_assets" / "inswapper_128.fp16.onnx"
+    import time
+
+    MODEL_PATH = (
+        pathlib.Path(__file__).parent.parent
+        / "model_assets"
+        / "inswapper_128.fp16.onnx"
+    )
 
     print("Loading model…")
     model = InSwapperTorch(str(MODEL_PATH), use_custom_kernel=True).cuda().eval()
 
     rng = torch.Generator(device="cuda").manual_seed(42)
-    target = torch.rand(1, 3, 128, 128, device="cuda", dtype=torch.float32, generator=rng)
-    source = torch.randn(1, 512,       device="cuda", dtype=torch.float32, generator=rng)
+    target = torch.rand(
+        1, 3, 128, 128, device="cuda", dtype=torch.float32, generator=rng
+    )
+    source = torch.randn(1, 512, device="cuda", dtype=torch.float32, generator=rng)
 
     print("Warmup…")
     for _ in range(5):
@@ -1231,7 +1313,7 @@ if __name__ == "__main__":
             out = model(target, source)
     torch.cuda.synchronize()
     elapsed = time.perf_counter() - t0
-    print(f"PyTorch+custom-kernel  : {elapsed/RUNS*1000:.3f} ms / inference")
+    print(f"PyTorch+custom-kernel  : {elapsed / RUNS * 1000:.3f} ms / inference")
     print(f"Output range: [{out.min().item():.4f}, {out.max().item():.4f}]")
 
     # Reference path (pure PyTorch ops, no custom kernel)
@@ -1246,7 +1328,7 @@ if __name__ == "__main__":
             out_ref = model_ref(target, source)
     torch.cuda.synchronize()
     elapsed_ref = time.perf_counter() - t0
-    print(f"PyTorch (no custom ker): {elapsed_ref/RUNS*1000:.3f} ms / inference")
+    print(f"PyTorch (no custom ker): {elapsed_ref / RUNS * 1000:.3f} ms / inference")
 
     diff = (out - out_ref).abs().max().item()
     print(f"Max abs diff (kernel vs reference): {diff:.6f}")

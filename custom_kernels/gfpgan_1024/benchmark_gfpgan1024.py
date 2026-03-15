@@ -6,17 +6,20 @@ Run via:
   or plain Python:
     .venv/Scripts/python custom_kernels/gfpgan_1024/benchmark_gfpgan1024.py
 """
-import sys, time, os
+
+import sys
+import time
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 MODEL_PATH = str(ROOT / "model_assets" / "gfpgan-1024.onnx")
 WARMUP = int(os.environ.get("WARMUP", 10))
-RUNS   = int(os.environ.get("ITERS",  50))
+RUNS = int(os.environ.get("ITERS", 50))
 
-import numpy as np
-import torch
+import numpy as np  # noqa: E402
+import torch  # noqa: E402
 
 
 def ms(t0, t1, n):
@@ -25,11 +28,15 @@ def ms(t0, t1, n):
 
 def run_ort():
     import onnxruntime as ort
+
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(MODEL_PATH, so,
+    sess = ort.InferenceSession(
+        MODEL_PATH,
+        so,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        provider_options=[{"device_id": "0"}, {}])
+        provider_options=[{"device_id": "0"}, {}],
+    )
     inp = np.random.default_rng(0).random((1, 3, 512, 512)).astype(np.float32)
     for _ in range(WARMUP):
         sess.run(None, {"input": inp})
@@ -46,8 +53,9 @@ def run_ort_trt():
     Loads from the pre-built engine cache (tensorrt-engines/).
     Returns None and prints a reason if TRT EP is unavailable or not cached."""
     import onnxruntime as ort
+
     try:
-        import tensorrt  # registers tensorrt_libs DLL directory on Windows
+        pass  # registers tensorrt_libs DLL directory on Windows
     except Exception:
         pass
     if "TensorrtExecutionProvider" not in ort.get_available_providers():
@@ -55,10 +63,15 @@ def run_ort_trt():
         return None
     ctx = ROOT / "tensorrt-engines" / "gfpgan-1024_ctx.onnx"
     if not ctx.exists():
-        print("  SKIP: no pre-built TRT engine (run the app once with TRT provider first)")
+        print(
+            "  SKIP: no pre-built TRT engine (run the app once with TRT provider first)"
+        )
         return None
     # Use relative paths matching the app config; run from project root.
-    import os; _prev_cwd = os.getcwd(); os.chdir(str(ROOT))
+    import os
+
+    _prev_cwd = os.getcwd()
+    os.chdir(str(ROOT))
     trt_opts = {
         "trt_engine_cache_enable": True,
         "trt_engine_cache_path": "tensorrt-engines",
@@ -72,12 +85,15 @@ def run_ort_trt():
     }
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(MODEL_PATH, so,
+    sess = ort.InferenceSession(
+        MODEL_PATH,
+        so,
         providers=[
             ("TensorrtExecutionProvider", trt_opts),
             ("CUDAExecutionProvider", {"device_id": "0"}),
             ("CPUExecutionProvider", {}),
-        ])
+        ],
+    )
     os.chdir(_prev_cwd)
     inp = np.random.default_rng(0).random((1, 3, 512, 512)).astype(np.float32)
     for _ in range(WARMUP):
@@ -92,6 +108,7 @@ def run_ort_trt():
 
 def run_pytorch(fp16: bool):
     from custom_kernels.gfpgan_v1_4.gfpgan_torch import GFPGANTorch
+
     dtype = torch.float16 if fp16 else torch.float32
     model = GFPGANTorch.from_onnx(MODEL_PATH, compute_dtype=dtype).cuda().eval()
     inp = torch.randn(1, 3, 512, 512, device="cuda")
@@ -108,7 +125,11 @@ def run_pytorch(fp16: bool):
 
 
 def run_cuda_graph():
-    from custom_kernels.gfpgan_v1_4.gfpgan_torch import GFPGANTorch, build_cuda_graph_runner
+    from custom_kernels.gfpgan_v1_4.gfpgan_torch import (
+        GFPGANTorch,
+        build_cuda_graph_runner,
+    )
+
     model = GFPGANTorch.from_onnx(MODEL_PATH, compute_dtype=torch.float16).cuda().eval()
     inp = torch.randn(1, 3, 512, 512, device="cuda")
     with torch.no_grad():
@@ -157,24 +178,24 @@ def main():
         print(f"  SKIPPED: {e}")
 
     cuda_ep_t = results[0][1]
-    trt_ep_t  = t_trt  # may be None if TRT not available
+    trt_ep_t = t_trt  # may be None if TRT not available
     hdr = f"{'Method':<38} {'ms':>8} {'vs CUDA EP':>11}"
     if trt_ep_t:
         hdr += f" {'vs TRT EP':>10}"
     print(f"\n{hdr}")
     print("-" * (len(hdr)))
     for name, t in results:
-        row = f"  {name:<38} {t:>8.2f} {cuda_ep_t/t:>10.2f}x"
+        row = f"  {name:<38} {t:>8.2f} {cuda_ep_t / t:>10.2f}x"
         if trt_ep_t:
-            row += f" {trt_ep_t/t:>9.2f}x"
+            row += f" {trt_ep_t / t:>9.2f}x"
         print(row)
 
     out = Path(__file__).parent / "benchmark_results.txt"
     with open(out, "w") as f:
         for name, t in results:
-            f.write(f"{name}: {t:.2f} ms  (vs CUDA EP: {cuda_ep_t/t:.2f}x")
+            f.write(f"{name}: {t:.2f} ms  (vs CUDA EP: {cuda_ep_t / t:.2f}x")
             if trt_ep_t:
-                f.write(f", vs TRT EP: {trt_ep_t/t:.2f}x")
+                f.write(f", vs TRT EP: {trt_ep_t / t:.2f}x")
             f.write(")\n")
     print(f"\n[Saved -> {out}]")
 

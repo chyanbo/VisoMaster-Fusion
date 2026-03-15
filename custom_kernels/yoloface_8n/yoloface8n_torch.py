@@ -15,9 +15,9 @@ Usage:
     with torch.no_grad():
         out = runner(img_float32_1_3_640_640)  # (1, 20, 8400) float32
 """
+
 from __future__ import annotations
 
-import pathlib
 from typing import Optional
 
 import numpy as np
@@ -30,11 +30,19 @@ import torch.nn.functional as F
 # Building blocks
 # ---------------------------------------------------------------------------
 
+
 class _CBS(nn.Module):
     """BN-folded Conv2d + optional SiLU.  Attribute .conv matches ONNX weight names."""
 
-    def __init__(self, c1: int, c2: int, k: int = 1, s: int = 1,
-                 p: Optional[int] = None, act: bool = True):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int = 1,
+        s: int = 1,
+        p: Optional[int] = None,
+        act: bool = True,
+    ):
         super().__init__()
         if p is None:
             p = k // 2
@@ -65,10 +73,12 @@ class _C2f(nn.Module):
 
     def __init__(self, c1: int, c2: int, n: int = 1, shortcut: bool = True):
         super().__init__()
-        self.c_ = c2 // 2            # hidden channels
+        self.c_ = c2 // 2  # hidden channels
         self.cv1 = _CBS(c1, 2 * self.c_, k=1)
         self.cv2 = _CBS((2 + n) * self.c_, c2, k=1)
-        self.m = nn.ModuleList([_Bottleneck(self.c_, shortcut=shortcut) for _ in range(n)])
+        self.m = nn.ModuleList(
+            [_Bottleneck(self.c_, shortcut=shortcut) for _ in range(n)]
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         y = list(self.cv1(x).chunk(2, 1))
@@ -98,32 +108,32 @@ class _SPPF(nn.Module):
 # Backbone (models 0–9)
 # ---------------------------------------------------------------------------
 
-class _Backbone(nn.Module):
 
+class _Backbone(nn.Module):
     def __init__(self):
         super().__init__()
-        self.m0 = _CBS(3, 16, k=3, s=2)             # stride 2
-        self.m1 = _CBS(16, 32, k=3, s=2)            # stride 4
+        self.m0 = _CBS(3, 16, k=3, s=2)  # stride 2
+        self.m1 = _CBS(16, 32, k=3, s=2)  # stride 4
         self.m2 = _C2f(32, 32, n=1, shortcut=True)
-        self.m3 = _CBS(32, 64, k=3, s=2)            # stride 8
+        self.m3 = _CBS(32, 64, k=3, s=2)  # stride 8
         self.m4 = _C2f(64, 64, n=2, shortcut=True)  # P3, stride 8, 64ch
-        self.m5 = _CBS(64, 128, k=3, s=2)           # stride 16
-        self.m6 = _C2f(128, 128, n=2, shortcut=True)# P4, stride 16, 128ch
-        self.m7 = _CBS(128, 256, k=3, s=2)          # stride 32
+        self.m5 = _CBS(64, 128, k=3, s=2)  # stride 16
+        self.m6 = _C2f(128, 128, n=2, shortcut=True)  # P4, stride 16, 128ch
+        self.m7 = _CBS(128, 256, k=3, s=2)  # stride 32
         self.m8 = _C2f(256, 256, n=1, shortcut=True)
-        self.m9 = _SPPF(256, 256, k=5)              # P5, stride 32, 256ch
+        self.m9 = _SPPF(256, 256, k=5)  # P5, stride 32, 256ch
 
     def forward(self, x: torch.Tensor):
         x = self.m0(x)
         x = self.m1(x)
         x = self.m2(x)
         x = self.m3(x)
-        p3 = self.m4(x)    # 64ch
+        p3 = self.m4(x)  # 64ch
         x = self.m5(p3)
-        p4 = self.m6(x)    # 128ch
+        p4 = self.m6(x)  # 128ch
         x = self.m7(p4)
         x = self.m8(x)
-        p5 = self.m9(x)    # 256ch
+        p5 = self.m9(x)  # 256ch
         return p3, p4, p5
 
 
@@ -132,38 +142,39 @@ class _Backbone(nn.Module):
 # Upsample/Concat ops — no learnable params)
 # ---------------------------------------------------------------------------
 
-class _Neck(nn.Module):
 
+class _Neck(nn.Module):
     def __init__(self):
         super().__init__()
         self.up = nn.Upsample(scale_factor=2, mode="nearest")
         # top-down
-        self.m12 = _C2f(384, 128, n=1, shortcut=False)   # cat(up(p5),p4)  256+128=384
-        self.m15 = _C2f(192, 64,  n=1, shortcut=False)   # cat(up(m12),p3) 128+64=192
+        self.m12 = _C2f(384, 128, n=1, shortcut=False)  # cat(up(p5),p4)  256+128=384
+        self.m15 = _C2f(192, 64, n=1, shortcut=False)  # cat(up(m12),p3) 128+64=192
         # bottom-up
         self.m16 = _CBS(64, 64, k=3, s=2)
-        self.m18 = _C2f(192, 128, n=1, shortcut=False)   # cat(m16,m12)    64+128=192
+        self.m18 = _C2f(192, 128, n=1, shortcut=False)  # cat(m16,m12)    64+128=192
         self.m19 = _CBS(128, 128, k=3, s=2)
-        self.m21 = _C2f(384, 256, n=1, shortcut=False)   # cat(m19,p5)     128+256=384
+        self.m21 = _C2f(384, 256, n=1, shortcut=False)  # cat(m19,p5)     128+256=384
 
     def forward(self, p3, p4, p5):
         # top-down pathway
         x = torch.cat([self.up(p5), p4], 1)  # 384ch
-        p4_neck = self.m12(x)                # 128ch, stride 16
+        p4_neck = self.m12(x)  # 128ch, stride 16
         x = torch.cat([self.up(p4_neck), p3], 1)  # 192ch
-        p3_out = self.m15(x)                 # 64ch,  stride 8  → detection output
+        p3_out = self.m15(x)  # 64ch,  stride 8  → detection output
 
         # bottom-up pathway
         x = torch.cat([self.m16(p3_out), p4_neck], 1)  # 192ch
-        p4_out = self.m18(x)                 # 128ch, stride 16 → detection output
-        x = torch.cat([self.m19(p4_out), p5], 1)       # 384ch
-        p5_out = self.m21(x)                 # 256ch, stride 32 → detection output
+        p4_out = self.m18(x)  # 128ch, stride 16 → detection output
+        x = torch.cat([self.m19(p4_out), p5], 1)  # 384ch
+        p5_out = self.m21(x)  # 256ch, stride 32 → detection output
         return p3_out, p4_out, p5_out
 
 
 # ---------------------------------------------------------------------------
 # Detect head (model.22) — per-scale branches + DFL decode
 # ---------------------------------------------------------------------------
+
 
 class _HeadScale(nn.Module):
     """One per detection stride.  cv2=bbox-reg, cv3=cls, cv4=kps."""
@@ -174,19 +185,19 @@ class _HeadScale(nn.Module):
         self.cv2 = nn.Sequential(
             _CBS(c1, 64, k=3),
             _CBS(64, 64, k=3),
-            nn.Conv2d(64, 64, 1, bias=True),   # plain — ONNX name .2.weight
+            nn.Conv2d(64, 64, 1, bias=True),  # plain — ONNX name .2.weight
         )
         # class confidence: outputs nc=1 channel
         self.cv3 = nn.Sequential(
             _CBS(c1, 64, k=3),
             _CBS(64, 64, k=3),
-            nn.Conv2d(64, 1, 1, bias=True),    # plain — ONNX name .2.weight
+            nn.Conv2d(64, 1, 1, bias=True),  # plain — ONNX name .2.weight
         )
         # keypoints: outputs nkpt*3=15 channels (5 kps × [x,y,vis])
         self.cv4 = nn.Sequential(
             _CBS(c1, 16, k=3),
             _CBS(16, 16, k=3),
-            nn.Conv2d(16, 15, 1, bias=True),   # plain — ONNX name .2.weight
+            nn.Conv2d(16, 15, 1, bias=True),  # plain — ONNX name .2.weight
         )
 
 
@@ -200,13 +211,13 @@ class _DetectHead(nn.Module):
     """
 
     REG_MAX = 16
-    NKPT    = 5
+    NKPT = 5
 
     def __init__(self):
         super().__init__()
-        self.head8  = _HeadScale(64)    # stride 8,  P3
-        self.head16 = _HeadScale(128)   # stride 16, P4
-        self.head32 = _HeadScale(256)   # stride 32, P5
+        self.head8 = _HeadScale(64)  # stride 8,  P3
+        self.head16 = _HeadScale(128)  # stride 16, P4
+        self.head32 = _HeadScale(256)  # stride 32, P5
 
         # DFL 1×1 conv: weights initialised as [0..REG_MAX-1], no bias.
         # Loaded from ONNX (model.22.dfl.conv.weight); should equal range [0..15].
@@ -214,67 +225,68 @@ class _DetectHead(nn.Module):
 
         # Anchor grids — computed analytically for fixed 640×640; float32 always.
         anchor_xy, strides = _make_anchor_grids()
-        self.register_buffer("anchor_xy", anchor_xy)   # (1, 2, 8400)
-        self.register_buffer("strides",   strides)     # (1, 1, 8400)
+        self.register_buffer("anchor_xy", anchor_xy)  # (1, 2, 8400)
+        self.register_buffer("strides", strides)  # (1, 1, 8400)
 
     # ------------------------------------------------------------------
-    def _dfl_decode(self,
-                    raw_reg: torch.Tensor,  # (B, 64, N)
-                    anc_xy:  torch.Tensor,  # (1, 2, N)
-                    stride:  torch.Tensor,  # (1, 1, N)
-                    ) -> torch.Tensor:      # (B, 4, N) cxcywh pixels
+    def _dfl_decode(
+        self,
+        raw_reg: torch.Tensor,  # (B, 64, N)
+        anc_xy: torch.Tensor,  # (1, 2, N)
+        stride: torch.Tensor,  # (1, 1, N)
+    ) -> torch.Tensor:  # (B, 4, N) cxcywh pixels
         """DFL soft-argmax → ltrb → dist2bbox → cxcywh, multiplied by stride."""
         B, _, N = raw_reg.shape
         # (B,4,16,N) → softmax → weighted sum → ltrb (grid units)
-        w = self.dfl.weight.reshape(1, 1, self.REG_MAX, 1).float()   # (1,1,16,1)
-        ltrb = (raw_reg.float().reshape(B, 4, self.REG_MAX, N)
-                .softmax(2)
-                .mul(w)
-                .sum(2))   # (B, 4, N)
+        w = self.dfl.weight.reshape(1, 1, self.REG_MAX, 1).float()  # (1,1,16,1)
+        ltrb = (
+            raw_reg.float().reshape(B, 4, self.REG_MAX, N).softmax(2).mul(w).sum(2)
+        )  # (B, 4, N)
 
-        anc = anc_xy.float()   # (1, 2, N)
-        l, t, r, b = ltrb[:, 0:1], ltrb[:, 1:2], ltrb[:, 2:3], ltrb[:, 3:4]
-        cx = anc[:, 0:1] + (r - l) * 0.5
+        anc = anc_xy.float()  # (1, 2, N)
+        lx, t, r, b = ltrb[:, 0:1], ltrb[:, 1:2], ltrb[:, 2:3], ltrb[:, 3:4]
+        cx = anc[:, 0:1] + (r - lx) * 0.5
         cy = anc[:, 1:2] + (b - t) * 0.5
-        w_ = l + r
+        w_ = lx + r
         h_ = t + b
-        return torch.cat([cx, cy, w_, h_], 1) * stride.float()   # (B,4,N) pixels
+        return torch.cat([cx, cy, w_, h_], 1) * stride.float()  # (B,4,N) pixels
 
     # ------------------------------------------------------------------
-    def _decode_scale(self,
-                      head:   _HeadScale,
-                      feat:   torch.Tensor,  # (B,C,H,W)
-                      anc_xy: torch.Tensor,  # (1,2,N)
-                      stride: torch.Tensor,  # (1,1,N)
-                      ) -> torch.Tensor:     # (B,20,N)
+    def _decode_scale(
+        self,
+        head: _HeadScale,
+        feat: torch.Tensor,  # (B,C,H,W)
+        anc_xy: torch.Tensor,  # (1,2,N)
+        stride: torch.Tensor,  # (1,1,N)
+    ) -> torch.Tensor:  # (B,20,N)
         B, _, H, W = feat.shape
         N = H * W
 
-        raw_reg = head.cv2(feat).reshape(B, 64,          N)   # (B,64,N)
-        raw_cls = head.cv3(feat).reshape(B, 1,           N)   # (B,1,N)
+        raw_reg = head.cv2(feat).reshape(B, 64, N)  # (B,64,N)
+        raw_cls = head.cv3(feat).reshape(B, 1, N)  # (B,1,N)
         raw_kps = head.cv4(feat).reshape(B, self.NKPT, 3, N)  # (B,5,3,N)
 
-        bbox = self._dfl_decode(raw_reg, anc_xy, stride)         # (B,4,N)
-        cls  = raw_cls.float().sigmoid()                          # (B,1,N)
+        bbox = self._dfl_decode(raw_reg, anc_xy, stride)  # (B,4,N)
+        cls = raw_cls.float().sigmoid()  # (B,1,N)
 
         # kps xy: (B,5,2,N) * 2 + anchor(1,1,2,N) * stride(1,1,1,N)
         kps_xy_raw = raw_kps[:, :, :2, :].float()
         kps_vis_raw = raw_kps[:, :, 2:3, :].float()
-        anc_exp = anc_xy.unsqueeze(1).float()   # (1,1,2,N) — broadcast over kpt dim
-        str_exp = stride.unsqueeze(1).float()   # (1,1,1,N)
-        kps_xy  = (kps_xy_raw * 2.0 + anc_exp) * str_exp       # (B,5,2,N) pixels
-        kps_vis = kps_vis_raw.sigmoid()                          # (B,5,1,N)
+        anc_exp = anc_xy.unsqueeze(1).float()  # (1,1,2,N) — broadcast over kpt dim
+        str_exp = stride.unsqueeze(1).float()  # (1,1,1,N)
+        kps_xy = (kps_xy_raw * 2.0 + anc_exp) * str_exp  # (B,5,2,N) pixels
+        kps_vis = kps_vis_raw.sigmoid()  # (B,5,1,N)
         kps_out = torch.cat([kps_xy, kps_vis], 2).reshape(B, 15, N)  # (B,15,N)
 
         return torch.cat([bbox, cls, kps_out], 1)  # (B,20,N)
 
     # ------------------------------------------------------------------
     def forward(self, p3, p4, p5) -> torch.Tensor:  # (B,20,8400)
-        a8,  s8  = self.anchor_xy[:, :, :6400],     self.strides[:, :, :6400]
+        a8, s8 = self.anchor_xy[:, :, :6400], self.strides[:, :, :6400]
         a16, s16 = self.anchor_xy[:, :, 6400:8000], self.strides[:, :, 6400:8000]
-        a32, s32 = self.anchor_xy[:, :, 8000:],     self.strides[:, :, 8000:]
+        a32, s32 = self.anchor_xy[:, :, 8000:], self.strides[:, :, 8000:]
 
-        out8  = self._decode_scale(self.head8,  p3, a8,  s8)
+        out8 = self._decode_scale(self.head8, p3, a8, s8)
         out16 = self._decode_scale(self.head16, p4, a16, s16)
         out32 = self._decode_scale(self.head32, p5, a32, s32)
         return torch.cat([out8, out16, out32], 2)  # (B,20,8400)
@@ -283,6 +295,7 @@ class _DetectHead(nn.Module):
 # ---------------------------------------------------------------------------
 # Top-level model
 # ---------------------------------------------------------------------------
+
 
 class YoloFace8nTorch(nn.Module):
     """
@@ -298,8 +311,8 @@ class YoloFace8nTorch(nn.Module):
     def __init__(self, compute_dtype: torch.dtype = torch.float16):
         super().__init__()
         self.backbone = _Backbone()
-        self.neck     = _Neck()
-        self.head     = _DetectHead()
+        self.neck = _Neck()
+        self.head = _DetectHead()
         self._compute_dtype = compute_dtype
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -307,18 +320,20 @@ class YoloFace8nTorch(nn.Module):
         x = x.to(self._compute_dtype)
         p3, p4, p5 = self.backbone(x)
         p3, p4, p5 = self.neck(p3, p4, p5)
-        return self.head(p3, p4, p5)   # float32 output from decode
+        return self.head(p3, p4, p5)  # float32 output from decode
 
     # ------------------------------------------------------------------
     @classmethod
-    def from_onnx(cls,
-                  onnx_path: str,
-                  compute_dtype: torch.dtype = torch.float16,
-                  ) -> "YoloFace8nTorch":
+    def from_onnx(
+        cls,
+        onnx_path: str,
+        compute_dtype: torch.dtype = torch.float16,
+    ) -> "YoloFace8nTorch":
         """Load weights from yoloface_8n.onnx and return ready-to-use model."""
         import onnx
+
         model_onnx = onnx.load(onnx_path)
-        init_map   = {init.name: init for init in model_onnx.graph.initializer}
+        init_map = {init.name: init for init in model_onnx.graph.initializer}
 
         def _np(name: str) -> np.ndarray:
             init = init_map[name]
@@ -336,7 +351,7 @@ class YoloFace8nTorch(nn.Module):
 
         def _load_cbs(mod: _CBS, prefix: str) -> None:
             _load(mod.conv.weight, f"{prefix}.conv.weight")
-            _load(mod.conv.bias,   f"{prefix}.conv.bias")
+            _load(mod.conv.bias, f"{prefix}.conv.bias")
 
         def _load_c2f(mod: _C2f, prefix: str) -> None:
             _load_cbs(mod.cv1, f"{prefix}.cv1")
@@ -349,28 +364,29 @@ class YoloFace8nTorch(nn.Module):
             _load_cbs(mod.cv1, f"{prefix}.cv1")
             _load_cbs(mod.cv2, f"{prefix}.cv2")
 
-        def _load_head_scale(mod: _HeadScale,
-                             pfx_cv2: str, pfx_cv3: str, pfx_cv4: str) -> None:
+        def _load_head_scale(
+            mod: _HeadScale, pfx_cv2: str, pfx_cv3: str, pfx_cv4: str
+        ) -> None:
             # cv2 — [0]=CBS, [1]=CBS, [2]=plain Conv2d
             _load_cbs(mod.cv2[0], f"{pfx_cv2}.0")
             _load_cbs(mod.cv2[1], f"{pfx_cv2}.1")
             _load(mod.cv2[2].weight, f"{pfx_cv2}.2.weight")
-            _load(mod.cv2[2].bias,   f"{pfx_cv2}.2.bias")
+            _load(mod.cv2[2].bias, f"{pfx_cv2}.2.bias")
             # cv3
             _load_cbs(mod.cv3[0], f"{pfx_cv3}.0")
             _load_cbs(mod.cv3[1], f"{pfx_cv3}.1")
             _load(mod.cv3[2].weight, f"{pfx_cv3}.2.weight")
-            _load(mod.cv3[2].bias,   f"{pfx_cv3}.2.bias")
+            _load(mod.cv3[2].bias, f"{pfx_cv3}.2.bias")
             # cv4
             _load_cbs(mod.cv4[0], f"{pfx_cv4}.0")
             _load_cbs(mod.cv4[1], f"{pfx_cv4}.1")
             _load(mod.cv4[2].weight, f"{pfx_cv4}.2.weight")
-            _load(mod.cv4[2].bias,   f"{pfx_cv4}.2.bias")
+            _load(mod.cv4[2].bias, f"{pfx_cv4}.2.bias")
 
         model = cls(compute_dtype=compute_dtype)
-        bb    = model.backbone
-        nk    = model.neck
-        hd    = model.head
+        bb = model.backbone
+        nk = model.neck
+        hd = model.head
 
         # Backbone
         _load_cbs(bb.m0, "model.0")
@@ -393,19 +409,20 @@ class YoloFace8nTorch(nn.Module):
         _load_c2f(nk.m21, "model.21")
 
         # Detection head — three scales
-        _load_head_scale(hd.head8,
-                         "model.22.cv2.0", "model.22.cv3.0", "model.22.cv4.0")
-        _load_head_scale(hd.head16,
-                         "model.22.cv2.1", "model.22.cv3.1", "model.22.cv4.1")
-        _load_head_scale(hd.head32,
-                         "model.22.cv2.2", "model.22.cv3.2", "model.22.cv4.2")
+        _load_head_scale(hd.head8, "model.22.cv2.0", "model.22.cv3.0", "model.22.cv4.0")
+        _load_head_scale(
+            hd.head16, "model.22.cv2.1", "model.22.cv3.1", "model.22.cv4.1"
+        )
+        _load_head_scale(
+            hd.head32, "model.22.cv2.2", "model.22.cv3.2", "model.22.cv4.2"
+        )
 
         # DFL conv — no bias
         _load(hd.dfl.weight, "model.22.dfl.conv.weight")
 
         # Apply compute dtype (anchor buffers stay float32 — cast back after)
         anchor_xy_saved = model.head.anchor_xy.clone()
-        strides_saved   = model.head.strides.clone()
+        strides_saved = model.head.strides.clone()
         model = model.to(compute_dtype)
         model._compute_dtype = compute_dtype
         # Restore float32 anchor buffers (used in decode, not in conv path)
@@ -418,6 +435,7 @@ class YoloFace8nTorch(nn.Module):
 # ---------------------------------------------------------------------------
 # Anchor grid helper (computed analytically for fixed 640×640 input)
 # ---------------------------------------------------------------------------
+
 
 def _make_anchor_grids() -> tuple[torch.Tensor, torch.Tensor]:
     """
@@ -437,19 +455,20 @@ def _make_anchor_grids() -> tuple[torch.Tensor, torch.Tensor]:
             torch.arange(W, dtype=torch.float32) + 0.5,
             indexing="ij",
         )
-        gx = gx.reshape(-1)   # (N,)
+        gx = gx.reshape(-1)  # (N,)
         gy = gy.reshape(-1)
-        all_xy.append(torch.stack([gx, gy], 0))              # (2, N)
+        all_xy.append(torch.stack([gx, gy], 0))  # (2, N)
         all_st.append(torch.full((N,), stride, dtype=torch.float32))
 
-    anchor_xy = torch.cat(all_xy, 1).unsqueeze(0)   # (1, 2, 8400)
-    strides   = torch.cat(all_st).unsqueeze(0).unsqueeze(0)  # (1, 1, 8400)
+    anchor_xy = torch.cat(all_xy, 1).unsqueeze(0)  # (1, 2, 8400)
+    strides = torch.cat(all_st).unsqueeze(0).unsqueeze(0)  # (1, 1, 8400)
     return anchor_xy, strides
 
 
 # ---------------------------------------------------------------------------
 # CUDA graph runner (fixed 640×640 — single captured graph)
 # ---------------------------------------------------------------------------
+
 
 class _CapturedGraph:
     """Wraps a single CUDA-graph capture for the fixed 640×640 input."""
@@ -473,7 +492,7 @@ class _CapturedGraph:
 
 
 def build_cuda_graph_runner(
-        model: YoloFace8nTorch,
+    model: YoloFace8nTorch,
 ) -> "_CapturedGraph | YoloFace8nTorch":
     """
     Capture a CUDA graph for the fixed 640×640 input.

@@ -36,6 +36,7 @@ import torch.nn.functional as F
 # Backbone helpers
 # ---------------------------------------------------------------------------
 
+
 class _Bottleneck(nn.Module):
     """ResNet bottleneck with BN folded into Conv (all biases present, no BN)."""
 
@@ -54,7 +55,9 @@ class _Bottleneck(nn.Module):
         self.conv2 = nn.Conv2d(mid_ch, mid_ch, 3, padding=1, stride=stride, bias=True)
         self.conv3 = nn.Conv2d(mid_ch, out_ch, 1, bias=True)
         self.downsample: Optional[nn.Conv2d] = (
-            nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=True) if downsample else None
+            nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=True)
+            if downsample
+            else None
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -77,9 +80,7 @@ def _make_layer(
     """Build a ResNet stage (Sequential of _Bottleneck blocks)."""
     blocks: List[_Bottleneck] = []
     # First block may downsample spatially and always projects channels
-    blocks.append(
-        _Bottleneck(in_ch, mid_ch, out_ch, stride=stride, downsample=True)
-    )
+    blocks.append(_Bottleneck(in_ch, mid_ch, out_ch, stride=stride, downsample=True))
     for _ in range(1, num_blocks):
         blocks.append(_Bottleneck(out_ch, mid_ch, out_ch, stride=1, downsample=False))
     return nn.Sequential(*blocks)
@@ -95,10 +96,10 @@ class _ResNet50Body(nn.Module):
         self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
 
         # Stages — stored as nn.Sequential so we can iterate blocks easily
-        self.layer1 = _make_layer(64,   64,   256,  num_blocks=3, stride=1)
-        self.layer2 = _make_layer(256,  128,  512,  num_blocks=4, stride=2)
-        self.layer3 = _make_layer(512,  256,  1024, num_blocks=6, stride=2)
-        self.layer4 = _make_layer(1024, 512,  2048, num_blocks=3, stride=2)
+        self.layer1 = _make_layer(64, 64, 256, num_blocks=3, stride=1)
+        self.layer2 = _make_layer(256, 128, 512, num_blocks=4, stride=2)
+        self.layer3 = _make_layer(512, 256, 1024, num_blocks=6, stride=2)
+        self.layer4 = _make_layer(1024, 512, 2048, num_blocks=3, stride=2)
 
     def forward(
         self, x: torch.Tensor
@@ -116,6 +117,7 @@ class _ResNet50Body(nn.Module):
 # FPN
 # ---------------------------------------------------------------------------
 
+
 class _FPN(nn.Module):
     """Feature Pyramid Network over C3/C4/C5.
 
@@ -125,11 +127,11 @@ class _FPN(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.output1 = nn.Conv2d(512,  256, 1, bias=True)   # lateral C3
-        self.output2 = nn.Conv2d(1024, 256, 1, bias=True)   # lateral C4
-        self.output3 = nn.Conv2d(2048, 256, 1, bias=True)   # lateral C5
-        self.merge2  = nn.Conv2d(256,  256, 3, padding=1, bias=True)
-        self.merge1  = nn.Conv2d(256,  256, 3, padding=1, bias=True)
+        self.output1 = nn.Conv2d(512, 256, 1, bias=True)  # lateral C3
+        self.output2 = nn.Conv2d(1024, 256, 1, bias=True)  # lateral C4
+        self.output3 = nn.Conv2d(2048, 256, 1, bias=True)  # lateral C5
+        self.merge2 = nn.Conv2d(256, 256, 3, padding=1, bias=True)
+        self.merge1 = nn.Conv2d(256, 256, 3, padding=1, bias=True)
 
     def forward(
         self,
@@ -154,6 +156,7 @@ class _FPN(nn.Module):
 # SSH module
 # ---------------------------------------------------------------------------
 
+
 class _SSH(nn.Module):
     """Single-Scale Head Module.
 
@@ -163,11 +166,11 @@ class _SSH(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.conv3X3   = nn.Conv2d(256, 128, 3, padding=1, bias=True)
-        self.conv5X5_1 = nn.Conv2d(256,  64, 3, padding=1, bias=True)
-        self.conv5X5_2 = nn.Conv2d( 64,  64, 3, padding=1, bias=True)
-        self.conv7X7_2 = nn.Conv2d( 64,  64, 3, padding=1, bias=True)
-        self.conv7x7_3 = nn.Conv2d( 64,  64, 3, padding=1, bias=True)
+        self.conv3X3 = nn.Conv2d(256, 128, 3, padding=1, bias=True)
+        self.conv5X5_1 = nn.Conv2d(256, 64, 3, padding=1, bias=True)
+        self.conv5X5_2 = nn.Conv2d(64, 64, 3, padding=1, bias=True)
+        self.conv7X7_2 = nn.Conv2d(64, 64, 3, padding=1, bias=True)
+        self.conv7x7_3 = nn.Conv2d(64, 64, 3, padding=1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Branch A: 3×3 only (no activation before concat)
@@ -188,6 +191,7 @@ class _SSH(nn.Module):
 # ---------------------------------------------------------------------------
 # Detection heads
 # ---------------------------------------------------------------------------
+
 
 class _ClassHead(nn.Module):
     """Classification head: 256ch → 4ch → (1, N, 2)."""
@@ -236,6 +240,7 @@ class _LandmarkHead(nn.Module):
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
 
+
 def _conv_modules_in_forward_order(model: "Res50Torch") -> List[nn.Conv2d]:
     """Return the 73 anonymous Conv2d modules in ONNX topological order.
 
@@ -256,7 +261,12 @@ def _conv_modules_in_forward_order(model: "Res50Torch") -> List[nn.Conv2d]:
     mods.append(model.body.conv1)
 
     # ResNet stages
-    for layer in (model.body.layer1, model.body.layer2, model.body.layer3, model.body.layer4):
+    for layer in (
+        model.body.layer1,
+        model.body.layer2,
+        model.body.layer3,
+        model.body.layer4,
+    ):
         for block in layer:
             mods.append(block.conv1)
             mods.append(block.conv2)
@@ -366,7 +376,9 @@ def _load_named_params(
         # weight_name looks like  'ClassHead.0.conv1x1.weight'
         # bias may be             'ClassHead.0.conv1x1.bias'
         if weight_name not in state:
-            raise KeyError(f"Named Conv weight '{weight_name}' not found in model state_dict")
+            raise KeyError(
+                f"Named Conv weight '{weight_name}' not found in model state_dict"
+            )
 
         w_np = np.frombuffer(init_map[weight_name].raw_data, dtype=np.float32).copy()
         w_np = w_np.reshape(list(init_map[weight_name].dims))
@@ -376,7 +388,9 @@ def _load_named_params(
         if len(node.input) > 2 and node.input[2]:
             bias_name = node.input[2]
             if bias_name not in state:
-                raise KeyError(f"Named Conv bias '{bias_name}' not found in model state_dict")
+                raise KeyError(
+                    f"Named Conv bias '{bias_name}' not found in model state_dict"
+                )
             b_np = np.frombuffer(init_map[bias_name].raw_data, dtype=np.float32).copy()
             with torch.no_grad():
                 state[bias_name].copy_(torch.from_numpy(b_np).to(dtype))
@@ -385,6 +399,7 @@ def _load_named_params(
 # ---------------------------------------------------------------------------
 # Main model
 # ---------------------------------------------------------------------------
+
 
 class Res50Torch(nn.Module):
     """FP16-capable PyTorch reimplementation of res50.onnx (RetinaFace / FaceLandmark5).
@@ -398,22 +413,20 @@ class Res50Torch(nn.Module):
     def __init__(self) -> None:
         super().__init__()
         self.body = _ResNet50Body()
-        self.fpn  = _FPN()
+        self.fpn = _FPN()
 
         self.ssh1 = _SSH()
         self.ssh2 = _SSH()
         self.ssh3 = _SSH()
 
-        self.ClassHead    = nn.ModuleList([_ClassHead()    for _ in range(3)])
-        self.BboxHead     = nn.ModuleList([_BboxHead()     for _ in range(3)])
+        self.ClassHead = nn.ModuleList([_ClassHead() for _ in range(3)])
+        self.BboxHead = nn.ModuleList([_BboxHead() for _ in range(3)])
         self.LandmarkHead = nn.ModuleList([_LandmarkHead() for _ in range(3)])
 
         # Set after from_onnx; used to cast inputs in forward()
         self._compute_dtype: torch.dtype = torch.float32
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         x = x.to(self._compute_dtype)
 
         # Backbone
@@ -488,6 +501,7 @@ class Res50Torch(nn.Module):
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 class Res50CUDAGraphRunner:
     """Wraps Res50Torch in a CUDA graph for lower-latency inference.
 
@@ -504,7 +518,7 @@ class Res50CUDAGraphRunner:
             for _ in range(warmup):
                 _ = model(self._inp)
 
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         self._stream = torch.cuda.Stream()
 
         torch.cuda.synchronize()
@@ -512,16 +526,12 @@ class Res50CUDAGraphRunner:
             self._out_conf, self._out_ldmk = model(self._inp)
         torch.cuda.synchronize()
 
-    def __call__(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __call__(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         self._inp.copy_(x, non_blocking=True)
         self._graph.replay()
         return self._out_conf.clone(), self._out_ldmk.clone()
 
 
-def build_cuda_graph_runner(
-    model: Res50Torch, warmup: int = 3
-) -> Res50CUDAGraphRunner:
+def build_cuda_graph_runner(model: Res50Torch, warmup: int = 3) -> Res50CUDAGraphRunner:
     """Convenience factory for Res50CUDAGraphRunner."""
     return Res50CUDAGraphRunner(model, warmup)

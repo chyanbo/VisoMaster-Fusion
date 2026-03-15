@@ -9,6 +9,7 @@ Optional env vars:
     WARMUP=50
     ITERS=500
 """
+
 from __future__ import annotations
 
 import os
@@ -20,13 +21,15 @@ import numpy as np
 import torch
 
 # ---------------------------------------------------------------------------
-ROOT      = pathlib.Path(__file__).parent.parent.parent
-ONNX_PATH = pathlib.Path(os.environ.get(
-    "ONNX_PATH",
-    ROOT / "model_assets" / "face_blendshapes_Nx146x2.onnx",
-))
+ROOT = pathlib.Path(__file__).parent.parent.parent
+ONNX_PATH = pathlib.Path(
+    os.environ.get(
+        "ONNX_PATH",
+        ROOT / "model_assets" / "face_blendshapes_Nx146x2.onnx",
+    )
+)
 WARMUP = int(os.environ.get("WARMUP", 50))
-ITERS  = int(os.environ.get("ITERS",  500))
+ITERS = int(os.environ.get("ITERS", 500))
 
 sys.path.insert(0, str(ROOT))
 
@@ -47,6 +50,7 @@ def _bench(fn, warmup: int = WARMUP, iters: int = ITERS) -> float:
 
 def _ort_session(path: str, provider: str = "CUDAExecutionProvider"):
     import onnxruntime as ort
+
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(str(path), sess_options=opts, providers=[provider])
@@ -61,17 +65,17 @@ def _print_row(tier, label, ms_val, ref_ms):
 
 
 def bench():
-    print(f"\n=== face_blendshapes — (1,146,2) → (1,52) ===")
+    print("\n=== face_blendshapes — (1,146,2) → (1,52) ===")
     print(f"  warm-up={WARMUP}, iters={ITERS}\n")
     print(f"  {'Tier':<6} | {'Method':<44} | {'ms':>8} | {'speedup':>7}")
-    print(f"  {'-'*6}-+-{'-'*44}-+-{'-'*8}-+-{'-'*7}")
+    print(f"  {'-' * 6}-+-{'-' * 44}-+-{'-' * 8}-+-{'-' * 7}")
 
-    inp    = torch.randn(1, 146, 2, dtype=torch.float32, device="cuda")
+    inp = torch.randn(1, 146, 2, dtype=torch.float32, device="cuda")
     inp_np = inp.cpu().numpy()
 
     # ── Tier 0: ORT FP32 CUDA EP ─────────────────────────────────────────
-    sess0     = _ort_session(ONNX_PATH, "CUDAExecutionProvider")
-    in_name   = sess0.get_inputs()[0].name
+    sess0 = _ort_session(ONNX_PATH, "CUDAExecutionProvider")
+    in_name = sess0.get_inputs()[0].name
     out_names = [o.name for o in sess0.get_outputs()]
     t0 = _bench(lambda: sess0.run(out_names, {in_name: inp_np}))
     _print_row("0", "ORT FP32 CUDA EP (baseline)", t0, t0)
@@ -79,18 +83,24 @@ def bench():
     # ── Tier 0b: ORT TensorRT EP ─────────────────────────────────────────
     t0b = t0
     try:
-        import tensorrt  # registers nvinfer DLL path on Windows
+        pass  # registers nvinfer DLL path on Windows
     except Exception:
         pass
     import onnxruntime as _ort
+
     if "TensorrtExecutionProvider" not in _ort.get_available_providers():
-        print(f"  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)")
+        print(
+            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
+        )
     else:
         ctx = ROOT / "tensorrt-engines" / "face_blendshapes_Nx146x2_ctx.onnx"
         if not ctx.exists():
-            print(f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})")
+            print(
+                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
+            )
         else:
             import os as _os
+
             _prev_cwd = _os.getcwd()
             _os.chdir(str(ROOT))
             trt_opts = {
@@ -106,32 +116,48 @@ def bench():
             }
             so = _ort.SessionOptions()
             so.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort.InferenceSession(str(ONNX_PATH), so, providers=[
-                ("TensorrtExecutionProvider", trt_opts),
-                ("CUDAExecutionProvider", {"device_id": "0"}),
-                ("CPUExecutionProvider", {}),
-            ])
+            sess0b = _ort.InferenceSession(
+                str(ONNX_PATH),
+                so,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider", {"device_id": "0"}),
+                    ("CPUExecutionProvider", {}),
+                ],
+            )
             _os.chdir(_prev_cwd)
             t0b = _bench(lambda: sess0b.run(out_names, {in_name: inp_np}))
             _print_row("0b", "ORT TensorRT EP FP32", t0b, t0)
 
     # ── Tier 1: PyTorch FP32 eager ────────────────────────────────────────
-    from custom_kernels.face_blendshapes.face_blendshapes_torch import FaceBlendShapesTorch
-    m_fp32 = (FaceBlendShapesTorch.from_onnx(ONNX_PATH, compute_dtype=torch.float32)
-              .cuda().eval())
+    from custom_kernels.face_blendshapes.face_blendshapes_torch import (
+        FaceBlendShapesTorch,
+    )
+
+    m_fp32 = (
+        FaceBlendShapesTorch.from_onnx(ONNX_PATH, compute_dtype=torch.float32)
+        .cuda()
+        .eval()
+    )
     with torch.no_grad():
         t1 = _bench(lambda: m_fp32(inp))
     _print_row("1", "PyTorch FP32 eager", t1, t0)
 
     # ── Tier 2: PyTorch FP16 eager ────────────────────────────────────────
-    m_fp16 = (FaceBlendShapesTorch.from_onnx(ONNX_PATH, compute_dtype=torch.float16)
-              .cuda().eval())
+    m_fp16 = (
+        FaceBlendShapesTorch.from_onnx(ONNX_PATH, compute_dtype=torch.float16)
+        .cuda()
+        .eval()
+    )
     with torch.no_grad():
         t2 = _bench(lambda: m_fp16(inp))
     _print_row("2", "PyTorch FP16 eager", t2, t0)
 
     # ── Tier 3: PyTorch FP16 + CUDA graph ─────────────────────────────────
-    from custom_kernels.face_blendshapes.face_blendshapes_torch import build_cuda_graph_runner
+    from custom_kernels.face_blendshapes.face_blendshapes_torch import (
+        build_cuda_graph_runner,
+    )
+
     runner = build_cuda_graph_runner(m_fp16)
     t3 = _bench(lambda: runner(inp))
     _print_row("3", "PyTorch FP16 + CUDA graph", t3, t0)
@@ -142,9 +168,9 @@ def bench():
     print("=== Numerical accuracy (ORT FP32 vs PyTorch FP16 + CUDA graph) ===")
     ref_out = sess0.run(out_names, {in_name: inp_np})[0]  # (1, 52)
     with torch.no_grad():
-        pt_out = runner(inp).cpu().numpy()                 # (1, 52)
+        pt_out = runner(inp).cpu().numpy()  # (1, 52)
 
-    max_err  = float(np.abs(ref_out - pt_out).max())
+    max_err = float(np.abs(ref_out - pt_out).max())
     mean_err = float(np.abs(ref_out - pt_out).mean())
     print(f"  max  |Δ| = {max_err:.5f}  (blendshape coefficients)")
     print(f"  mean |Δ| = {mean_err:.7f}")
@@ -166,6 +192,7 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     try:
         import onnxruntime as ort
+
         print(f"ORT    : {ort.__version__}")
     except ImportError:
         print("ORT    : not available — install onnxruntime-gpu")

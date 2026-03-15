@@ -274,310 +274,388 @@ class FaceLandmarkDetectors:
         """Lazy-load the Res50Torch Custom-kernel runner for FaceLandmark5."""
         if self._landmark5_runner is not None:
             return self._landmark5_runner
-        with self._custom_init_lock:
-            if self._landmark5_runner is not None:
-                return self._landmark5_runner
-            if self._landmark5_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for Landmark 5-point detector.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._landmark5_runner is not None:
+                    return self._landmark5_runner
+                if self._landmark5_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.res50.res50_torch import Res50Torch
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "res50.onnx"
+                        )
+                        m = (
+                            Res50Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._landmark5_torch = m
+                    except Exception as e:
+                        print(f"[Custom] res50 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.res50.res50_torch import Res50Torch
+                    from custom_kernels.res50.res50_torch import build_cuda_graph_runner
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "res50.onnx"
-                    )
-                    m = (
-                        Res50Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._landmark5_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._landmark5_runner = build_cuda_graph_runner(
+                            self._landmark5_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] res50 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.res50.res50_torch import build_cuda_graph_runner
-
-                self._landmark5_runner = build_cuda_graph_runner(self._landmark5_torch)
-            except Exception as e:
-                print(f"[Custom] res50 CUDA graph failed, using eager: {e}")
-                self._landmark5_runner = self._landmark5_torch
+                    print(f"[Custom] res50 CUDA graph failed, using eager: {e}")
+                    self._landmark5_runner = self._landmark5_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._landmark5_runner
 
     def _get_1k3d68_runner(self):
         """Lazy-load the Landmark1k3d68Torch Custom-kernel runner for FaceLandmark3d68."""
         if self._1k3d68_runner is not None:
             return self._1k3d68_runner
-        with self._custom_init_lock:
-            if self._1k3d68_runner is not None:
-                return self._1k3d68_runner
-            if self._1k3d68_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for 1K3D68 3D landmark detector.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._1k3d68_runner is not None:
+                    return self._1k3d68_runner
+                if self._1k3d68_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.landmark_1k3d68.landmark_1k3d68_torch import (
+                            Landmark1k3d68Torch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "1k3d68.onnx"
+                        )
+                        m = (
+                            Landmark1k3d68Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._1k3d68_torch = m
+                    except Exception as e:
+                        print(f"[Custom] 1k3d68 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.landmark_1k3d68.landmark_1k3d68_torch import (
-                        Landmark1k3d68Torch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "1k3d68.onnx"
-                    )
-                    m = (
-                        Landmark1k3d68Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._1k3d68_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._1k3d68_runner = build_cuda_graph_runner(
+                            self._1k3d68_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] 1k3d68 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.landmark_1k3d68.landmark_1k3d68_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._1k3d68_runner = build_cuda_graph_runner(self._1k3d68_torch)
-            except Exception as e:
-                print(f"[Custom] 1k3d68 CUDA graph failed, using eager: {e}")
-                self._1k3d68_runner = self._1k3d68_torch
+                    print(f"[Custom] 1k3d68 CUDA graph failed, using eager: {e}")
+                    self._1k3d68_runner = self._1k3d68_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._1k3d68_runner
 
     def _get_landmark203_runner(self):
         """Lazy-load the Landmark203Torch Custom-kernel runner for FaceLandmark203."""
         if self._landmark203_runner is not None:
             return self._landmark203_runner
-        with self._custom_init_lock:
-            if self._landmark203_runner is not None:
-                return self._landmark203_runner
-            if self._landmark203_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for Landmark 203-point detector.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._landmark203_runner is not None:
+                    return self._landmark203_runner
+                if self._landmark203_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.landmark_203.landmark_203_torch import (
+                            Landmark203Torch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "landmark.onnx"
+                        )
+                        m = (
+                            Landmark203Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._landmark203_torch = m
+                    except Exception as e:
+                        print(f"[Custom] landmark_203 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.landmark_203.landmark_203_torch import (
-                        Landmark203Torch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "landmark.onnx"
-                    )
-                    m = (
-                        Landmark203Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._landmark203_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._landmark203_runner = build_cuda_graph_runner(
+                            self._landmark203_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] landmark_203 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.landmark_203.landmark_203_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._landmark203_runner = build_cuda_graph_runner(
-                    self._landmark203_torch
-                )
-            except Exception as e:
-                print(f"[Custom] landmark_203 CUDA graph failed, using eager: {e}")
-                self._landmark203_runner = self._landmark203_torch
+                    print(f"[Custom] landmark_203 CUDA graph failed, using eager: {e}")
+                    self._landmark203_runner = self._landmark203_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._landmark203_runner
 
     def _get_fan2dfan4_runner(self):
         """Lazy-load the FAN2dfan4 Custom-kernel runner for FaceLandmark68."""
         if self._fan2dfan4_runner is not None:
             return self._fan2dfan4_runner
-        with self._custom_init_lock:
-            if self._fan2dfan4_runner is not None:
-                return self._fan2dfan4_runner
-            if self._fan2dfan4_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for 2DFan4 face alignment.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._fan2dfan4_runner is not None:
+                    return self._fan2dfan4_runner
+                if self._fan2dfan4_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.fan_2dfan4.fan_2dfan4_torch import FAN2dfan4
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "2dfan4.onnx"
+                        )
+                        m = (
+                            FAN2dfan4.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._fan2dfan4_torch = m
+                    except Exception as e:
+                        print(f"[Custom] fan_2dfan4 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.fan_2dfan4.fan_2dfan4_torch import FAN2dfan4
+                    from custom_kernels.fan_2dfan4.fan_2dfan4_torch import (
+                        build_cuda_graph_runner,
+                    )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "2dfan4.onnx"
-                    )
-                    m = (
-                        FAN2dfan4.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._fan2dfan4_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._fan2dfan4_runner = build_cuda_graph_runner(
+                            self._fan2dfan4_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] fan_2dfan4 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.fan_2dfan4.fan_2dfan4_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._fan2dfan4_runner = build_cuda_graph_runner(self._fan2dfan4_torch)
-            except Exception as e:
-                print(f"[Custom] fan_2dfan4 CUDA graph failed, using eager: {e}")
-                self._fan2dfan4_runner = self._fan2dfan4_torch
+                    print(f"[Custom] fan_2dfan4 CUDA graph failed, using eager: {e}")
+                    self._fan2dfan4_runner = self._fan2dfan4_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._fan2dfan4_runner
 
     def _get_landmark478_runner(self):
         """Lazy-load the FaceLandmark478Torch Custom-kernel runner for FaceLandmark478."""
         if self._landmark478_runner is not None:
             return self._landmark478_runner
-        with self._custom_init_lock:
-            if self._landmark478_runner is not None:
-                return self._landmark478_runner
-            if self._landmark478_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for Face Landmark 478 (MediaPipe).\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._landmark478_runner is not None:
+                    return self._landmark478_runner
+                if self._landmark478_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.face_landmark478.face_landmark478_torch import (
+                            FaceLandmark478Torch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "face_landmarks_detector_Nx3x256x256.onnx"
+                        )
+                        m = (
+                            FaceLandmark478Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._landmark478_torch = m
+                    except Exception as e:
+                        print(f"[Custom] face_landmark478 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.face_landmark478.face_landmark478_torch import (
-                        FaceLandmark478Torch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "face_landmarks_detector_Nx3x256x256.onnx"
-                    )
-                    m = (
-                        FaceLandmark478Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._landmark478_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._landmark478_runner = build_cuda_graph_runner(
+                            self._landmark478_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] face_landmark478 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.face_landmark478.face_landmark478_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._landmark478_runner = build_cuda_graph_runner(
-                    self._landmark478_torch
-                )
-            except Exception as e:
-                print(f"[Custom] face_landmark478 CUDA graph failed, using eager: {e}")
-                self._landmark478_runner = self._landmark478_torch
+                    print(
+                        f"[Custom] face_landmark478 CUDA graph failed, using eager: {e}"
+                    )
+                    self._landmark478_runner = self._landmark478_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._landmark478_runner
 
     def _get_blendshapes_runner(self):
         """Lazy-load the FaceBlendShapesTorch Custom-kernel runner."""
         if self._blendshapes_runner is not None:
             return self._blendshapes_runner
-        with self._custom_init_lock:
-            if self._blendshapes_runner is not None:
-                return self._blendshapes_runner
-            if self._blendshapes_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for Face Blendshapes.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._blendshapes_runner is not None:
+                    return self._blendshapes_runner
+                if self._blendshapes_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.face_blendshapes.face_blendshapes_torch import (
+                            FaceBlendShapesTorch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "face_blendshapes_Nx146x2.onnx"
+                        )
+                        m = (
+                            FaceBlendShapesTorch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._blendshapes_torch = m
+                    except Exception as e:
+                        print(f"[Custom] face_blendshapes load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.face_blendshapes.face_blendshapes_torch import (
-                        FaceBlendShapesTorch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "face_blendshapes_Nx146x2.onnx"
-                    )
-                    m = (
-                        FaceBlendShapesTorch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._blendshapes_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._blendshapes_runner = build_cuda_graph_runner(
+                            self._blendshapes_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] face_blendshapes load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.face_blendshapes.face_blendshapes_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._blendshapes_runner = build_cuda_graph_runner(
-                    self._blendshapes_torch
-                )
-            except Exception as e:
-                print(f"[Custom] face_blendshapes CUDA graph failed, using eager: {e}")
-                self._blendshapes_runner = self._blendshapes_torch
+                    print(
+                        f"[Custom] face_blendshapes CUDA graph failed, using eager: {e}"
+                    )
+                    self._blendshapes_runner = self._blendshapes_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._blendshapes_runner
 
     def _get_det106_runner(self):
         """Lazy-load the Det106Torch Custom-kernel runner for FaceLandmark106."""
         if self._det106_runner is not None:
             return self._det106_runner
-        with self._custom_init_lock:
-            if self._det106_runner is not None:
-                return self._det106_runner
-            if self._det106_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for 106-point face detector.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._det106_runner is not None:
+                    return self._det106_runner
+                if self._det106_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.det_106.det_106_torch import Det106Torch
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "2d106det.onnx"
+                        )
+                        m = (
+                            Det106Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._det106_torch = m
+                    except Exception as e:
+                        print(f"[Custom] det_106 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.det_106.det_106_torch import Det106Torch
+                    from custom_kernels.det_106.det_106_torch import (
+                        build_cuda_graph_runner,
+                    )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "2d106det.onnx"
-                    )
-                    m = (
-                        Det106Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._det106_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._det106_runner = build_cuda_graph_runner(
+                            self._det106_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] det_106 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.det_106.det_106_torch import build_cuda_graph_runner
-
-                self._det106_runner = build_cuda_graph_runner(self._det106_torch)
-            except Exception as e:
-                print(f"[Custom] det_106 CUDA graph failed, using eager: {e}")
-                self._det106_runner = self._det106_torch
+                    print(f"[Custom] det_106 CUDA graph failed, using eager: {e}")
+                    self._det106_runner = self._det106_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._det106_runner
 
     def _get_peppapig98_runner(self):
         """Lazy-load the PeppaPig98Torch Custom-kernel runner for FaceLandmark98."""
         if self._peppapig98_runner is not None:
             return self._peppapig98_runner
-        with self._custom_init_lock:
-            if self._peppapig98_runner is not None:
-                return self._peppapig98_runner
-            if self._peppapig98_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for PeppaPig 98-point detector.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._peppapig98_runner is not None:
+                    return self._peppapig98_runner
+                if self._peppapig98_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.peppapig_98.peppapig_98_torch import (
+                            PeppaPig98Torch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "peppapig_teacher_Nx3x256x256.onnx"
+                        )
+                        m = (
+                            PeppaPig98Torch(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._peppapig98_torch = m
+                    except Exception as e:
+                        print(f"[Custom] peppapig_98 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.peppapig_98.peppapig_98_torch import (
-                        PeppaPig98Torch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "peppapig_teacher_Nx3x256x256.onnx"
-                    )
-                    m = (
-                        PeppaPig98Torch(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._peppapig98_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._peppapig98_runner = build_cuda_graph_runner(
+                            self._peppapig98_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] peppapig_98 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.peppapig_98.peppapig_98_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._peppapig98_runner = build_cuda_graph_runner(
-                    self._peppapig98_torch
-                )
-            except Exception as e:
-                print(f"[Custom] peppapig_98 CUDA graph failed, using eager: {e}")
-                self._peppapig98_runner = self._peppapig98_torch
+                    print(f"[Custom] peppapig_98 CUDA graph failed, using eager: {e}")
+                    self._peppapig98_runner = self._peppapig98_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._peppapig98_runner
 
     def _prepare_crop(

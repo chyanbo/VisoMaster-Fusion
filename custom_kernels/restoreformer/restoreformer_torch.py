@@ -15,6 +15,7 @@ Cross-attention skip connections (encoder features as Q, decoder features as K/V
   decoder.up[5].attn[i]: Q from enc.mid.block_1 output  (512ch, 16×16)
   decoder.up[4].attn[i]: Q from enc.down[4] block output (256ch, 32×32)
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -29,8 +30,10 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 try:
     import sys as _sys
+
     _sys.path.insert(0, str(pathlib.Path(__file__).parent.parent.parent))
     from custom_kernels.triton_ops import triton_group_norm_silu as _tgns
+
     _TRITON_OK = True
 except Exception:
     _TRITON_OK = False
@@ -39,6 +42,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Primitives
 # ---------------------------------------------------------------------------
+
 
 class _GN(nn.Module):
     """GroupNorm(32) with optional Triton-fused SiLU."""
@@ -107,7 +111,13 @@ class _AttnBlock(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v)  # (B,nh,H*W,hd)
         # view(B,H,W,C) → permute(0,3,1,2) produces channels-last (NHWC) strides;
         # .contiguous() restores NCHW layout so downstream Triton GN is correct.
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        out = (
+            out.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(B, H, W, C)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
         return x + self.proj_out(out)
 
 
@@ -122,7 +132,7 @@ class _CrossAttnBlock(nn.Module):
 
     def __init__(self, in_ch: int, enc_ch: int):
         super().__init__()
-        self.norm1 = _GN(in_ch)   # K, V — current decoder features
+        self.norm1 = _GN(in_ch)  # K, V — current decoder features
         self.norm2 = _GN(enc_ch)  # Q   — encoder skip features
         self.q = nn.Conv2d(enc_ch, in_ch, 1)
         self.k = nn.Conv2d(in_ch, in_ch, 1)
@@ -130,7 +140,7 @@ class _CrossAttnBlock(nn.Module):
         self.proj_out = nn.Conv2d(in_ch, in_ch, 1)
 
     def forward(self, x: torch.Tensor, enc_skip: torch.Tensor) -> torch.Tensor:
-        h     = self.norm1(x)
+        h = self.norm1(x)
         enc_n = self.norm2(enc_skip)
         B, C, H, W = h.shape
         nh = _ATTN_HEADS
@@ -142,7 +152,13 @@ class _CrossAttnBlock(nn.Module):
         out = F.scaled_dot_product_attention(q, k, v)  # (B,nh,H*W,hd)
         # view(B,H,W,C) → permute(0,3,1,2) produces channels-last (NHWC) strides;
         # .contiguous() restores NCHW layout so downstream Triton GN is correct.
-        out = out.permute(0, 2, 1, 3).contiguous().view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        out = (
+            out.permute(0, 2, 1, 3)
+            .contiguous()
+            .view(B, H, W, C)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
         return x + self.proj_out(out)
 
 
@@ -167,6 +183,7 @@ class _Upsample(nn.Module):
 # ---------------------------------------------------------------------------
 # Encoder / Decoder stage blocks
 # ---------------------------------------------------------------------------
+
 
 class _DownBlock(nn.Module):
     """Encoder stage with interleaved ResBlocks + AttnBlocks."""
@@ -223,7 +240,9 @@ class _UpBlockCrossAttn(nn.Module):
         self.block = nn.ModuleList(
             [_ResBlock(in_ch if i == 0 else out_ch, out_ch) for i in range(n_res)]
         )
-        self.attn = nn.ModuleList([_CrossAttnBlock(out_ch, enc_ch) for _ in range(n_res)])
+        self.attn = nn.ModuleList(
+            [_CrossAttnBlock(out_ch, enc_ch) for _ in range(n_res)]
+        )
         self.upsample: Optional[_Upsample] = _Upsample(out_ch) if has_us else None
 
     def forward(self, x: torch.Tensor, enc_skip: torch.Tensor) -> torch.Tensor:
@@ -241,16 +260,18 @@ class _EncoderMidBlock(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
         self.block_1 = _ResBlock(ch, ch)
-        self.attn_1  = _AttnBlock(ch)
+        self.attn_1 = _AttnBlock(ch)
         self.block_2 = _ResBlock(ch, ch)
 
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Returns (output, enc_mid_attn_skip, enc_norm_out_skip)."""
         x = self.block_1(x)
-        enc_mid_attn_skip = x          # input to attn_1 — used by dec.up[5]
+        enc_mid_attn_skip = x  # input to attn_1 — used by dec.up[5]
         x = self.attn_1(x)
         x = self.block_2(x)
-        enc_norm_out_skip = x          # input to enc.norm_out — used by dec.mid
+        enc_norm_out_skip = x  # input to enc.norm_out — used by dec.mid
         return x, enc_mid_attn_skip, enc_norm_out_skip
 
 
@@ -260,7 +281,7 @@ class _DecoderMidBlock(nn.Module):
     def __init__(self, ch: int):
         super().__init__()
         self.block_1 = _ResBlock(ch, ch)
-        self.attn_1  = _CrossAttnBlock(ch, ch)
+        self.attn_1 = _CrossAttnBlock(ch, ch)
         self.block_2 = _ResBlock(ch, ch)
 
     def forward(self, x: torch.Tensor, enc_norm_out_skip: torch.Tensor) -> torch.Tensor:
@@ -280,19 +301,28 @@ class _VQLayer(nn.Module):
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         B, C, H, W = z.shape
         z_f = z.permute(0, 2, 3, 1).reshape(-1, C).float()
-        e   = self.embedding.weight.float()
-        d   = (z_f.pow(2).sum(1, keepdim=True)
-               - 2.0 * (z_f @ e.t())
-               + e.pow(2).sum(1).unsqueeze(0))
+        e = self.embedding.weight.float()
+        d = (
+            z_f.pow(2).sum(1, keepdim=True)
+            - 2.0 * (z_f @ e.t())
+            + e.pow(2).sum(1).unsqueeze(0)
+        )
         idx = d.argmin(dim=1)
         # .contiguous() ensures NCHW layout — without it the permute produces a
         # channels-last (NHWC) view that breaks the Triton GroupNorm kernel.
-        return self.embedding(idx).to(z.dtype).reshape(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+        return (
+            self.embedding(idx)
+            .to(z.dtype)
+            .reshape(B, H, W, C)
+            .permute(0, 3, 1, 2)
+            .contiguous()
+        )
 
 
 # ---------------------------------------------------------------------------
 # Encoder
 # ---------------------------------------------------------------------------
+
 
 class _Encoder(nn.Module):
     """
@@ -306,15 +336,17 @@ class _Encoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv_in = nn.Conv2d(3, 64, 3, padding=1)
-        self.down = nn.ModuleList([
-            _DownBlock(64,  64,  2, 0, True),   # down.0  512→256
-            _DownBlock(64,  128, 2, 0, True),   # down.1  256→128
-            _DownBlock(128, 128, 2, 0, True),   # down.2  128→64
-            _DownBlock(128, 256, 2, 0, True),   # down.3   64→32
-            _DownBlock(256, 256, 2, 0, True),   # down.4   32→16 (skip captured here)
-            _DownBlock(256, 512, 2, 2, False),  # down.5   16→16 (2 attn, no ds)
-        ])
-        self.mid      = _EncoderMidBlock(512)
+        self.down = nn.ModuleList(
+            [
+                _DownBlock(64, 64, 2, 0, True),  # down.0  512→256
+                _DownBlock(64, 128, 2, 0, True),  # down.1  256→128
+                _DownBlock(128, 128, 2, 0, True),  # down.2  128→64
+                _DownBlock(128, 256, 2, 0, True),  # down.3   64→32
+                _DownBlock(256, 256, 2, 0, True),  # down.4   32→16 (skip captured here)
+                _DownBlock(256, 512, 2, 2, False),  # down.5   16→16 (2 attn, no ds)
+            ]
+        )
+        self.mid = _EncoderMidBlock(512)
         self.norm_out = _GN(512)
         self.conv_out = nn.Conv2d(512, 256, 3, padding=1)
 
@@ -342,6 +374,7 @@ class _Encoder(nn.Module):
 # Decoder
 # ---------------------------------------------------------------------------
 
+
 class _Decoder(nn.Module):
     """
     Decoder: conv_in → mid → 6 UpBlocks (5→0) → norm_out+SiLU → conv_out
@@ -351,15 +384,17 @@ class _Decoder(nn.Module):
     def __init__(self):
         super().__init__()
         self.conv_in = nn.Conv2d(256, 512, 3, padding=1)
-        self.mid     = _DecoderMidBlock(512)
-        self.up = nn.ModuleList([
-            _UpBlock(128, 64,  3, False),                         # up.0  no upsample
-            _UpBlock(128, 128, 3, True),                          # up.1
-            _UpBlock(256, 128, 3, True),                          # up.2
-            _UpBlock(256, 256, 3, True),                          # up.3
-            _UpBlockCrossAttn(512, 256, 3, enc_ch=256, has_us=True),  # up.4
-            _UpBlockCrossAttn(512, 512, 3, enc_ch=512, has_us=True),  # up.5
-        ])
+        self.mid = _DecoderMidBlock(512)
+        self.up = nn.ModuleList(
+            [
+                _UpBlock(128, 64, 3, False),  # up.0  no upsample
+                _UpBlock(128, 128, 3, True),  # up.1
+                _UpBlock(256, 128, 3, True),  # up.2
+                _UpBlock(256, 256, 3, True),  # up.3
+                _UpBlockCrossAttn(512, 256, 3, enc_ch=256, has_us=True),  # up.4
+                _UpBlockCrossAttn(512, 512, 3, enc_ch=512, has_us=True),  # up.5
+            ]
+        )
         self.norm_out = _GN(64)
         self.conv_out = nn.Conv2d(64, 3, 3, padding=1)
 
@@ -371,7 +406,7 @@ class _Decoder(nn.Module):
         enc_norm_out_skip: torch.Tensor,
     ) -> torch.Tensor:
         h = self.mid(self.conv_in(z_q), enc_norm_out_skip)
-        for up in reversed(self.up):   # up[5] → up[4] → ... → up[0]
+        for up in reversed(self.up):  # up[5] → up[4] → ... → up[0]
             if isinstance(up, _UpBlockCrossAttn):
                 # up[5] uses enc_mid_attn_skip, up[4] uses enc_skip4
                 # Distinguish by output channel: up[5] out_ch=512, up[4] out_ch=256
@@ -387,26 +422,27 @@ class _Decoder(nn.Module):
 # Main model
 # ---------------------------------------------------------------------------
 
+
 class RestoreFormerPlusPlusTorch(nn.Module):
     """FP16 PyTorch reimplementation of RestoreFormerPlusPlus.fp16.onnx."""
 
     def __init__(self):
         super().__init__()
-        self.encoder         = _Encoder()
-        self.quant_conv      = nn.Conv2d(256, 256, 1)
-        self.quantize        = _VQLayer(1024, 256)
+        self.encoder = _Encoder()
+        self.quant_conv = nn.Conv2d(256, 256, 1)
+        self.quantize = _VQLayer(1024, 256)
         self.post_quant_conv = nn.Conv2d(256, 256, 1)
-        self.decoder         = _Decoder()
+        self.decoder = _Decoder()
         self._compute_dtype: torch.dtype = torch.float16
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         dtype_in = x.dtype
-        h        = x.to(self._compute_dtype)
+        h = x.to(self._compute_dtype)
         z, enc_skip4, enc_mid_attn_skip, enc_norm_out_skip = self.encoder(h)
-        z_e      = self.quant_conv(z)
-        z_q      = self.quantize(z_e)
-        dec_in   = self.post_quant_conv(z_q)
-        out      = self.decoder(dec_in, enc_skip4, enc_mid_attn_skip, enc_norm_out_skip)
+        z_e = self.quant_conv(z)
+        z_q = self.quantize(z_e)
+        dec_in = self.post_quant_conv(z_q)
+        out = self.decoder(dec_in, enc_skip4, enc_mid_attn_skip, enc_norm_out_skip)
         return out.to(dtype_in)
 
     @classmethod
@@ -416,20 +452,24 @@ class RestoreFormerPlusPlusTorch(nn.Module):
         compute_dtype: torch.dtype = torch.float16,
     ) -> "RestoreFormerPlusPlusTorch":
         import onnx
+
         model = cls()
         model._compute_dtype = compute_dtype
         onnx_model = onnx.load(onnx_path)
         n_named = _load_named_params(model, onnx_model, compute_dtype)
-        n_gn    = _load_gn_params(model, onnx_model, compute_dtype)
-        print(f"[RFP++] Named: {n_named}, GN: {n_gn}  "
-              f"(dtype={compute_dtype}, "
-              f"triton={'yes' if _TRITON_OK else 'no (PyTorch fallback)'})")
+        n_gn = _load_gn_params(model, onnx_model, compute_dtype)
+        print(
+            f"[RFP++] Named: {n_named}, GN: {n_gn}  "
+            f"(dtype={compute_dtype}, "
+            f"triton={'yes' if _TRITON_OK else 'no (PyTorch fallback)'})"
+        )
         return model.to(compute_dtype)
 
 
 # ---------------------------------------------------------------------------
 # GN module ordering helper
 # ---------------------------------------------------------------------------
+
 
 def _gn_modules_in_forward_order(model: RestoreFormerPlusPlusTorch) -> List[_GN]:
     """
@@ -511,7 +551,7 @@ def _gn_modules_in_forward_order(model: RestoreFormerPlusPlusTorch) -> List[_GN]
         gns.append(a.norm1)
 
     # ── Decoder up[3] – up[0] (no attn) ──────────────────────────────────────
-    for stage in reversed(list(dec.up)[:4]):   # up[3], up[2], up[1], up[0]
+    for stage in reversed(list(dec.up)[:4]):  # up[3], up[2], up[1], up[0]
         for blk in stage.block:
             gns.extend([blk.norm1, blk.norm2])
 
@@ -525,16 +565,18 @@ def _gn_modules_in_forward_order(model: RestoreFormerPlusPlusTorch) -> List[_GN]
 # Weight loaders
 # ---------------------------------------------------------------------------
 
+
 def _load_named_params(
     model: RestoreFormerPlusPlusTorch,
     onnx_model,
     dtype: torch.dtype,
 ) -> int:
     from onnx import numpy_helper
+
     init_map = {init.name: init for init in onnx_model.graph.initializer}
-    state    = model.state_dict()
-    updates  = {}
-    loaded   = 0
+    state = model.state_dict()
+    updates = {}
+    loaded = 0
     for pt_name, pt_tensor in state.items():
         if pt_name not in init_map:
             continue
@@ -545,7 +587,9 @@ def _load_named_params(
                 t = t.reshape(pt_tensor.shape)
             else:
                 continue
-        updates[pt_name] = t.to(dtype if pt_tensor.is_floating_point() else pt_tensor.dtype)
+        updates[pt_name] = t.to(
+            dtype if pt_tensor.is_floating_point() else pt_tensor.dtype
+        )
         loaded += 1
     state.update(updates)
     model.load_state_dict(state, strict=False)
@@ -587,8 +631,9 @@ def _load_gn_params(
         reshape = first_consumer(node.output[0], "Reshape")
         if reshape is None:
             continue
-        mul_nodes = [n for n in input_to_nodes.get(reshape.output[0], [])
-                     if n.op_type == "Mul"]
+        mul_nodes = [
+            n for n in input_to_nodes.get(reshape.output[0], []) if n.op_type == "Mul"
+        ]
         for mul_node in mul_nodes:
             add_node = first_consumer(mul_node.output[0], "Add")
             if add_node is None:
@@ -602,19 +647,21 @@ def _load_gn_params(
             if scale_init is None or bias_init is None:
                 continue
             scale = torch.from_numpy(numpy_helper.to_array(scale_init).copy()).squeeze()
-            bias  = torch.from_numpy(numpy_helper.to_array(bias_init).copy()).squeeze()
+            bias = torch.from_numpy(numpy_helper.to_array(bias_init).copy()).squeeze()
             gn_pairs.append((scale, bias))
 
     gn_modules = _gn_modules_in_forward_order(model)
     count = min(len(gn_pairs), len(gn_modules))
     if len(gn_pairs) != len(gn_modules):
-        print(f"[RFP++] WARNING: {len(gn_pairs)} GN pairs in ONNX, "
-              f"{len(gn_modules)} expected — loading {count}")
+        print(
+            f"[RFP++] WARNING: {len(gn_pairs)} GN pairs in ONNX, "
+            f"{len(gn_modules)} expected — loading {count}"
+        )
 
     for gn_mod, (scale, bias) in zip(gn_modules[:count], gn_pairs[:count]):
         with torch.no_grad():
             gn_mod.gn.weight.copy_(scale.to(gn_mod.gn.weight.dtype))
-            gn_mod.gn.bias.copy_(  bias.to(gn_mod.gn.bias.dtype))
+            gn_mod.gn.bias.copy_(bias.to(gn_mod.gn.bias.dtype))
 
     return count
 
@@ -623,10 +670,11 @@ def _load_gn_params(
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 def build_cuda_graph_runner(
-    model:     "RestoreFormerPlusPlusTorch",
+    model: "RestoreFormerPlusPlusTorch",
     inp_shape: Tuple[int, ...] = (1, 3, 512, 512),
-    warmup:    int = 3,
+    warmup: int = 3,
 ) -> "CUDAGraphRunner":
     return CUDAGraphRunner(model, inp_shape, warmup)
 
@@ -634,18 +682,18 @@ def build_cuda_graph_runner(
 class CUDAGraphRunner:
     def __init__(
         self,
-        model:     "RestoreFormerPlusPlusTorch",
+        model: "RestoreFormerPlusPlusTorch",
         inp_shape: Tuple[int, ...],
-        warmup:    int = 3,
+        warmup: int = 3,
     ):
-        self.model     = model
+        self.model = model
         self.inp_shape = inp_shape
-        device    = next(model.parameters()).device
+        device = next(model.parameters()).device
         self._inp = torch.zeros(inp_shape, dtype=torch.float32, device=device)
         with torch.no_grad():
             for _ in range(warmup):
                 _ = model(self._inp)
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         self._stream = torch.cuda.Stream()
         torch.cuda.synchronize()
         with torch.no_grad(), torch.cuda.graph(self._graph, stream=self._stream):

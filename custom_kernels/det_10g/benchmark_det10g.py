@@ -15,6 +15,7 @@ Optional env vars:
     WARMUP=10                      warm-up iterations
     ITERS=50                       timed iterations
 """
+
 from __future__ import annotations
 
 import os
@@ -28,14 +29,15 @@ import torch
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROOT     = pathlib.Path(__file__).parent.parent.parent
+ROOT = pathlib.Path(__file__).parent.parent.parent
 ONNX_DIR = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
-INPUT_H  = int(os.environ.get("INPUT_H", 640))
-INPUT_W  = int(os.environ.get("INPUT_W", 640))
-WARMUP   = int(os.environ.get("WARMUP", 10))
-ITERS    = int(os.environ.get("ITERS",  50))
+INPUT_H = int(os.environ.get("INPUT_H", 640))
+INPUT_W = int(os.environ.get("INPUT_W", 640))
+WARMUP = int(os.environ.get("WARMUP", 10))
+ITERS = int(os.environ.get("ITERS", 50))
 
 DET_ONNX = str(ONNX_DIR / "det_10g.onnx")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -58,6 +60,7 @@ def _bench(fn, warmup: int = WARMUP, iters: int = ITERS) -> float:
 
 def _ort_session(onnx_path: str, provider: str = "CUDAExecutionProvider"):
     import onnxruntime as ort
+
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(onnx_path, sess_options=opts, providers=[provider])
@@ -78,9 +81,15 @@ def _check_accuracy(
     """Compare ORT FP32 outputs vs PyTorch FP16 outputs."""
     # ONNX output order: scores_8/16/32, bbox_8/16/32, kps_8/16/32
     out_names = [
-        "scores_8", "scores_16", "scores_32",
-        "bbox_8",   "bbox_16",   "bbox_32",
-        "kps_8",    "kps_16",    "kps_32",
+        "scores_8",
+        "scores_16",
+        "scores_32",
+        "bbox_8",
+        "bbox_16",
+        "bbox_32",
+        "kps_8",
+        "kps_16",
+        "kps_32",
     ]
     print("\n  Numerical accuracy (FP16 PyTorch vs ORT FP32):")
     max_errs = []
@@ -105,34 +114,40 @@ def bench_det10g():
     print(f"\n=== det_10g / SCRFD-10G  (1,3,{INPUT_H},{INPUT_W}) → 9 outputs ===")
     print(f"  warm-up={WARMUP}, iters={ITERS}\n")
     print(f"  {'Tier':<6} | {'Method':<46} | {'ms':>8} | {'speedup':>7}")
-    print(f"  {'-'*6}-+-{'-'*46}-+-{'-'*8}-+-{'-'*7}")
+    print(f"  {'-' * 6}-+-{'-' * 46}-+-{'-' * 8}-+-{'-' * 7}")
 
-    inp    = torch.randn(1, 3, INPUT_H, INPUT_W, dtype=torch.float32, device="cuda")
+    inp = torch.randn(1, 3, INPUT_H, INPUT_W, dtype=torch.float32, device="cuda")
     inp_np = inp.cpu().numpy()
 
     ORT_OUT_NAMES = ["448", "471", "494", "451", "474", "497", "454", "477", "500"]
 
     # ── Tier 0 — ORT FP32 CUDA EP ────────────────────────────────────────
     sess0 = _ort_session(DET_ONNX, "CUDAExecutionProvider")
-    in_name = sess0.get_inputs()[0].name   # "input.1"
+    in_name = sess0.get_inputs()[0].name  # "input.1"
     t0 = _bench(lambda: sess0.run(ORT_OUT_NAMES, {in_name: inp_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
     # ── Tier 0b — ORT TensorRT EP ─────────────────────────────────────────
     t0b = t0
     try:
-        import tensorrt  # registers nvinfer DLL path on Windows
+        pass  # registers nvinfer DLL path on Windows
     except Exception:
         pass
     import onnxruntime as ort
+
     if "TensorrtExecutionProvider" not in ort.get_available_providers():
-        print(f"  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)")
+        print(
+            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
+        )
     else:
         ctx = ROOT / "tensorrt-engines" / "det_10g_ctx.onnx"
         if not ctx.exists():
-            print(f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})")
+            print(
+                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
+            )
         else:
             import os as _os
+
             _prev_cwd = _os.getcwd()
             _os.chdir(str(ROOT))
             trt_opts = {
@@ -148,11 +163,15 @@ def bench_det10g():
             }
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = ort.InferenceSession(DET_ONNX, so, providers=[
-                ("TensorrtExecutionProvider", trt_opts),
-                ("CUDAExecutionProvider", {"device_id": "0"}),
-                ("CPUExecutionProvider", {}),
-            ])
+            sess0b = ort.InferenceSession(
+                DET_ONNX,
+                so,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider", {"device_id": "0"}),
+                    ("CPUExecutionProvider", {}),
+                ],
+            )
             _os.chdir(_prev_cwd)
             t0b = _bench(lambda: sess0b.run(ORT_OUT_NAMES, {in_name: inp_np}))
             _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
@@ -182,7 +201,7 @@ def bench_det10g():
     try:
         runner = build_cuda_graph_runner(m_fp16)
         with torch.no_grad():
-            _ = runner(inp)   # trigger first-shape graph capture
+            _ = runner(inp)  # trigger first-shape graph capture
         t3 = _bench(lambda: runner(inp))
         _print_row("3", "FP16 NCHW + CUDA graph (per-shape cache)", t3, t0)
     except Exception as e:
@@ -191,9 +210,14 @@ def bench_det10g():
 
     # ── Tier 4 — FP16 NHWC (channels_last) ───────────────────────────────
     from custom_kernels.det_10g.det10g_torch import Det10gTorch as _Det10gTorch
-    m_nhwc = _Det10gTorch.from_onnx(
-        DET_ONNX, compute_dtype=torch.float16, channels_last=True
-    ).cuda().eval()
+
+    m_nhwc = (
+        _Det10gTorch.from_onnx(
+            DET_ONNX, compute_dtype=torch.float16, channels_last=True
+        )
+        .cuda()
+        .eval()
+    )
     with torch.no_grad():
         t4 = _bench(lambda: m_nhwc(inp))
     _print_row("4", "FP16 NHWC (channels_last, cuDNN native path)", t4, t0)
@@ -202,7 +226,7 @@ def bench_det10g():
     try:
         runner_nhwc = build_cuda_graph_runner(m_nhwc)
         with torch.no_grad():
-            _ = runner_nhwc(inp)   # first call captures graph
+            _ = runner_nhwc(inp)  # first call captures graph
         t5 = _bench(lambda: runner_nhwc(inp))
         _print_row("5", "FP16 NHWC + CUDA graph (recommended)", t5, t0)
     except Exception as e:
@@ -216,24 +240,24 @@ def bench_det10g():
     _check_accuracy(ort_outs, pt_outs_nhwc)
 
     # ── Summary ───────────────────────────────────────────────────────────
-    print(f"\n  {'─'*72}")
+    print(f"\n  {'─' * 72}")
     print(f"  SUMMARY  (input {INPUT_H}×{INPUT_W}, {ITERS} iters)")
-    print(f"  {'─'*72}")
+    print(f"  {'─' * 72}")
     print(f"  {'Tier':<6} | {'Method':<46} | {'ms':>8} | {'speedup vs ORT FP32':>20}")
-    print(f"  {'-'*6}-+-{'-'*46}-+-{'-'*8}-+-{'-'*20}")
+    print(f"  {'-' * 6}-+-{'-' * 46}-+-{'-' * 8}-+-{'-' * 20}")
     rows = [
-        ("0",  "ORT FP32 CUDA EP",                              t0),
-        ("0b", "ORT TensorRT EP",                               t0b),
-        ("2",  "FP16 NCHW pure ops",                            t2),
-        ("3",  "FP16 NCHW + CUDA graph",                        t3),
-        ("4",  "FP16 NHWC (channels_last)",                     t4),
-        ("5",  "FP16 NHWC + CUDA graph  ← recommended",         t5),
+        ("0", "ORT FP32 CUDA EP", t0),
+        ("0b", "ORT TensorRT EP", t0b),
+        ("2", "FP16 NCHW pure ops", t2),
+        ("3", "FP16 NCHW + CUDA graph", t3),
+        ("4", "FP16 NHWC (channels_last)", t4),
+        ("5", "FP16 NHWC + CUDA graph  ← recommended", t5),
     ]
     for tier, label, ms_val in rows:
         speedup = t0 / ms_val if ms_val > 0 else float("nan")
         marker = " ***" if tier == "5" else ""
         print(f"  {tier:<6} | {label:<46} | {ms_val:8.3f} ms | {speedup:6.2f}×{marker}")
-    print(f"  {'─'*72}")
+    print(f"  {'─' * 72}")
 
     print()
     return t0, t0b
@@ -252,6 +276,7 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     try:
         import onnxruntime as ort
+
         print(f"ORT:     {ort.__version__}")
     except ImportError:
         print("ORT:     not available (skipping Tier 0/0b)")

@@ -13,6 +13,7 @@ Optional env vars:
     WARMUP=5                   warm-up iterations
     ITERS=30                   timed iterations
 """
+
 from __future__ import annotations
 
 import os
@@ -26,12 +27,13 @@ import torch
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROOT      = pathlib.Path(__file__).parent.parent.parent
-ONNX_DIR  = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
-WARMUP    = int(os.environ.get("WARMUP", 5))
-ITERS     = int(os.environ.get("ITERS", 30))
+ROOT = pathlib.Path(__file__).parent.parent.parent
+ONNX_DIR = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
+WARMUP = int(os.environ.get("WARMUP", 5))
+ITERS = int(os.environ.get("ITERS", 30))
 
 XSEG_ONNX = str(ONNX_DIR / "XSeg_model.onnx")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +56,7 @@ def _bench(fn, warmup: int = WARMUP, iters: int = ITERS) -> float:
 
 def _ort_session(onnx_path: str, provider: str = "CUDAExecutionProvider"):
     import onnxruntime as ort
+
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(onnx_path, sess_options=opts, providers=[provider])
@@ -76,7 +79,7 @@ def _check_accuracy(ort_out: np.ndarray, pt_out: torch.Tensor) -> None:
     a_bin = (a > 0.5).astype(np.uint8)
     b_bin = (b > 0.5).astype(np.uint8)
     agree = (a_bin == b_bin).mean() * 100
-    print(f"\n  Numerical accuracy (FP16 PyTorch vs ORT FP32):")
+    print("\n  Numerical accuracy (FP16 PyTorch vs ORT FP32):")
     print(f"    MAE={diff.mean():.2e}  MaxAbsErr={diff.max():.2e}")
     print(f"    Binary pixel agreement (threshold 0.5): {agree:.2f}%  (target > 99%)")
 
@@ -85,36 +88,42 @@ def _check_accuracy(ort_out: np.ndarray, pt_out: torch.Tensor) -> None:
 # Main benchmark
 # ---------------------------------------------------------------------------
 def bench_xseg():
-    print(f"\n=== XSeg_model / SN256_XSeg U-Net  (1,3,256,256) → (1,1,256,256) ===")
+    print("\n=== XSeg_model / SN256_XSeg U-Net  (1,3,256,256) → (1,1,256,256) ===")
     print(f"  warm-up={WARMUP}, iters={ITERS}\n")
     print(f"  {'Tier':<6} | {'Method':<46} | {'ms':>8} | {'speedup':>7}")
-    print(f"  {'-'*6}-+-{'-'*46}-+-{'-'*8}-+-{'-'*7}")
+    print(f"  {'-' * 6}-+-{'-' * 46}-+-{'-' * 8}-+-{'-' * 7}")
 
     # Normalised face-crop input ([0, 1])
     inp_f32 = torch.rand(1, 3, 256, 256, dtype=torch.float32, device="cuda")
-    inp_np  = inp_f32.cpu().numpy()
+    inp_np = inp_f32.cpu().numpy()
 
     # ── Tier 0 — ORT FP32 CUDA EP ────────────────────────────────────────
     sess0 = _ort_session(XSEG_ONNX, "CUDAExecutionProvider")
-    in_name = sess0.get_inputs()[0].name   # "in_face:0"
+    in_name = sess0.get_inputs()[0].name  # "in_face:0"
     t0 = _bench(lambda: sess0.run(None, {in_name: inp_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
     # ── Tier 0b — ORT TensorRT EP ─────────────────────────────────────────
     t0b = t0
     try:
-        import tensorrt  # registers nvinfer DLL path on Windows
+        pass  # registers nvinfer DLL path on Windows
     except Exception:
         pass
     import onnxruntime as _ort
+
     if "TensorrtExecutionProvider" not in _ort.get_available_providers():
-        print(f"  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)")
+        print(
+            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
+        )
     else:
         ctx = ROOT / "tensorrt-engines" / "XSeg_model_ctx.onnx"
         if not ctx.exists():
-            print(f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})")
+            print(
+                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
+            )
         else:
             import os as _os
+
             _prev_cwd = _os.getcwd()
             _os.chdir(str(ROOT))
             trt_opts = {
@@ -130,11 +139,15 @@ def bench_xseg():
             }
             so = _ort.SessionOptions()
             so.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort.InferenceSession(XSEG_ONNX, so, providers=[
-                ("TensorrtExecutionProvider", trt_opts),
-                ("CUDAExecutionProvider", {"device_id": "0"}),
-                ("CPUExecutionProvider", {}),
-            ])
+            sess0b = _ort.InferenceSession(
+                XSEG_ONNX,
+                so,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider", {"device_id": "0"}),
+                    ("CPUExecutionProvider", {}),
+                ],
+            )
             _os.chdir(_prev_cwd)
             t0b = _bench(lambda: sess0b.run(None, {in_name: inp_np}))
             _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
@@ -155,7 +168,7 @@ def bench_xseg():
     _print_row("2", "PyTorch FP16 (TensorCore conv dispatch)", t2, t0)
 
     # ── Accuracy check ────────────────────────────────────────────────────
-    ort_out = sess0.run(None, {in_name: inp_np})[0]    # (1, 1, 256, 256)
+    ort_out = sess0.run(None, {in_name: inp_np})[0]  # (1, 1, 256, 256)
     with torch.no_grad():
         pt_out = m_fp16(inp_f32)
     _check_accuracy(ort_out, pt_out)
@@ -165,7 +178,7 @@ def bench_xseg():
     try:
         runner3 = build_cuda_graph_runner(m_fp16)
         with torch.no_grad():
-            _ = runner3(inp_f32)   # verify
+            _ = runner3(inp_f32)  # verify
         t3 = _bench(lambda: runner3(inp_f32))
         _print_row("3", "FP16 + CUDA graph (single captured graph)", t3, t0)
     except Exception as e:
@@ -174,15 +187,20 @@ def bench_xseg():
     # ── Tier 4 — Triton RMSNormMax + FP16 + CUDA graph ───────────────────
     try:
         from custom_kernels.triton_ops import TRITON_AVAILABLE
+
         if not TRITON_AVAILABLE:
             print("  Tier 4 | Triton — skipped (Triton not available)")
         else:
             # Build a fresh fp16 model; Triton path is enabled automatically
             # inside _RMSNormMax.forward() when _TRITON_RMSNORMMAX is set.
-            m_triton = XSegTorch.from_onnx(XSEG_ONNX, compute_dtype=torch.float16).cuda().eval()
-            runner4  = build_cuda_graph_runner(m_triton)
+            m_triton = (
+                XSegTorch.from_onnx(XSEG_ONNX, compute_dtype=torch.float16)
+                .cuda()
+                .eval()
+            )
+            runner4 = build_cuda_graph_runner(m_triton)
             with torch.no_grad():
-                _ = runner4(inp_f32)   # verify
+                _ = runner4(inp_f32)  # verify
             t4 = _bench(lambda: runner4(inp_f32))
             _print_row("4", "FP16 + Triton RMSNormMax + CUDA graph", t4, t0)
     except Exception as e:
@@ -205,12 +223,14 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     try:
         import onnxruntime as ort
+
         print(f"ORT:     {ort.__version__}")
     except ImportError:
         print("ORT:     not available (skipping Tier 0/0b)")
         sys.exit(1)
 
     import pathlib as _pl
+
     if not _pl.Path(XSEG_ONNX).exists():
         print(f"ERROR: XSeg ONNX not found: {XSEG_ONNX}")
         sys.exit(1)

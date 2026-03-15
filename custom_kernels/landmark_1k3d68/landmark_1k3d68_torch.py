@@ -47,6 +47,7 @@ import torch.nn.functional as F
 # Pre-activation bottleneck
 # ---------------------------------------------------------------------------
 
+
 class _PreActBottleneck(nn.Module):
     """
     MXNet-style pre-activation bottleneck:
@@ -70,28 +71,30 @@ class _PreActBottleneck(nn.Module):
         has_skip_conv: bool = False,
     ) -> None:
         super().__init__()
-        self.bn1      = nn.BatchNorm2d(in_ch, eps=2e-5, momentum=0.9)
-        self.conv1    = nn.Conv2d(in_ch,  mid_ch, 1, bias=True)
-        self.conv2    = nn.Conv2d(mid_ch, mid_ch, 3, stride=stride, padding=1, bias=True)
-        self.conv3    = nn.Conv2d(mid_ch, out_ch, 1, bias=False)
+        self.bn1 = nn.BatchNorm2d(in_ch, eps=2e-5, momentum=0.9)
+        self.conv1 = nn.Conv2d(in_ch, mid_ch, 1, bias=True)
+        self.conv2 = nn.Conv2d(mid_ch, mid_ch, 3, stride=stride, padding=1, bias=True)
+        self.conv3 = nn.Conv2d(mid_ch, out_ch, 1, bias=False)
         self.shortcut: Optional[nn.Conv2d] = (
             nn.Conv2d(in_ch, out_ch, 1, stride=stride, bias=False)
-            if has_skip_conv else None
+            if has_skip_conv
+            else None
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Shared BN + ReLU — used by both main path and (when present) shortcut
-        h   = F.relu(self.bn1(x), inplace=True)
+        h = F.relu(self.bn1(x), inplace=True)
         out = F.relu(self.conv1(h), inplace=True)
         out = F.relu(self.conv2(out), inplace=True)
         out = self.conv3(out)
-        sc  = self.shortcut(h) if self.shortcut is not None else x
+        sc = self.shortcut(h) if self.shortcut is not None else x
         return out + sc
 
 
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
+
 
 class Landmark1k3d68Torch(nn.Module):
     """
@@ -107,7 +110,7 @@ class Landmark1k3d68Torch(nn.Module):
         self._compute_dtype = compute_dtype
 
         # ── Input BatchNorm (applied to raw 3-channel normalised input) ───
-        self.input_bn  = nn.BatchNorm2d(3, eps=2e-5, momentum=0.9)
+        self.input_bn = nn.BatchNorm2d(3, eps=2e-5, momentum=0.9)
 
         # ── Stem ──────────────────────────────────────────────────────────
         self.stem_conv = nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=True)
@@ -115,9 +118,9 @@ class Landmark1k3d68Torch(nn.Module):
 
         # ── Stage 1: 3 units, 64 → 256, no spatial downsampling ──────────
         self.stage1 = nn.Sequential(
-            _PreActBottleneck( 64,  64, 256, stride=1, has_skip_conv=True),
-            _PreActBottleneck(256,  64, 256, stride=1, has_skip_conv=False),
-            _PreActBottleneck(256,  64, 256, stride=1, has_skip_conv=False),
+            _PreActBottleneck(64, 64, 256, stride=1, has_skip_conv=True),
+            _PreActBottleneck(256, 64, 256, stride=1, has_skip_conv=False),
+            _PreActBottleneck(256, 64, 256, stride=1, has_skip_conv=False),
         )
 
         # ── Stage 2: 4 units, 256 → 512, stride-2 in first unit ──────────
@@ -130,7 +133,7 @@ class Landmark1k3d68Torch(nn.Module):
 
         # ── Stage 3: 6 units, 512 → 1024, stride-2 in first unit ─────────
         self.stage3 = nn.Sequential(
-            _PreActBottleneck( 512, 256, 1024, stride=2, has_skip_conv=True),
+            _PreActBottleneck(512, 256, 1024, stride=2, has_skip_conv=True),
             _PreActBottleneck(1024, 256, 1024, stride=1, has_skip_conv=False),
             _PreActBottleneck(1024, 256, 1024, stride=1, has_skip_conv=False),
             _PreActBottleneck(1024, 256, 1024, stride=1, has_skip_conv=False),
@@ -146,13 +149,13 @@ class Landmark1k3d68Torch(nn.Module):
         )
 
         # ── Final BN (bn8) ────────────────────────────────────────────────
-        self.final_bn  = nn.BatchNorm2d(2048, eps=2e-5, momentum=0.9)
+        self.final_bn = nn.BatchNorm2d(2048, eps=2e-5, momentum=0.9)
 
         # ── Head: Conv3×3 stride-2 → ReLU → Flatten → FC ─────────────────
         # After stage4: 192/32 = 6 × 6 spatial; after head_conv(s=2): 3 × 3
         # Flatten → 256 × 3 × 3 = 2304  (matches Gemm weight (3309, 2304))
         self.head_conv = nn.Conv2d(2048, 256, 3, stride=2, padding=1, bias=True)
-        self.fc        = nn.Linear(2304, 3309, bias=True)
+        self.fc = nn.Linear(2304, 3309, bias=True)
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -170,8 +173,8 @@ class Landmark1k3d68Torch(nn.Module):
         x = F.relu(self.final_bn(x), inplace=True)
 
         x = F.relu(self.head_conv(x), inplace=True)
-        x = x.flatten(1)        # (1, 256*3*3) = (1, 2304)
-        x = self.fc(x)          # (1, 3309)
+        x = x.flatten(1)  # (1, 256*3*3) = (1, 2304)
+        x = self.fc(x)  # (1, 3309)
 
         return x.float()
 
@@ -207,6 +210,7 @@ class Landmark1k3d68Torch(nn.Module):
 # ---------------------------------------------------------------------------
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
+
 
 def _conv_modules_in_forward_order(model: Landmark1k3d68Torch) -> List[nn.Conv2d]:
     """
@@ -254,7 +258,7 @@ def _conv_modules_in_forward_order(model: Landmark1k3d68Torch) -> List[nn.Conv2d
 
 def _load_all_params(
     model: Landmark1k3d68Torch,
-    onnx_model,       # onnx.ModelProto
+    onnx_model,  # onnx.ModelProto
     verbose: bool = False,
 ) -> None:
     """
@@ -264,16 +268,14 @@ def _load_all_params(
       3. Linear (FC) weights    — by ONNX initialiser names.
     """
     from onnx import numpy_helper  # type: ignore
-    import numpy as np
 
     init_map: dict = {
-        init.name: numpy_helper.to_array(init)
-        for init in onnx_model.graph.initializer
+        init.name: numpy_helper.to_array(init) for init in onnx_model.graph.initializer
     }
 
     # ── 1. Conv2d (positional) ────────────────────────────────────────
     conv_mods = _conv_modules_in_forward_order(model)
-    conv_idx  = 0
+    conv_idx = 0
     for node in onnx_model.graph.node:
         if node.op_type != "Conv":
             continue
@@ -292,7 +294,7 @@ def _load_all_params(
     # ── 2. BatchNorm (by MXNet name) ──────────────────────────────────
     # Maps (PyTorch BN module, ONNX name prefix)
     bn_map: List[Tuple[nn.BatchNorm2d, str]] = [
-        (model.input_bn,      "bn_data"),
+        (model.input_bn, "bn_data"),
         (model.stage1[0].bn1, "stage1_unit1_bn1"),
         (model.stage1[1].bn1, "stage1_unit2_bn1"),
         (model.stage1[2].bn1, "stage1_unit3_bn1"),
@@ -309,17 +311,17 @@ def _load_all_params(
         (model.stage4[0].bn1, "stage4_unit1_bn1"),
         (model.stage4[1].bn1, "stage4_unit2_bn1"),
         (model.stage4[2].bn1, "stage4_unit3_bn1"),
-        (model.final_bn,      "bn8"),
+        (model.final_bn, "bn8"),
     ]
     for bn_mod, prefix in bn_map:
-        bn_mod.weight.data.copy_(
-            torch.from_numpy(init_map[f"{prefix}_gamma"].copy()))
-        bn_mod.bias.data.copy_(
-            torch.from_numpy(init_map[f"{prefix}_beta"].copy()))
+        bn_mod.weight.data.copy_(torch.from_numpy(init_map[f"{prefix}_gamma"].copy()))
+        bn_mod.bias.data.copy_(torch.from_numpy(init_map[f"{prefix}_beta"].copy()))
         bn_mod.running_mean.copy_(
-            torch.from_numpy(init_map[f"{prefix}_moving_mean"].copy()))
+            torch.from_numpy(init_map[f"{prefix}_moving_mean"].copy())
+        )
         bn_mod.running_var.copy_(
-            torch.from_numpy(init_map[f"{prefix}_moving_var"].copy()))
+            torch.from_numpy(init_map[f"{prefix}_moving_var"].copy())
+        )
 
     # ── 3. FC (by name) ───────────────────────────────────────────────
     model.fc.weight.data.copy_(torch.from_numpy(init_map["fc1_weight"].copy()))
@@ -333,6 +335,7 @@ def _load_all_params(
 # ---------------------------------------------------------------------------
 # CUDA graph runner
 # ---------------------------------------------------------------------------
+
 
 class Landmark1k3d68CUDAGraphRunner:
     """
@@ -351,7 +354,7 @@ class Landmark1k3d68CUDAGraphRunner:
             for _ in range(warmup):
                 _ = model(self._inp)
 
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         self._stream = torch.cuda.Stream()
 
         torch.cuda.synchronize()

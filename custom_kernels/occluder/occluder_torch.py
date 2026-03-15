@@ -21,6 +21,7 @@ Usage:
         logits = runner(x)   # (1,3,256,256) float32 → (1,1,256,256) float32
     mask = logits.squeeze() > 0  # (256,256) bool — True = face
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -33,6 +34,7 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # Encoder building blocks
 # ---------------------------------------------------------------------------
+
 
 class _BasicBlock(nn.Module):
     """
@@ -67,6 +69,7 @@ class _BasicBlock(nn.Module):
 # Decoder building block
 # ---------------------------------------------------------------------------
 
+
 class _DecBlock(nn.Module):
     """
     Decoder block: nearest-neighbour 2× upsample → optional skip-cat → 2× Conv+ReLU.
@@ -83,7 +86,9 @@ class _DecBlock(nn.Module):
         self.relu2 = nn.ReLU(inplace=True)
         self._has_skip = skip_ch > 0
 
-    def forward(self, x: torch.Tensor, skip: Optional[torch.Tensor] = None) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, skip: Optional[torch.Tensor] = None
+    ) -> torch.Tensor:
         x = F.interpolate(x, scale_factor=2, mode="nearest")
         if self._has_skip and skip is not None:
             x = torch.cat([x, skip], dim=1)
@@ -93,6 +98,7 @@ class _DecBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
+
 
 class OccluderTorch(nn.Module):
     """
@@ -110,15 +116,15 @@ class OccluderTorch(nn.Module):
         # ── Encoder stem ─────────────────────────────────────────────────
         self.stem_conv = nn.Conv2d(3, 64, 7, stride=2, padding=3, bias=True)
         self.stem_relu = nn.ReLU(inplace=True)
-        self.maxpool   = nn.MaxPool2d(3, stride=2, padding=1)
+        self.maxpool = nn.MaxPool2d(3, stride=2, padding=1)
 
         # ── Encoder stages ───────────────────────────────────────────────
         self.layer1 = nn.Sequential(
-            _BasicBlock(64,  64),
-            _BasicBlock(64,  64),
+            _BasicBlock(64, 64),
+            _BasicBlock(64, 64),
         )
         self.layer2 = nn.Sequential(
-            _BasicBlock(64,  128, stride=2),
+            _BasicBlock(64, 128, stride=2),
             _BasicBlock(128, 128),
         )
         self.layer3 = nn.Sequential(
@@ -136,11 +142,11 @@ class OccluderTorch(nn.Module):
         # dec1: dec0(256)       + skip layer2(128) → 128
         self.dec1 = _DecBlock(256, 128, 128)
         # dec2: dec1(128)       + skip layer1(64)  → 64
-        self.dec2 = _DecBlock(128, 64,   64)
+        self.dec2 = _DecBlock(128, 64, 64)
         # dec3: dec2(64)        + skip stem_relu(64) → 32
-        self.dec3 = _DecBlock(64,  64,   32)
+        self.dec3 = _DecBlock(64, 64, 32)
         # dec4: dec3(32)        no skip             → 16
-        self.dec4 = _DecBlock(32,  0,    16)
+        self.dec4 = _DecBlock(32, 0, 16)
 
         # ── Output head ──────────────────────────────────────────────────
         self.head = nn.Conv2d(16, 1, 3, padding=1, bias=True)
@@ -150,24 +156,24 @@ class OccluderTorch(nn.Module):
         x = x.to(self._compute_dtype)
 
         # Encoder
-        s0 = self.stem_relu(self.stem_conv(x))   # (1, 64, 128, 128) — skip for dec3
-        x  = self.maxpool(s0)                     # (1, 64,  64,  64)
-        x  = self.layer1(x)                       # (1, 64,  64,  64) — skip for dec2
+        s0 = self.stem_relu(self.stem_conv(x))  # (1, 64, 128, 128) — skip for dec3
+        x = self.maxpool(s0)  # (1, 64,  64,  64)
+        x = self.layer1(x)  # (1, 64,  64,  64) — skip for dec2
         s1 = x
-        x  = self.layer2(x)                       # (1,128,  32,  32) — skip for dec1
+        x = self.layer2(x)  # (1,128,  32,  32) — skip for dec1
         s2 = x
-        x  = self.layer3(x)                       # (1,256,  16,  16) — skip for dec0
+        x = self.layer3(x)  # (1,256,  16,  16) — skip for dec0
         s3 = x
-        x  = self.layer4(x)                       # (1,512,   8,   8) — bottleneck
+        x = self.layer4(x)  # (1,512,   8,   8) — bottleneck
 
         # Decoder
-        x = self.dec0(x,  s3)   # resize + cat → (1,256, 16, 16)
-        x = self.dec1(x,  s2)   # resize + cat → (1,128, 32, 32)
-        x = self.dec2(x,  s1)   # resize + cat → (1, 64, 64, 64)
-        x = self.dec3(x,  s0)   # resize + cat → (1, 32,128,128)
-        x = self.dec4(x)        # resize (no skip) → (1, 16,256,256)
+        x = self.dec0(x, s3)  # resize + cat → (1,256, 16, 16)
+        x = self.dec1(x, s2)  # resize + cat → (1,128, 32, 32)
+        x = self.dec2(x, s1)  # resize + cat → (1, 64, 64, 64)
+        x = self.dec3(x, s0)  # resize + cat → (1, 32,128,128)
+        x = self.dec4(x)  # resize (no skip) → (1, 16,256,256)
 
-        return self.head(x).float()   # raw logits, (1,1,256,256) float32
+        return self.head(x).float()  # raw logits, (1,1,256,256) float32
 
     # ------------------------------------------------------------------
     @classmethod
@@ -178,6 +184,7 @@ class OccluderTorch(nn.Module):
     ) -> "OccluderTorch":
         """Build and return an OccluderTorch with weights loaded from *onnx_path*."""
         import onnx
+
         onnx_model = onnx.load(onnx_path)
         model = cls(compute_dtype=compute_dtype)
         _load_all_params(model, onnx_model)
@@ -187,6 +194,7 @@ class OccluderTorch(nn.Module):
 # ---------------------------------------------------------------------------
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
+
 
 def _conv_modules_in_forward_order(model: OccluderTorch) -> list:
     """
@@ -248,15 +256,13 @@ def _load_all_params(model: OccluderTorch, onnx_model) -> None:
     copy weight (and bias if present) to the next positional Conv2d module.
     """
     from onnx import numpy_helper
-    import numpy as np
 
     init_map: dict = {
-        init.name: numpy_helper.to_array(init)
-        for init in onnx_model.graph.initializer
+        init.name: numpy_helper.to_array(init) for init in onnx_model.graph.initializer
     }
 
     conv_mods = _conv_modules_in_forward_order(model)
-    conv_idx  = 0
+    conv_idx = 0
 
     for node in onnx_model.graph.node:
         if node.op_type != "Conv":
@@ -282,6 +288,7 @@ def _load_all_params(model: OccluderTorch, onnx_model) -> None:
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 class _CapturedGraph:
     """Single CUDA graph captured for fixed input (1, 3, 256, 256)."""
 
@@ -292,25 +299,26 @@ class _CapturedGraph:
         self._inp = torch.zeros(1, 3, 256, 256, dtype=torch.float32, device=device)
         self._out: Optional[torch.Tensor] = None
 
-        # Warm-up (fills cuDNN algorithm caches)
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
+        # Warm-up on the default stream — primes cuDNN workspace caches
+        # (MaxPool2d, interpolate) before the graph capture begins.
+        with torch.no_grad():
             for _ in range(warmup):
-                with torch.no_grad():
-                    _ = model(self._inp)
-        torch.cuda.current_stream().wait_stream(s)
+                _ = model(self._inp)
 
-        # Capture
+        # Explicit device sync before capture ensures no in-flight GPU work
+        # interferes with cudaStreamBeginCapture.  A dedicated capture stream
+        # is used so the capture is isolated from the default stream.
         self._graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(self._graph, stream=s):
-            with torch.no_grad():
-                self._out = model(self._inp)
+        self._stream = torch.cuda.Stream()
+        torch.cuda.synchronize()
+        with torch.no_grad(), torch.cuda.graph(self._graph, stream=self._stream):
+            self._out = model(self._inp)
+        torch.cuda.synchronize()
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        self._inp.copy_(x)
+        self._inp.copy_(x, non_blocking=True)
         self._graph.replay()
-        return self._out.clone()   # type: ignore[return-value]
+        return self._out.clone()  # type: ignore[union-attr, return-value]
 
 
 def build_cuda_graph_runner(

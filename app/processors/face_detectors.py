@@ -433,74 +433,94 @@ class FaceDetectors:
         """Lazy-load the Det10gTorch Custom-kernel runner for RetinaFace."""
         if self._det10g_runner is not None:
             return self._det10g_runner
-        with self._custom_init_lock:
-            if self._det10g_runner is not None:
-                return self._det10g_runner
-            if self._det10g_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for RetinaFace (det10g).\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._det10g_runner is not None:
+                    return self._det10g_runner
+                if self._det10g_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.det_10g.det10g_torch import Det10gTorch
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "det_10g.onnx"
+                        )
+                        m = (
+                            Det10gTorch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._det10g_torch = m
+                    except Exception as e:
+                        print(f"[Custom] det_10g load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.det_10g.det10g_torch import Det10gTorch
+                    from custom_kernels.det_10g.det10g_torch import (
+                        build_cuda_graph_runner,
+                    )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "det_10g.onnx"
-                    )
-                    m = (
-                        Det10gTorch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._det10g_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._det10g_runner = build_cuda_graph_runner(
+                            self._det10g_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] det_10g load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.det_10g.det10g_torch import build_cuda_graph_runner
-
-                self._det10g_runner = build_cuda_graph_runner(self._det10g_torch)
-            except Exception as e:
-                print(f"[Custom] det_10g graph runner failed, using eager: {e}")
-                self._det10g_runner = self._det10g_torch
+                    print(f"[Custom] det_10g graph runner failed, using eager: {e}")
+                    self._det10g_runner = self._det10g_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._det10g_runner
 
     def _get_yolo_runner(self):
         """Lazy-load the YoloFace8nTorch Custom-kernel runner for YOLOv8 face detector."""
         if self._yolo_runner is not None:
             return self._yolo_runner
-        with self._custom_init_lock:
-            if self._yolo_runner is not None:
-                return self._yolo_runner
-            if self._yolo_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for YOLOv8n face detector.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._custom_init_lock:
+                if self._yolo_runner is not None:
+                    return self._yolo_runner
+                if self._yolo_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.yoloface_8n.yoloface8n_torch import (
+                            YoloFace8nTorch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "yoloface_8n.onnx"
+                        )
+                        m = (
+                            YoloFace8nTorch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._yolo_torch = m
+                    except Exception as e:
+                        print(f"[Custom] yoloface_8n load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.yoloface_8n.yoloface8n_torch import (
-                        YoloFace8nTorch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "yoloface_8n.onnx"
-                    )
-                    m = (
-                        YoloFace8nTorch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._yolo_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._yolo_runner = build_cuda_graph_runner(self._yolo_torch)
                 except Exception as e:
-                    print(f"[Custom] yoloface_8n load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.yoloface_8n.yoloface8n_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._yolo_runner = build_cuda_graph_runner(self._yolo_torch)
-            except Exception as e:
-                print(f"[Custom] yoloface_8n graph runner failed, using eager: {e}")
-                self._yolo_runner = self._yolo_torch
+                    print(f"[Custom] yoloface_8n graph runner failed, using eager: {e}")
+                    self._yolo_runner = self._yolo_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._yolo_runner
 
     def _run_model_with_lazy_build_check(

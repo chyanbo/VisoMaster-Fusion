@@ -238,6 +238,26 @@ class ModelsProcessor(QtCore.QObject):
         self.trt_build_locks: Dict[str, threading.Lock] = {}
         # A lock to protect the creation of new locks in the dictionary above.
         self.trt_build_lock_creation_lock = threading.Lock()
+        # MP-CUDA-01: Global serialisation lock for CUDA graph capture.
+        # torch.cuda.graph() uses cudaStreamCaptureModeGlobal by default —
+        # only one capture may be in-flight on the entire GPU at any time.
+        # All _get_*_runner() lazy-builders MUST hold this lock while calling
+        # torch.cuda.graph() / build_cuda_graph_runner().
+        self.cuda_graph_capture_lock = threading.Lock()
+
+        # BUG-C01: Register Triton JIT build-dialog callbacks so that GFPGAN /
+        # CodeFormer eager-mode kernels show a progress dialog on first compile.
+        # Safe to call unconditionally — the hooks are only fired when a Triton
+        # kernel actually compiles, which only happens on the Custom provider.
+        try:
+            from custom_kernels.triton_ops import register_triton_build_dialog
+
+            register_triton_build_dialog(
+                lambda title, msg: self.show_build_dialog.emit(title, msg),
+                lambda: self.hide_build_dialog.emit(),
+            )
+        except Exception:
+            pass  # Triton not installed or import failed — no dialog, no crash
 
         # Default TensorRT options
         self.trt_ep_options = {
@@ -1056,6 +1076,67 @@ class ModelsProcessor(QtCore.QObject):
         if self.main_window.model_load_dialog:
             self.main_window.model_load_dialog.close()
 
+    def warm_up_custom_kernels(self):
+        """Optional manual warm-up: pre-build CUDA graph runners for the
+        currently-active models to eliminate first-frame lag.
+
+        NOT called automatically on provider switch — Custom provider uses
+        lazy initialisation so that VRAM is only consumed by models the user
+        actually enables.  Each runner is built on first use and a build-
+        progress dialog is shown at that point (same behaviour as TensorRT
+        lazy engine builds).
+
+        This method can be called explicitly if a zero-lag first frame is
+        desired (e.g. from a "Pre-build kernels" UI button).  It is safe to
+        call on a background thread.  All builds are serialised internally by
+        cuda_graph_capture_lock, so concurrent CUDA graph capture is never
+        triggered even if this is called from a worker thread.
+
+        Only models whose ONNX files are present on disk are loaded;
+        missing models are skipped silently.
+        """
+        if self.provider_name != "Custom":
+            return
+
+        print("[CustomProvider] Pre-building CUDA graph runners for active models...")
+
+        # --- Face detectors ---
+        self.face_detectors._get_det10g_runner()
+        self.face_detectors._get_yolo_runner()
+
+        # --- Face masks ---
+        self.face_masks._get_faceparser_runner()
+        self.face_masks._get_xseg_runner()
+        self.face_masks._get_occluder_runner()
+        self.face_masks._get_vgg_combo_runner()
+
+        # --- Face swappers (ArcFace first, then InSwapper) ---
+        self.face_swappers._get_w600k_runner()
+        self.face_swappers._get_inswapper_runner_b1()
+
+        # --- Landmark detectors ---
+        self.face_landmark_detectors._get_landmark203_runner()
+        self.face_landmark_detectors._get_fan2dfan4_runner()
+        self.face_landmark_detectors._get_landmark5_runner()
+        self.face_landmark_detectors._get_1k3d68_runner()
+        self.face_landmark_detectors._get_det106_runner()
+        self.face_landmark_detectors._get_peppapig98_runner()
+        self.face_landmark_detectors._get_landmark478_runner()
+        self.face_landmark_detectors._get_blendshapes_runner()
+
+        # --- Face restorers ---
+        # Heavy models (GPEN-1024/2048, RestoreFormer++, RefLDM) can consume
+        # 500 MB – 2 GB each.  They are intentionally excluded from this
+        # default warm-up to avoid wasting VRAM when the user has not enabled
+        # them.  They will still be lazily built (with a dialog) on first use.
+        self.face_restorers._get_restoreformer_runner()
+        self.face_restorers._get_ref_ldm_encoder_runner()
+        self.face_restorers._get_ref_ldm_decoder_runner()
+        for _gpen_size in (256, 512, 1024, 2048):
+            self.face_restorers._get_gpen_runner(_gpen_size)
+
+        print("[CustomProvider] Pre-build complete.")
+
     def switch_providers_priority(self, provider_name):
         """
         Reconfigures the ONNX Runtime provider list and the active device.
@@ -1068,6 +1149,16 @@ class ModelsProcessor(QtCore.QObject):
             str: The resolved provider name (may differ from the input when TensorRT
                  is downgraded due to a version constraint).
         """
+        # Release existing Custom-kernel CUDA graph runners and ORT sessions
+        # whenever the provider is changed so that GPU memory from the old
+        # provider is freed before new sessions / runners are allocated.
+        # Runners are lazily rebuilt on next use (or via warm_up_custom_kernels).
+        self.face_detectors.unload_models()
+        self.face_masks.unload_models()
+        self.face_swappers.unload_models()
+        self.face_landmark_detectors.unload_models()
+        self.face_restorers.unload_models()  # BUG-R03 fix: free GPEN/RestoreFormer/RefLDM runners
+
         match provider_name:
             case "TensorRT" | "TensorRT-Engine":
                 # MP-04: guard against TensorRT not being installed

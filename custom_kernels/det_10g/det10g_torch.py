@@ -24,8 +24,10 @@ NHWC (channels_last) allows cuDNN to use its native NHWC convolution kernels,
 eliminating the internal NCHW↔NHWC reformatting overhead that cuDNN performs
 on every layer when weights are in NCHW format.
 """
+
 from __future__ import annotations
 
+import threading
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -37,6 +39,7 @@ import torch.nn.functional as F
 # ---------------------------------------------------------------------------
 # Backbone
 # ---------------------------------------------------------------------------
+
 
 class _BasicBlock(nn.Module):
     """2-conv residual block (BN folded into Conv bias).
@@ -97,15 +100,16 @@ class _Backbone(nn.Module):
         x = F.relu(self.conv3(x))
         x = F.max_pool2d(x, 2, stride=2)
         x = self.stage1(x)
-        c4 = self.stage2(x)    # stride 8,  88ch
-        c5 = self.stage3(c4)   # stride 16, 88ch
-        c6 = self.stage4(c5)   # stride 32, 224ch
+        c4 = self.stage2(x)  # stride 8,  88ch
+        c5 = self.stage3(c4)  # stride 16, 88ch
+        c6 = self.stage4(c5)  # stride 32, 224ch
         return c4, c5, c6
 
 
 # ---------------------------------------------------------------------------
 # PA-FPN Neck
 # ---------------------------------------------------------------------------
+
 
 class _PAFPN(nn.Module):
     """PA-FPN neck (verified against ONNX topological graph).
@@ -128,14 +132,14 @@ class _PAFPN(nn.Module):
 
     def __init__(self) -> None:
         super().__init__()
-        self.lateral0 = nn.Conv2d(88,  56, 1, bias=True)
-        self.lateral1 = nn.Conv2d(88,  56, 1, bias=True)
+        self.lateral0 = nn.Conv2d(88, 56, 1, bias=True)
+        self.lateral1 = nn.Conv2d(88, 56, 1, bias=True)
         self.lateral2 = nn.Conv2d(224, 56, 1, bias=True)
-        self.fpn0   = nn.Conv2d(56, 56, 3, padding=1, bias=True)
-        self.fpn1   = nn.Conv2d(56, 56, 3, padding=1, bias=True)
-        self.fpn2   = nn.Conv2d(56, 56, 3, padding=1, bias=True)
-        self.ds0    = nn.Conv2d(56, 56, 3, stride=2, padding=1, bias=True)
-        self.ds1    = nn.Conv2d(56, 56, 3, stride=2, padding=1, bias=True)
+        self.fpn0 = nn.Conv2d(56, 56, 3, padding=1, bias=True)
+        self.fpn1 = nn.Conv2d(56, 56, 3, padding=1, bias=True)
+        self.fpn2 = nn.Conv2d(56, 56, 3, padding=1, bias=True)
+        self.ds0 = nn.Conv2d(56, 56, 3, stride=2, padding=1, bias=True)
+        self.ds1 = nn.Conv2d(56, 56, 3, stride=2, padding=1, bias=True)
         self.pafpn0 = nn.Conv2d(56, 56, 3, padding=1, bias=True)
         self.pafpn1 = nn.Conv2d(56, 56, 3, padding=1, bias=True)
 
@@ -150,7 +154,9 @@ class _PAFPN(nn.Module):
         lat_c6 = self.lateral2(c6)
 
         merged_c5 = lat_c5 + F.interpolate(lat_c6, scale_factor=2, mode="nearest")
-        p4 = self.fpn0(lat_c4 + F.interpolate(merged_c5, scale_factor=2, mode="nearest"))
+        p4 = self.fpn0(
+            lat_c4 + F.interpolate(merged_c5, scale_factor=2, mode="nearest")
+        )
 
         p5_merged = self.fpn1(merged_c5) + self.ds0(p4)
         p5_pa = self.pafpn0(p5_merged)
@@ -158,12 +164,13 @@ class _PAFPN(nn.Module):
         p6_merged = self.fpn2(lat_c6) + self.ds1(p5_merged)
         p6_pa = self.pafpn1(p6_merged)
 
-        return p4, p5_pa, p6_pa   # strides 8, 16, 32
+        return p4, p5_pa, p6_pa  # strides 8, 16, 32
 
 
 # ---------------------------------------------------------------------------
 # Per-stride detection head
 # ---------------------------------------------------------------------------
+
 
 class _HeadBranch(nn.Module):
     """Per-stride detection head.
@@ -178,11 +185,11 @@ class _HeadBranch(nn.Module):
 
     def __init__(self, in_ch: int = 56, feat_ch: int = 80) -> None:
         super().__init__()
-        self.sc1 = nn.Conv2d(in_ch,   feat_ch, 3, padding=1, bias=True)
+        self.sc1 = nn.Conv2d(in_ch, feat_ch, 3, padding=1, bias=True)
         self.sc2 = nn.Conv2d(feat_ch, feat_ch, 3, padding=1, bias=True)
         self.sc3 = nn.Conv2d(feat_ch, feat_ch, 3, padding=1, bias=True)
-        self.cls = nn.Conv2d(feat_ch, 2,  3, padding=1, bias=True)
-        self.reg = nn.Conv2d(feat_ch, 8,  3, padding=1, bias=True)
+        self.cls = nn.Conv2d(feat_ch, 2, 3, padding=1, bias=True)
+        self.reg = nn.Conv2d(feat_ch, 8, 3, padding=1, bias=True)
         self.kps = nn.Conv2d(feat_ch, 20, 3, padding=1, bias=True)
         self.scale = nn.Parameter(torch.ones(1))
 
@@ -193,14 +200,15 @@ class _HeadBranch(nn.Module):
         x = F.relu(self.sc2(x))
         x = F.relu(self.sc3(x))
         scores = self.cls(x).permute(0, 2, 3, 1).reshape(-1, 1).sigmoid()
-        bbox   = (self.reg(x) * self.scale).permute(0, 2, 3, 1).reshape(-1, 4)
-        kps    = self.kps(x).permute(0, 2, 3, 1).reshape(-1, 10)
+        bbox = (self.reg(x) * self.scale).permute(0, 2, 3, 1).reshape(-1, 4)
+        kps = self.kps(x).permute(0, 2, 3, 1).reshape(-1, 10)
         return scores, bbox, kps
 
 
 # ---------------------------------------------------------------------------
 # Full SCRFD-10G model
 # ---------------------------------------------------------------------------
+
 
 class Det10gTorch(nn.Module):
     """FP16 PyTorch reimplementation of det_10g.onnx (SCRFD-10G).
@@ -229,10 +237,10 @@ class Det10gTorch(nn.Module):
     ) -> None:
         super().__init__()
         self.backbone = _Backbone()
-        self.neck     = _PAFPN()
-        self.head8    = _HeadBranch()
-        self.head16   = _HeadBranch()
-        self.head32   = _HeadBranch()
+        self.neck = _PAFPN()
+        self.head8 = _HeadBranch()
+        self.head16 = _HeadBranch()
+        self.head32 = _HeadBranch()
         self._compute_dtype = compute_dtype
         self._channels_last = channels_last
 
@@ -242,13 +250,19 @@ class Det10gTorch(nn.Module):
             x = x.to(memory_format=torch.channels_last)
         c4, c5, c6 = self.backbone(x)
         p8, p16, p32 = self.neck(c4, c5, c6)
-        s8,  b8,  k8  = self.head8(p8)
+        s8, b8, k8 = self.head8(p8)
         s16, b16, k16 = self.head16(p16)
         s32, b32, k32 = self.head32(p32)
         return (
-            s8.float(),  s16.float(),  s32.float(),
-            b8.float(),  b16.float(),  b32.float(),
-            k8.float(),  k16.float(),  k32.float(),
+            s8.float(),
+            s16.float(),
+            s32.float(),
+            b8.float(),
+            b16.float(),
+            b32.float(),
+            k8.float(),
+            k16.float(),
+            k32.float(),
         )
 
     @classmethod
@@ -259,6 +273,7 @@ class Det10gTorch(nn.Module):
         channels_last: bool = True,
     ) -> "Det10gTorch":
         import onnx
+
         onnx_model = onnx.load(onnx_path)
         model = cls(compute_dtype=torch.float32, channels_last=channels_last)
         _load_all_params(model, onnx_model, torch.float32)
@@ -274,6 +289,7 @@ class Det10gTorch(nn.Module):
 # ---------------------------------------------------------------------------
 # Weight loading — all-positional (58 Conv2d in ONNX topological order)
 # ---------------------------------------------------------------------------
+
 
 def _conv_modules_in_forward_order(model: Det10gTorch) -> List[nn.Conv2d]:
     """Return all 58 Conv2d modules in ONNX topological order.
@@ -308,10 +324,16 @@ def _conv_modules_in_forward_order(model: Det10gTorch) -> List[nn.Conv2d]:
     # Neck
     neck = model.neck
     mods += [
-        neck.lateral0, neck.lateral1, neck.lateral2,
-        neck.fpn0, neck.fpn1, neck.fpn2,
-        neck.ds0, neck.ds1,
-        neck.pafpn0, neck.pafpn1,
+        neck.lateral0,
+        neck.lateral1,
+        neck.lateral2,
+        neck.fpn0,
+        neck.fpn1,
+        neck.fpn2,
+        neck.ds0,
+        neck.ds1,
+        neck.pafpn0,
+        neck.pafpn1,
     ]
 
     # Detection heads
@@ -324,7 +346,7 @@ def _conv_modules_in_forward_order(model: Det10gTorch) -> List[nn.Conv2d]:
 
 def _load_all_params(
     model: Det10gTorch,
-    onnx_model,          # onnx.ModelProto
+    onnx_model,  # onnx.ModelProto
     dtype: torch.dtype,
 ) -> None:
     """Load all weights from ONNX initializers into the PyTorch model."""
@@ -345,9 +367,7 @@ def _load_all_params(
     conv_nodes = [n for n in onnx_model.graph.node if n.op_type == "Conv"]
 
     if len(conv_nodes) != 58:
-        raise RuntimeError(
-            f"Expected 58 Conv nodes in ONNX, found {len(conv_nodes)}"
-        )
+        raise RuntimeError(f"Expected 58 Conv nodes in ONNX, found {len(conv_nodes)}")
 
     for mod, node in zip(conv_mods, conv_nodes):
         w_name = node.input[1]
@@ -365,9 +385,7 @@ def _load_all_params(
     }
     for init_name, param in scale_map.items():
         if init_name in init_map:
-            val = np.frombuffer(
-                init_map[init_name].raw_data, dtype=np.float32
-            ).copy()
+            val = np.frombuffer(init_map[init_name].raw_data, dtype=np.float32).copy()
             with torch.no_grad():
                 param.data.copy_(torch.from_numpy(val).to(dtype))
 
@@ -375,6 +393,7 @@ def _load_all_params(
 # ---------------------------------------------------------------------------
 # CUDA graph runner — per-shape cache
 # ---------------------------------------------------------------------------
+
 
 class _CapturedGraph:
     """A CUDA graph captured for one specific input shape.
@@ -420,27 +439,30 @@ class Det10gGraphRunner:
     def __init__(self, model: Det10gTorch) -> None:
         self._model = model
         self._graphs: Dict[Tuple[int, int], Optional[_CapturedGraph]] = {}
+        self._capture_lock = threading.Lock()  # protects per-shape lazy capture
 
     def __call__(self, x: torch.Tensor) -> Tuple[torch.Tensor, ...]:
         H, W = int(x.shape[2]), int(x.shape[3])
         key = (H, W)
         if key not in self._graphs:
-            try:
-                # Allocate static buffer matching model memory format so the
-                # graph captures the NHWC path when channels_last is active.
-                if self._model._channels_last:
-                    static_inp = torch.zeros_like(
-                        x, memory_format=torch.channels_last
-                    )
-                else:
-                    static_inp = torch.zeros_like(x)
-                self._graphs[key] = _CapturedGraph(self._model, static_inp)
-            except Exception as e:
-                print(
-                    f"[Det10g] CUDA graph capture failed for ({H},{W}): {e}. "
-                    "Using eager fallback."
-                )
-                self._graphs[key] = None
+            with self._capture_lock:
+                if key not in self._graphs:  # double-checked inside lock
+                    try:
+                        # Allocate static buffer matching model memory format so the
+                        # graph captures the NHWC path when channels_last is active.
+                        if self._model._channels_last:
+                            static_inp = torch.zeros_like(
+                                x, memory_format=torch.channels_last
+                            )
+                        else:
+                            static_inp = torch.zeros_like(x)
+                        self._graphs[key] = _CapturedGraph(self._model, static_inp)
+                    except Exception as e:
+                        print(
+                            f"[Det10g] CUDA graph capture failed for ({H},{W}): {e}. "
+                            "Using eager fallback."
+                        )
+                        self._graphs[key] = None
 
         g = self._graphs[key]
         if g is not None:

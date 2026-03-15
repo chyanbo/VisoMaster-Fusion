@@ -7,8 +7,8 @@ and writes per-model result files to custom_kernels/<model>/benchmark_results.tx
 Usage (from repo root):
     .venv/Scripts/python custom_kernels/run_all_benchmarks.py
 """
+
 from __future__ import annotations
-import io
 import subprocess
 import sys
 import time
@@ -50,22 +50,29 @@ BENCHMARKS = [
 
 CKDIR = ROOT / "custom_kernels"
 
+
 def run_benchmark(rel_path: str) -> tuple[bool, str]:
     script = CKDIR / rel_path
     out_file = script.parent / "benchmark_results.txt"
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  Running: {rel_path}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     t0 = time.perf_counter()
     env = {**__import__("os").environ, "PYTHONIOENCODING": "utf-8"}
     result = subprocess.run(
         [str(VENV_PY), str(script)],
-        capture_output=True, text=True, cwd=str(ROOT), env=env,
-        encoding="utf-8", errors="replace",
+        capture_output=True,
+        text=True,
+        cwd=str(ROOT),
+        env=env,
+        encoding="utf-8",
+        errors="replace",
     )
     time.sleep(3)  # allow GPU driver to release VRAM between benchmark subprocesses
     elapsed = time.perf_counter() - t0
-    output = result.stdout + ("\n[STDERR]\n" + result.stderr if result.stderr.strip() else "")
+    output = result.stdout + (
+        "\n[STDERR]\n" + result.stderr if result.stderr.strip() else ""
+    )
     out_file.write_text(output, encoding="utf-8")
     ok = result.returncode == 0
     status = "OK" if ok else f"FAILED (rc={result.returncode})"
@@ -75,7 +82,7 @@ def run_benchmark(rel_path: str) -> tuple[bool, str]:
 
 
 def main():
-    print(f"\nVisoMaster-Fusion — Master Benchmark Runner")
+    print("\nVisoMaster-Fusion — Master Benchmark Runner")
     print(f"GPU: {_gpu_name()}")
     print(f"Running {len(BENCHMARKS)} benchmarks...\n")
 
@@ -84,9 +91,9 @@ def main():
         ok, out = run_benchmark(rel)
         results.append((rel, ok, out))
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for rel, ok, out in results:
         status = "OK  " if ok else "FAIL"
         print(f"  [{status}]  {rel}")
@@ -97,6 +104,7 @@ def main():
 def _gpu_name() -> str:
     try:
         import torch
+
         return torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
     except Exception:
         return "unknown"

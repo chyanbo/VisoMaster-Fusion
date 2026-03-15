@@ -31,12 +31,12 @@ from typing import List, Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
 # IBasicBlock (single-BN pre-activation block from InsightFace w600k_r50)
 # ---------------------------------------------------------------------------
+
 
 class _IBasicBlock(nn.Module):
     """InsightFace IBasicBlock — single BN, PReLU, no post-block BN.
@@ -50,7 +50,7 @@ class _IBasicBlock(nn.Module):
 
     def __init__(self, in_ch: int, out_ch: int, stride: int = 1) -> None:
         super().__init__()
-        self.bn1  = nn.BatchNorm2d(in_ch, eps=1e-5, momentum=0.1, affine=True)
+        self.bn1 = nn.BatchNorm2d(in_ch, eps=1e-5, momentum=0.1, affine=True)
         self.conv1 = nn.Conv2d(in_ch, out_ch, 3, stride=1, padding=1, bias=True)
         self.prelu = nn.PReLU(out_ch)
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, stride=stride, padding=1, bias=True)
@@ -83,6 +83,7 @@ def _make_layer(in_ch: int, out_ch: int, num_blocks: int, stride: int) -> nn.Seq
 # Full IResNet-50 model
 # ---------------------------------------------------------------------------
 
+
 class IResNet50Torch(nn.Module):
     """FP16-capable PyTorch reimplementation of w600k_r50.onnx (IResNet-50 / ArcFace).
 
@@ -94,18 +95,18 @@ class IResNet50Torch(nn.Module):
         super().__init__()
 
         # Stem — Conv(3→64, 3×3, s=1, p=1, bias=True) + PReLU; NO BatchNorm, NO MaxPool
-        self.conv1  = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=True)
+        self.conv1 = nn.Conv2d(3, 64, 3, stride=1, padding=1, bias=True)
         self.prelu0 = nn.PReLU(64)
 
         # IResNet-50 stages: layers=[3,4,14,3], all stride=2
-        self.layer1 = _make_layer( 64,  64, num_blocks=3,  stride=2)  # → 56×56
-        self.layer2 = _make_layer( 64, 128, num_blocks=4,  stride=2)  # → 28×28
+        self.layer1 = _make_layer(64, 64, num_blocks=3, stride=2)  # → 56×56
+        self.layer2 = _make_layer(64, 128, num_blocks=4, stride=2)  # → 28×28
         self.layer3 = _make_layer(128, 256, num_blocks=14, stride=2)  # → 14×14
-        self.layer4 = _make_layer(256, 512, num_blocks=3,  stride=2)  # →  7×7
+        self.layer4 = _make_layer(256, 512, num_blocks=3, stride=2)  # →  7×7
 
         # Head
-        self.bn2      = nn.BatchNorm2d(512, eps=1e-5, momentum=0.1, affine=True)
-        self.fc       = nn.Linear(512 * 7 * 7, 512, bias=True)   # 25088 → 512
+        self.bn2 = nn.BatchNorm2d(512, eps=1e-5, momentum=0.1, affine=True)
+        self.fc = nn.Linear(512 * 7 * 7, 512, bias=True)  # 25088 → 512
         self.features = nn.BatchNorm1d(512, eps=1e-5, affine=True)
 
         # Compute dtype is set by from_onnx(); inputs cast inside forward()
@@ -125,9 +126,9 @@ class IResNet50Torch(nn.Module):
 
         # Head: BN2 → Flatten → FC → BN_features
         x = self.bn2(x)
-        x = torch.flatten(x, 1)   # (1, 25088)
-        x = self.fc(x)            # (1, 512)
-        x = self.features(x)      # (1, 512)
+        x = torch.flatten(x, 1)  # (1, 25088)
+        x = self.fc(x)  # (1, 512)
+        x = self.features(x)  # (1, 512)
 
         return x.float()
 
@@ -175,9 +176,11 @@ class IResNet50Torch(nn.Module):
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
 
+
 def _np(init):
     """Extract float32 numpy array from an ONNX TensorProto initialiser."""
     import numpy as np
+
     if init.raw_data:
         return np.frombuffer(init.raw_data, dtype=np.float32).copy()
     return np.array(init.float_data, dtype=np.float32)
@@ -240,19 +243,17 @@ def _load_all_params(model: IResNet50Torch, onnx_model) -> None:
         topological order to _prelu_modules_in_forward_order().
       - BatchNorm, FC (Linear), BN_features: loaded by name from state_dict.
     """
-    import numpy as np
 
     init_map = {init.name: init for init in onnx_model.graph.initializer}
     state = model.state_dict()
 
-    conv_mods   = _conv_modules_in_forward_order(model)
-    prelu_mods  = _prelu_modules_in_forward_order(model)
-    conv_idx    = 0
-    prelu_idx   = 0
+    conv_mods = _conv_modules_in_forward_order(model)
+    prelu_mods = _prelu_modules_in_forward_order(model)
+    conv_idx = 0
+    prelu_idx = 0
 
     # ── Step 1: Positional Conv + PReLU loading ──────────────────────────────
     for node in onnx_model.graph.node:
-
         if node.op_type == "Conv":
             if conv_idx >= len(conv_mods):
                 raise RuntimeError(
@@ -283,7 +284,7 @@ def _load_all_params(model: IResNet50Torch, onnx_model) -> None:
             prelu_idx += 1
 
             slope_init = init_map[node.input[1]]
-            slope = _np(slope_init).flatten()   # [C,1,1] → [C]
+            slope = _np(slope_init).flatten()  # [C,1,1] → [C]
             with torch.no_grad():
                 mod.weight.copy_(torch.from_numpy(slope))
 
@@ -326,6 +327,7 @@ def _load_all_params(model: IResNet50Torch, onnx_model) -> None:
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 class _CapturedGraph:
     """Single fixed-size CUDA graph for (1, 3, 112, 112) input."""
 
@@ -337,7 +339,7 @@ class _CapturedGraph:
             for _ in range(warmup):
                 _ = model(self._inp)
 
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         self._stream = torch.cuda.Stream()
 
         torch.cuda.synchronize()
@@ -351,9 +353,7 @@ class _CapturedGraph:
         return self._out.clone()
 
 
-def build_cuda_graph_runner(
-    model: IResNet50Torch, warmup: int = 3
-) -> _CapturedGraph:
+def build_cuda_graph_runner(model: IResNet50Torch, warmup: int = 3) -> _CapturedGraph:
     """Capture a CUDA graph for model and return a callable runner.
 
     Falls back gracefully if graph capture is unsupported on the current device.

@@ -35,12 +35,14 @@ class FaceMasks:
         self._kernel_cache_lock = threading.Lock()
         self._meshgrid_cache_lock = threading.Lock()
         self._clip_load_lock = threading.Lock()
-        self._custom_inference_lock = (
-            threading.Lock()
-        )  # serialises parallel inference for CUDA-graph runners
-        self._custom_init_lock = (
-            threading.Lock()
-        )  # serialises all Custom-kernel lazy inits
+        self._custom_inference_lock = threading.Lock()  # serialises parallel inference for CUDA-graph runners (shared across all mask runners)
+        # FM-INIT: per-model init locks so that one model's ONNX loading does not
+        # block another model's ONNX loading (CPU-only work that can overlap).
+        # The global cuda_graph_capture_lock still serialises GPU captures.
+        self._faceparser_init_lock = threading.Lock()
+        self._xseg_init_lock = threading.Lock()
+        self._occluder_init_lock = threading.Lock()
+        self._vgg_init_lock = threading.Lock()
 
         self.clip_model_loaded = False
         self.active_models: set[str] = set()
@@ -69,13 +71,16 @@ class FaceMasks:
             self.active_models.clear()
 
         # Release Custom-kernel instances so they rebuild on next use.
-        with self._custom_init_lock:
+        with self._faceparser_init_lock:
             self._faceparser_torch = None
             self._faceparser_runner = None
+        with self._xseg_init_lock:
             self._xseg_torch = None
             self._xseg_runner = None
+        with self._occluder_init_lock:
             self._occluder_torch = None
             self._occluder_runner = None
+        with self._vgg_init_lock:
             self._vgg_combo_torch = None
             self._vgg_combo_runner = None
 
@@ -85,152 +90,190 @@ class FaceMasks:
         """Lazy-load the FaceParserResnet34Torch Custom-kernel runner."""
         if self._faceparser_runner is not None:
             return self._faceparser_runner
-        with self._custom_init_lock:
-            if self._faceparser_runner is not None:
-                return self._faceparser_runner
-            if self._faceparser_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for FaceParser.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._faceparser_init_lock:
+                if self._faceparser_runner is not None:
+                    return self._faceparser_runner
+                if self._faceparser_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.faceparser_resnet34.faceparser_resnet34_torch import (
+                            FaceParserResnet34Torch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "faceparser_resnet34.onnx"
+                        )
+                        m = (
+                            FaceParserResnet34Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._faceparser_torch = m
+                    except Exception as e:
+                        print(f"[Custom] faceparser_resnet34 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
                     from custom_kernels.faceparser_resnet34.faceparser_resnet34_torch import (
-                        FaceParserResnet34Torch,
+                        build_cuda_graph_runner,
                     )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "faceparser_resnet34.onnx"
-                    )
-                    m = (
-                        FaceParserResnet34Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._faceparser_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._faceparser_runner = build_cuda_graph_runner(
+                            self._faceparser_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] faceparser_resnet34 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.faceparser_resnet34.faceparser_resnet34_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._faceparser_runner = build_cuda_graph_runner(
-                    self._faceparser_torch
-                )
-            except Exception as e:
-                print(
-                    f"[Custom] faceparser_resnet34 graph runner failed, using eager: {e}"
-                )
-                self._faceparser_runner = self._faceparser_torch
+                    print(
+                        f"[Custom] faceparser_resnet34 graph runner failed, using eager: {e}"
+                    )
+                    self._faceparser_runner = self._faceparser_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._faceparser_runner
 
     def _get_xseg_runner(self):
         """Lazy-load the XSegTorch Custom-kernel runner."""
         if self._xseg_runner is not None:
             return self._xseg_runner
-        with self._custom_init_lock:
-            if self._xseg_runner is not None:
-                return self._xseg_runner
-            if self._xseg_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for XSeg mask model.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._xseg_init_lock:
+                if self._xseg_runner is not None:
+                    return self._xseg_runner
+                if self._xseg_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.xseg.xseg_torch import XSegTorch
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "XSeg_model.onnx"
+                        )
+                        m = (
+                            XSegTorch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._xseg_torch = m
+                    except Exception as e:
+                        print(f"[Custom] xseg load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.xseg.xseg_torch import XSegTorch
+                    from custom_kernels.xseg.xseg_torch import build_cuda_graph_runner
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "XSeg_model.onnx"
-                    )
-                    m = (
-                        XSegTorch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._xseg_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._xseg_runner = build_cuda_graph_runner(self._xseg_torch)
                 except Exception as e:
-                    print(f"[Custom] xseg load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.xseg.xseg_torch import build_cuda_graph_runner
-
-                self._xseg_runner = build_cuda_graph_runner(self._xseg_torch)
-            except Exception as e:
-                print(f"[Custom] xseg graph runner failed, using eager: {e}")
-                self._xseg_runner = self._xseg_torch
+                    print(f"[Custom] xseg graph runner failed, using eager: {e}")
+                    self._xseg_runner = self._xseg_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._xseg_runner
 
     def _get_occluder_runner(self):
         """Lazy-load the OccluderTorch Custom-kernel runner."""
         if self._occluder_runner is not None:
             return self._occluder_runner
-        with self._custom_init_lock:
-            if self._occluder_runner is not None:
-                return self._occluder_runner
-            if self._occluder_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for Occluder mask model.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._occluder_init_lock:
+                if self._occluder_runner is not None:
+                    return self._occluder_runner
+                if self._occluder_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.occluder.occluder_torch import OccluderTorch
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "occluder.onnx"
+                        )
+                        m = (
+                            OccluderTorch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._occluder_torch = m
+                    except Exception as e:
+                        print(f"[Custom] occluder load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.occluder.occluder_torch import OccluderTorch
+                    from custom_kernels.occluder.occluder_torch import (
+                        build_cuda_graph_runner,
+                    )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "occluder.onnx"
-                    )
-                    m = (
-                        OccluderTorch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._occluder_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._occluder_runner = build_cuda_graph_runner(
+                            self._occluder_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] occluder load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.occluder.occluder_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._occluder_runner = build_cuda_graph_runner(self._occluder_torch)
-            except Exception as e:
-                print(f"[Custom] occluder graph runner failed, using eager: {e}")
-                self._occluder_runner = self._occluder_torch
+                    print(f"[Custom] occluder graph runner failed, using eager: {e}")
+                    self._occluder_runner = self._occluder_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._occluder_runner
 
     def _get_vgg_combo_runner(self):
         """Lazy-load the VggComboTorch Custom-kernel runner."""
         if self._vgg_combo_runner is not None:
             return self._vgg_combo_runner
-        with self._custom_init_lock:
-            if self._vgg_combo_runner is not None:
-                return self._vgg_combo_runner
-            if self._vgg_combo_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for VGG face differencing model.\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._vgg_init_lock:
+                if self._vgg_combo_runner is not None:
+                    return self._vgg_combo_runner
+                if self._vgg_combo_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.vgg_combo.vgg_combo_torch import (
+                            VggComboTorch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "vgg_combo_relu3_3_relu3_1.onnx"
+                        )
+                        m = (
+                            VggComboTorch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._vgg_combo_torch = m
+                    except Exception as e:
+                        print(f"[Custom] vgg_combo load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.vgg_combo.vgg_combo_torch import VggComboTorch
+                    from custom_kernels.vgg_combo.vgg_combo_torch import (
+                        build_cuda_graph_runner,
+                    )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "vgg_combo_relu3_3_relu3_1.onnx"
-                    )
-                    m = (
-                        VggComboTorch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._vgg_combo_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._vgg_combo_runner = build_cuda_graph_runner(
+                            self._vgg_combo_torch
+                        )
                 except Exception as e:
-                    print(f"[Custom] vgg_combo load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.vgg_combo.vgg_combo_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self._vgg_combo_runner = build_cuda_graph_runner(self._vgg_combo_torch)
-            except Exception as e:
-                print(f"[Custom] vgg_combo CUDA graph failed, using eager: {e}")
-                self._vgg_combo_runner = self._vgg_combo_torch
+                    print(f"[Custom] vgg_combo CUDA graph failed, using eager: {e}")
+                    self._vgg_combo_runner = self._vgg_combo_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._vgg_combo_runner
 
     def _faceparser_labels(self, img_uint8_3x512x512: torch.Tensor) -> torch.Tensor:

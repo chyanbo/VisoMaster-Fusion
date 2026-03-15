@@ -41,7 +41,7 @@ norm blocks in the encoder and decoder.  Falls back to pure PyTorch silently.
 from __future__ import annotations
 
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
@@ -53,8 +53,9 @@ import torch.nn.functional as F
 _TRITON_RMSNORMMAX = None
 try:
     from custom_kernels.triton_ops import TRITON_AVAILABLE as _TRITON_AVAIL
+
     if _TRITON_AVAIL:
-        from custom_kernels.triton_ops import triton_rmsnormmax as _TRITON_RMSNORMMAX
+        from custom_kernels.triton_ops import triton_rmsnormmax as _TRITON_RMSNORMMAX  # type: ignore[assignment]
 except Exception:
     pass
 
@@ -62,6 +63,7 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Custom normalization + activation
 # ---------------------------------------------------------------------------
+
 
 class _RMSNormMax(nn.Module):
     """Per-block RMS normalisation with learned affine and max-clamp activation.
@@ -74,8 +76,8 @@ class _RMSNormMax(nn.Module):
 
     def __init__(self, ch: int) -> None:
         super().__init__()
-        self.gamma   = nn.Parameter(torch.ones (1, ch, 1, 1))
-        self.beta    = nn.Parameter(torch.zeros(1, ch, 1, 1))
+        self.gamma = nn.Parameter(torch.ones(1, ch, 1, 1))
+        self.beta = nn.Parameter(torch.zeros(1, ch, 1, 1))
         self.max_val = nn.Parameter(torch.zeros(1, ch, 1, 1))
         # eps set by weight loader from the ONNX Abs_* initialiser (per-block scalar)
         self.eps: float = 1.0
@@ -97,6 +99,7 @@ class _RMSNormMax(nn.Module):
 # Encoder components
 # ---------------------------------------------------------------------------
 
+
 class _EncBlock(nn.Module):
     """Encoder stage: n_convs × (Conv3×3 + RMSNormMax) + depthwise strided-Conv.
 
@@ -109,7 +112,7 @@ class _EncBlock(nn.Module):
         out_ch: int,
         n_convs: int,
         ds_k: int,
-        ds_pad: Tuple[int, int, int, int],   # (left, right, top, bottom) for F.pad
+        ds_pad: Tuple[int, int, int, int],  # (left, right, top, bottom) for F.pad
     ) -> None:
         super().__init__()
         self.convs: nn.ModuleList = nn.ModuleList()
@@ -120,13 +123,12 @@ class _EncBlock(nn.Module):
             self.norms.append(_RMSNormMax(out_ch))
             ch = out_ch
         # Depthwise strided conv — no bias; uses explicit F.pad for asymmetric padding
-        self.ds     = nn.Conv2d(out_ch, out_ch, ds_k, stride=2, padding=0,
-                                groups=out_ch, bias=False)
+        self.ds = nn.Conv2d(
+            out_ch, out_ch, ds_k, stride=2, padding=0, groups=out_ch, bias=False
+        )
         self._ds_pad = ds_pad
 
-    def forward(
-        self, x: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         for conv, norm in zip(self.convs, self.norms):
             x = norm(conv(x))
         skip = x
@@ -138,6 +140,7 @@ class _EncBlock(nn.Module):
 # Decoder components
 # ---------------------------------------------------------------------------
 
+
 class _UpBlock(nn.Module):
     """ConvTranspose upsample → additive bias → RMSNormMax.
 
@@ -147,8 +150,9 @@ class _UpBlock(nn.Module):
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.ct   = nn.ConvTranspose2d(in_ch, out_ch, 3, stride=2,
-                                       padding=1, output_padding=1, bias=False)
+        self.ct = nn.ConvTranspose2d(
+            in_ch, out_ch, 3, stride=2, padding=1, output_padding=1, bias=False
+        )
         self.bias = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
         self.norm = _RMSNormMax(out_ch)
 
@@ -168,8 +172,8 @@ class _DecBlock(nn.Module):
         out_ch: int,
     ) -> None:
         super().__init__()
-        self.up    = _UpBlock(in_ch, in_ch // 2)
-        concat_ch  = in_ch // 2 + skip_ch
+        self.up = _UpBlock(in_ch, in_ch // 2)
+        concat_ch = in_ch // 2 + skip_ch
         self.convs: nn.ModuleList = nn.ModuleList()
         self.norms: nn.ModuleList = nn.ModuleList()
         ch = concat_ch
@@ -179,9 +183,7 @@ class _DecBlock(nn.Module):
             self.norms.append(_RMSNormMax(o))
             ch = o
 
-    def forward(
-        self, x: torch.Tensor, skip: torch.Tensor
-    ) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, skip: torch.Tensor) -> torch.Tensor:
         x = self.up(x)
         x = torch.cat([x, skip], dim=1)
         for conv, norm in zip(self.convs, self.norms):
@@ -192,6 +194,7 @@ class _DecBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Full XSeg U-Net
 # ---------------------------------------------------------------------------
+
 
 class XSegTorch(nn.Module):
     """FP16-capable PyTorch reimplementation of XSeg_model.onnx.
@@ -212,17 +215,17 @@ class XSegTorch(nn.Module):
         #   enc0 pads=[1,1,2,2]  → (1,2,1,2)
         #   enc1 pads=[1,1,1,1]  → (1,1,1,1)
         #   enc2–5 pads=[0,0,1,1]→ (0,1,0,1)
-        self.enc0 = _EncBlock(3,   32,  2, ds_k=4, ds_pad=(1, 2, 1, 2))
-        self.enc1 = _EncBlock(32,  64,  2, ds_k=3, ds_pad=(1, 1, 1, 1))
-        self.enc2 = _EncBlock(64,  128, 2, ds_k=2, ds_pad=(0, 1, 0, 1))
+        self.enc0 = _EncBlock(3, 32, 2, ds_k=4, ds_pad=(1, 2, 1, 2))
+        self.enc1 = _EncBlock(32, 64, 2, ds_k=3, ds_pad=(1, 1, 1, 1))
+        self.enc2 = _EncBlock(64, 128, 2, ds_k=2, ds_pad=(0, 1, 0, 1))
         self.enc3 = _EncBlock(128, 256, 3, ds_k=2, ds_pad=(0, 1, 0, 1))
         self.enc4 = _EncBlock(256, 256, 3, ds_k=2, ds_pad=(0, 1, 0, 1))
         self.enc5 = _EncBlock(256, 256, 3, ds_k=2, ds_pad=(0, 1, 0, 1))
 
         # ── Bottleneck FC bridge ────────────────────────────────────────────
         # Spatial: 4×4×256 = 4096 → Linear(512) → Linear(4096) → reshape 256×4×4
-        self.dense1 = nn.Linear(4096, 512,  bias=True)
-        self.dense2 = nn.Linear(512,  4096, bias=True)
+        self.dense1 = nn.Linear(4096, 512, bias=True)
+        self.dense2 = nn.Linear(512, 4096, bias=True)
 
         # ── Decoder (skip channels come from enc5→0 in order) ──────────────
         # dec5: in=256, skip=256ch(enc5), up→128, cat→384, 3×Conv(384→256→256→256)
@@ -234,9 +237,9 @@ class XSegTorch(nn.Module):
         # dec2: in=256, skip=128ch(enc2), up→128, cat→256, 2×Conv(256→128→128)
         self.dec2 = _DecBlock(256, 128, 2, first_out_ch=128, out_ch=128)
         # dec1: in=128, skip=64ch(enc1),  up→64,  cat→128, 2×Conv(128→64→64)
-        self.dec1 = _DecBlock(128, 64,  2, first_out_ch=64,  out_ch=64)
+        self.dec1 = _DecBlock(128, 64, 2, first_out_ch=64, out_ch=64)
         # dec0: in=64,  skip=32ch(enc0),  up→32,  cat→64,  2×Conv(64→32→32)
-        self.dec0 = _DecBlock(64,  32,  2, first_out_ch=32,  out_ch=32)
+        self.dec0 = _DecBlock(64, 32, 2, first_out_ch=32, out_ch=32)
 
         # ── Output head ────────────────────────────────────────────────────
         self.out_conv = nn.Conv2d(32, 1, 3, padding=1, bias=True)
@@ -247,31 +250,31 @@ class XSegTorch(nn.Module):
         x = x.to(self._compute_dtype)
 
         # Encoder — save skip features before downsampling
-        x, s0 = self.enc0(x)   # 256×256 → 128×128, s0: 32ch  @256×256
-        x, s1 = self.enc1(x)   # 128×128 →  64×64,  s1: 64ch  @128×128
-        x, s2 = self.enc2(x)   #  64×64  →  32×32,  s2: 128ch @ 64×64
-        x, s3 = self.enc3(x)   #  32×32  →  16×16,  s3: 256ch @ 32×32
-        x, s4 = self.enc4(x)   #  16×16  →   8×8,   s4: 256ch @ 16×16
-        x, s5 = self.enc5(x)   #   8×8   →   4×4,   s5: 256ch @  8×8
+        x, s0 = self.enc0(x)  # 256×256 → 128×128, s0: 32ch  @256×256
+        x, s1 = self.enc1(x)  # 128×128 →  64×64,  s1: 64ch  @128×128
+        x, s2 = self.enc2(x)  #  64×64  →  32×32,  s2: 128ch @ 64×64
+        x, s3 = self.enc3(x)  #  32×32  →  16×16,  s3: 256ch @ 32×32
+        x, s4 = self.enc4(x)  #  16×16  →   8×8,   s4: 256ch @ 16×16
+        x, s5 = self.enc5(x)  #   8×8   →   4×4,   s5: 256ch @  8×8
 
         # Bottleneck FC bridge
         B, C, H, W = x.shape
-        x = x.flatten(1)            # (B, 4096)
-        x = self.dense1(x)          # (B, 512)
-        x = self.dense2(x)          # (B, 4096)
+        x = x.flatten(1)  # (B, 4096)
+        x = self.dense1(x)  # (B, 512)
+        x = self.dense2(x)  # (B, 4096)
         x = x.reshape(B, C, H, W)  # (B, 256, 4, 4)
 
         # Decoder — upsample and fuse with skips (deepest first)
-        x = self.dec5(x, s5)   #  4×4  →   8×8
-        x = self.dec4(x, s4)   #  8×8  →  16×16
-        x = self.dec3(x, s3)   # 16×16 →  32×32
-        x = self.dec2(x, s2)   # 32×32 →  64×64
-        x = self.dec1(x, s1)   # 64×64 → 128×128
-        x = self.dec0(x, s0)   # 128×128→ 256×256
+        x = self.dec5(x, s5)  #  4×4  →   8×8
+        x = self.dec4(x, s4)  #  8×8  →  16×16
+        x = self.dec3(x, s3)  # 16×16 →  32×32
+        x = self.dec2(x, s2)  # 32×32 →  64×64
+        x = self.dec1(x, s1)  # 64×64 → 128×128
+        x = self.dec0(x, s0)  # 128×128→ 256×256
 
         # Output
         x = torch.sigmoid(self.out_conv(x))
-        return x.float()   # always float32 output
+        return x.float()  # always float32 output
 
     # ------------------------------------------------------------------
     # Class-method constructor
@@ -307,8 +310,7 @@ class XSegTorch(nn.Module):
 
         total = sum(p.numel() for p in model.parameters())
         print(
-            f"[XSegTorch] Loaded {total:,} parameters"
-            f" | compute dtype: {compute_dtype}"
+            f"[XSegTorch] Loaded {total:,} parameters | compute dtype: {compute_dtype}"
         )
         return model
 
@@ -317,9 +319,11 @@ class XSegTorch(nn.Module):
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
 
+
 def _np(init):
     """Extract float32 numpy array from an ONNX TensorProto initialiser."""
     import numpy as np
+
     if init.raw_data:
         return np.frombuffer(init.raw_data, dtype=np.float32).copy()
     return np.array(init.float_data, dtype=np.float32)
@@ -450,7 +454,6 @@ def _load_all_params(model: XSegTorch, onnx_model) -> None:
         beta from Add, max_val from Max nodes — all with [1,C,1,1] initialisers).
       - Linear weights / biases: matched by shape (dense1↔[4096,512], dense2↔[512,4096]).
     """
-    import numpy as np
 
     init_map = {i.name: i for i in onnx_model.graph.initializer}
 
@@ -460,17 +463,16 @@ def _load_all_params(model: XSegTorch, onnx_model) -> None:
         for out in node.output:
             output_to_node[out] = node
 
-    conv_mods   = _conv_modules_in_forward_order(model)
-    norm_mods   = _rms_norm_mods_in_forward_order(model)
-    ct_biases   = _ct_bias_params_in_forward_order(model)
+    conv_mods = _conv_modules_in_forward_order(model)
+    norm_mods = _rms_norm_mods_in_forward_order(model)
+    ct_biases = _ct_bias_params_in_forward_order(model)
 
-    conv_idx    = 0
-    norm_idx    = 0
+    conv_idx = 0
+    norm_idx = 0
     ct_bias_idx = 0
-    matmul_idx  = 0
+    matmul_idx = 0
 
     for node in onnx_model.graph.node:
-
         # ── Conv / ConvTranspose weights & biases ─────────────────────────
         if node.op_type in ("Conv", "ConvTranspose"):
             if conv_idx >= len(conv_mods):
@@ -568,7 +570,7 @@ def _load_all_params(model: XSegTorch, onnx_model) -> None:
                     v = _np(init).reshape(d)
                     with torch.no_grad():
                         norm_mods[norm_idx].max_val.copy_(torch.from_numpy(v))
-                    norm_idx += 1   # max_val is the last norm param: advance block index
+                    norm_idx += 1  # max_val is the last norm param: advance block index
 
     # ── Sanity checks ─────────────────────────────────────────────────────
     if conv_idx != len(conv_mods):
@@ -589,6 +591,7 @@ def _load_all_params(model: XSegTorch, onnx_model) -> None:
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 class _CapturedGraph:
     """Single fixed-size CUDA graph for (1, 3, 256, 256) input."""
 
@@ -600,7 +603,7 @@ class _CapturedGraph:
             for _ in range(warmup):
                 _ = model(self._inp)
 
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         self._stream = torch.cuda.Stream()
 
         torch.cuda.synchronize()
@@ -614,8 +617,6 @@ class _CapturedGraph:
         return self._out.clone()
 
 
-def build_cuda_graph_runner(
-    model: XSegTorch, warmup: int = 3
-) -> _CapturedGraph:
+def build_cuda_graph_runner(model: XSegTorch, warmup: int = 3) -> _CapturedGraph:
     """Capture a CUDA graph for model and return a callable runner."""
     return _CapturedGraph(model, warmup)

@@ -31,6 +31,7 @@ during `PeppaPig98Torch.__init__()`. Conv weights use **positional** loading
 (ONNX topological order = PyTorch forward order). The 4 ASPP named
 Conv weights and the BN/attention weights are loaded by name.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -79,7 +80,7 @@ class PeppaPig98Torch(nn.Module):
         import numpy as np
 
         proto = onnx.load(onnx_path)
-        g     = proto.graph
+        g = proto.graph
 
         inits: dict[str, np.ndarray] = {
             i.name: numpy_helper.to_array(i) for i in g.initializer
@@ -87,45 +88,61 @@ class PeppaPig98Torch(nn.Module):
 
         # ── Build Conv2d list in ONNX topological order ───────────────────────
         convs: list[nn.Conv2d] = []
-        conv_node_to_idx: dict[int, int] = {}   # ONNX node index → convs[]
+        conv_node_to_idx: dict[int, int] = {}  # ONNX node index → convs[]
 
         bn_layer: Optional[nn.BatchNorm2d] = None
-        bn_node_idx: int = -1
+        _bn_node_idx: int = -1
 
         def _get_attr(node, name, default=None):
             for a in node.attribute:
                 if a.name == name:
-                    if a.ints:  return list(a.ints)
-                    if a.floats: return list(a.floats)
-                    if a.s:     return a.s.decode()
-                    if a.HasField("i"): return a.i
-                    if a.HasField("f"): return a.f
+                    if a.ints:
+                        return list(a.ints)
+                    if a.floats:
+                        return list(a.floats)
+                    if a.s:
+                        return a.s.decode()
+                    if a.HasField("i"):
+                        return a.i
+                    if a.HasField("f"):
+                        return a.f
             return default
 
         for ni, node in enumerate(g.node):
             if node.op_type == "Conv":
-                w_name  = node.input[1]
-                w       = inits.get(w_name)
+                w_name = node.input[1]
+                w = inits.get(w_name)
                 if w is None:
                     continue
-                has_bias = len(node.input) > 2 and bool(node.input[2]) and node.input[2] in inits
-                strides   = _get_attr(node, "strides",    [1, 1])
-                pads      = _get_attr(node, "pads",       [0, 0, 0, 0])
-                groups    = _get_attr(node, "group",       1)
-                ks        = _get_attr(node, "kernel_shape", [1, 1])
-                dilations = _get_attr(node, "dilations",  [1, 1])
+                has_bias = (
+                    len(node.input) > 2
+                    and bool(node.input[2])
+                    and node.input[2] in inits
+                )
+                strides = _get_attr(node, "strides", [1, 1])
+                pads = _get_attr(node, "pads", [0, 0, 0, 0])
+                groups = _get_attr(node, "group", 1)
+                ks = _get_attr(node, "kernel_shape", [1, 1])
+                dilations = _get_attr(node, "dilations", [1, 1])
 
                 out_c = w.shape[0]
-                in_c  = w.shape[1] * (groups if isinstance(groups, int) else groups[0])
+                in_c = w.shape[1] * (groups if isinstance(groups, int) else groups[0])
                 g_val = groups if isinstance(groups, int) else groups[0]
                 d_val = dilations[0] if isinstance(dilations, list) else dilations
-                s_val = (strides[0], strides[1]) if isinstance(strides, list) else strides
+                s_val = (
+                    (strides[0], strides[1]) if isinstance(strides, list) else strides
+                )
                 p_val = (pads[0], pads[1])
 
                 conv = nn.Conv2d(
-                    in_c, out_c, (ks[0], ks[1]),
-                    stride=s_val, padding=p_val, dilation=d_val,
-                    groups=g_val, bias=has_bias,
+                    in_c,
+                    out_c,
+                    (ks[0], ks[1]),
+                    stride=s_val,
+                    padding=p_val,
+                    dilation=d_val,
+                    groups=g_val,
+                    bias=has_bias,
                 )
                 conv.weight.data = torch.tensor(w, dtype=self.compute_dtype)
                 if has_bias:
@@ -136,17 +153,17 @@ class PeppaPig98Torch(nn.Module):
                 convs.append(conv)
 
             elif node.op_type == "BatchNormalization":
-                w   = inits[node.input[1]]
-                b   = inits[node.input[2]]
-                mn  = inits[node.input[3]]
-                vr  = inits[node.input[4]]
-                C   = w.shape[0]
+                w = inits[node.input[1]]
+                b = inits[node.input[2]]
+                mn = inits[node.input[3]]
+                vr = inits[node.input[4]]
+                C = w.shape[0]
                 bn_layer = nn.BatchNorm2d(C, eps=1e-5)
                 bn_layer.weight.data.copy_(torch.tensor(w, dtype=torch.float32))
-                bn_layer.bias.data.copy_(torch.tensor(b,   dtype=torch.float32))
+                bn_layer.bias.data.copy_(torch.tensor(b, dtype=torch.float32))
                 bn_layer.running_mean.copy_(torch.tensor(mn, dtype=torch.float32))
-                bn_layer.running_var.copy_(torch.tensor(vr,  dtype=torch.float32))
-                bn_node_idx = ni
+                bn_layer.running_var.copy_(torch.tensor(vr, dtype=torch.float32))
+                _bn_node_idx = ni
 
         self.convs = nn.ModuleList(convs)
         if bn_layer is not None:
@@ -197,36 +214,51 @@ class PeppaPig98Torch(nn.Module):
                     if nm and nm in inits:
                         arr = inits[nm]
                         if arr.shape == (4,) and arr.dtype in [
-                            __import__("numpy").float32, __import__("numpy").float64
+                            __import__("numpy").float32,
+                            __import__("numpy").float64,
                         ]:
                             scales = (float(arr[2]), float(arr[3]))
                 mode = _get_attr(node, "mode", "nearest")
-                ctm  = _get_attr(node, "coordinate_transformation_mode", "asymmetric")
-                align = (ctm == "half_pixel")
+                ctm = _get_attr(node, "coordinate_transformation_mode", "asymmetric")
+                align = ctm == "half_pixel"
                 interp_mode = "nearest" if mode == "nearest" else "bilinear"
-                plan.append({
-                    "op":    "Resize",
-                    "in":    inp[0],
-                    "scale": scales,
-                    "mode":  interp_mode,
-                    "align": align,
-                    "out":   out[0],
-                })
+                plan.append(
+                    {
+                        "op": "Resize",
+                        "in": inp[0],
+                        "scale": scales,
+                        "mode": interp_mode,
+                        "align": align,
+                        "out": out[0],
+                    }
+                )
 
             elif op == "Slice":
                 # All slices here are along channel axis=1
                 # starts/ends/axes are constant initializers
                 starts = int(inits[inp[1]].flat[0])
-                ends   = int(inits[inp[2]].flat[0])
-                plan.append({"op": "Slice", "in": inp[0], "start": starts, "end": ends, "out": out[0]})
+                ends = int(inits[inp[2]].flat[0])
+                plan.append(
+                    {
+                        "op": "Slice",
+                        "in": inp[0],
+                        "start": starts,
+                        "end": ends,
+                        "out": out[0],
+                    }
+                )
 
             elif op == "Reshape":
-                shape = inits[inp[1]].tolist()   # e.g. [-1, 98, 4096]
-                plan.append({"op": "Reshape", "in": inp[0], "shape": shape, "out": out[0]})
+                shape = inits[inp[1]].tolist()  # e.g. [-1, 98, 4096]
+                plan.append(
+                    {"op": "Reshape", "in": inp[0], "shape": shape, "out": out[0]}
+                )
 
             elif op == "ReduceMax":
                 axes = _get_attr(node, "axes", [2])
-                plan.append({"op": "ReduceMax", "in": inp[0], "axis": axes[0], "out": out[0]})
+                plan.append(
+                    {"op": "ReduceMax", "in": inp[0], "axis": axes[0], "out": out[0]}
+                )
 
             elif op == "ArgMax":
                 axis = _get_attr(node, "axis", 2)
@@ -234,19 +266,35 @@ class PeppaPig98Torch(nn.Module):
 
             elif op == "GatherElements":
                 axis = _get_attr(node, "axis", 2)
-                plan.append({"op": "GatherElements", "data": inp[0], "idx": inp[1],
-                              "axis": axis, "out": out[0]})
+                plan.append(
+                    {
+                        "op": "GatherElements",
+                        "data": inp[0],
+                        "idx": inp[1],
+                        "axis": axis,
+                        "out": out[0],
+                    }
+                )
 
             elif op == "Mod":
                 divisor = int(inits[inp[1]].flat[0])
-                plan.append({"op": "Mod", "in": inp[0], "divisor": divisor, "out": out[0]})
+                plan.append(
+                    {"op": "Mod", "in": inp[0], "divisor": divisor, "out": out[0]}
+                )
 
             elif op == "Div":
                 # divisor may be a constant initializer (int or float)
                 div_name = inp[1]
-                div_val  = float(inits[div_name].flat[0]) if div_name in inits else None
-                plan.append({"op": "Div", "in": inp[0], "div_name": div_name,
-                              "div_val": div_val, "out": out[0]})
+                div_val = float(inits[div_name].flat[0]) if div_name in inits else None
+                plan.append(
+                    {
+                        "op": "Div",
+                        "in": inp[0],
+                        "div_name": div_name,
+                        "div_val": div_val,
+                        "out": out[0],
+                    }
+                )
 
             elif op == "Cast":
                 to = _get_attr(node, "to", 1)
@@ -254,7 +302,7 @@ class PeppaPig98Torch(nn.Module):
 
         self._plan = plan
         self._output_name = g.output[0].name
-        self._input_name  = g.input[0].name
+        self._input_name = g.input[0].name
 
     # -------------------------------------------------------------------------
 
@@ -263,7 +311,6 @@ class PeppaPig98Torch(nn.Module):
         x : (N, 3, 256, 256)  float32  in [0, 1]
         returns : (N, 98, 3)  float32  — (x, y, score) in [0,1]
         """
-        device = x.device
         T: dict[str, torch.Tensor] = {self._input_name: x.to(self.compute_dtype)}
 
         for step in self._plan:
@@ -297,34 +344,36 @@ class PeppaPig98Torch(nn.Module):
 
             elif op == "Resize":
                 src = T[step["in"]]
-                sf  = step["scale"]
+                sf = step["scale"]
                 if step["mode"] == "nearest":
                     T[step["out"]] = F.interpolate(src, scale_factor=sf, mode="nearest")
                 else:
                     T[step["out"]] = F.interpolate(
-                        src.float(), scale_factor=sf,
-                        mode="bilinear", align_corners=False,
+                        src.float(),
+                        scale_factor=sf,
+                        mode="bilinear",
+                        align_corners=False,
                     ).to(self.compute_dtype)
 
             elif op == "Slice":
-                T[step["out"]] = T[step["in"]][:, step["start"]:step["end"]]
+                T[step["out"]] = T[step["in"]][:, step["start"] : step["end"]]
 
             elif op == "Reshape":
                 T[step["out"]] = T[step["in"]].reshape(step["shape"])
 
             elif op == "ReduceMax":
-                T[step["out"]] = T[step["in"]].float().max(
-                    dim=step["axis"], keepdim=True
-                ).values
+                T[step["out"]] = (
+                    T[step["in"]].float().max(dim=step["axis"], keepdim=True).values
+                )
 
             elif op == "ArgMax":
-                T[step["out"]] = T[step["in"]].float().argmax(
-                    dim=step["axis"], keepdim=True
+                T[step["out"]] = (
+                    T[step["in"]].float().argmax(dim=step["axis"], keepdim=True)
                 )
 
             elif op == "GatherElements":
                 data = T[step["data"]].float()
-                idx  = T[step["idx"]].long()
+                idx = T[step["idx"]].long()
                 T[step["out"]] = data.gather(step["axis"], idx)
 
             elif op == "Mod":
@@ -332,14 +381,14 @@ class PeppaPig98Torch(nn.Module):
 
             elif op == "Div":
                 src = T[step["in"]]
-                dv  = step["div_val"]
+                dv = step["div_val"]
                 T[step["out"]] = src / dv
 
             elif op == "Cast":
                 dst_dtype = _ONNX_DTYPE.get(step["to"], torch.float32)
                 T[step["out"]] = T[step["in"]].to(dst_dtype)
 
-        return T[self._output_name].float()   # (N, 98, 3)
+        return T[self._output_name].float()  # (N, 98, 3)
 
 
 # ---------------------------------------------------------------------------
@@ -378,7 +427,7 @@ def build_cuda_graph_runner(
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=warmup_stream):
         with torch.no_grad():
-            static_out = model(static_in)   # (N, 98, 3)
+            static_out = model(static_in)  # (N, 98, 3)
 
     def runner(x: torch.Tensor) -> torch.Tensor:
         static_in.copy_(x)

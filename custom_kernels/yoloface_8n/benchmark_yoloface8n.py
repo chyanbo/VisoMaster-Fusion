@@ -13,6 +13,7 @@ Optional env vars:
     WARMUP=10                      warm-up iterations
     ITERS=50                       timed iterations
 """
+
 from __future__ import annotations
 
 import os
@@ -26,12 +27,13 @@ import torch
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROOT     = pathlib.Path(__file__).parent.parent.parent
+ROOT = pathlib.Path(__file__).parent.parent.parent
 ONNX_DIR = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
-WARMUP   = int(os.environ.get("WARMUP", 10))
-ITERS    = int(os.environ.get("ITERS",  50))
+WARMUP = int(os.environ.get("WARMUP", 10))
+ITERS = int(os.environ.get("ITERS", 50))
 
 YOLO_ONNX = str(ONNX_DIR / "yoloface_8n.onnx")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,6 +56,7 @@ def _bench(fn, warmup: int = WARMUP, iters: int = ITERS) -> float:
 
 def _ort_session(onnx_path: str, provider: str = "CUDAExecutionProvider"):
     import onnxruntime as ort
+
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(onnx_path, sess_options=opts, providers=[provider])
@@ -69,15 +72,18 @@ def _print_row(tier, label, ms_val, ref_ms):
 # ---------------------------------------------------------------------------
 def _check_accuracy(ort_out: np.ndarray, pt_out: torch.Tensor) -> None:
     """Compare ORT FP32 output vs PyTorch FP16 output."""
-    a = ort_out.astype(np.float32)                # (1, 20, 8400)
+    a = ort_out.astype(np.float32)  # (1, 20, 8400)
     b = pt_out.cpu().numpy().astype(np.float32)
     if a.shape != b.shape:
         print(f"  Shape mismatch: ORT={a.shape} vs PT={b.shape}")
         return
 
     # Per-row check: [bbox(4), cls(1), kps(15)] — report per group
-    groups = [("bbox [0:4]", slice(0, 4)), ("cls  [4]",  slice(4, 5)),
-              ("kps  [5:]",  slice(5, 20))]
+    groups = [
+        ("bbox [0:4]", slice(0, 4)),
+        ("cls  [4]", slice(4, 5)),
+        ("kps  [5:]", slice(5, 20)),
+    ]
     print("\n  Numerical accuracy (FP16 PyTorch vs ORT FP32):")
     for name, sl in groups:
         diff = np.abs(a[0, sl, :] - b[0, sl, :])
@@ -90,35 +96,41 @@ def _check_accuracy(ort_out: np.ndarray, pt_out: torch.Tensor) -> None:
 # Main benchmark
 # ---------------------------------------------------------------------------
 def bench_yoloface8n():
-    print(f"\n=== yoloface_8n / YOLOv8n-face  (1,3,640,640) → (1,20,8400) ===")
+    print("\n=== yoloface_8n / YOLOv8n-face  (1,3,640,640) → (1,20,8400) ===")
     print(f"  warm-up={WARMUP}, iters={ITERS}\n")
     print(f"  {'Tier':<6} | {'Method':<46} | {'ms':>8} | {'speedup':>7}")
-    print(f"  {'-'*6}-+-{'-'*46}-+-{'-'*8}-+-{'-'*7}")
+    print(f"  {'-' * 6}-+-{'-' * 46}-+-{'-' * 8}-+-{'-' * 7}")
 
     inp_f32 = torch.rand(1, 3, 640, 640, dtype=torch.float32, device="cuda")
-    inp_np  = inp_f32.cpu().numpy()
+    inp_np = inp_f32.cpu().numpy()
 
     # ── Tier 0 — ORT FP32 CUDA EP ────────────────────────────────────────
     sess0 = _ort_session(YOLO_ONNX, "CUDAExecutionProvider")
-    in_name = sess0.get_inputs()[0].name   # "images"
+    in_name = sess0.get_inputs()[0].name  # "images"
     t0 = _bench(lambda: sess0.run(["output0"], {in_name: inp_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
     # ── Tier 0b — ORT TensorRT EP ─────────────────────────────────────────
     t0b = t0
     try:
-        import tensorrt  # registers nvinfer DLL path on Windows
+        pass  # registers nvinfer DLL path on Windows
     except Exception:
         pass
     import onnxruntime as ort
+
     if "TensorrtExecutionProvider" not in ort.get_available_providers():
-        print(f"  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)")
+        print(
+            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
+        )
     else:
         ctx = ROOT / "tensorrt-engines" / "yoloface_8n_ctx.onnx"
         if not ctx.exists():
-            print(f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})")
+            print(
+                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
+            )
         else:
             import os as _os
+
             _prev_cwd = _os.getcwd()
             _os.chdir(str(ROOT))
             trt_opts = {
@@ -134,11 +146,15 @@ def bench_yoloface8n():
             }
             so = ort.SessionOptions()
             so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = ort.InferenceSession(YOLO_ONNX, so, providers=[
-                ("TensorrtExecutionProvider", trt_opts),
-                ("CUDAExecutionProvider", {"device_id": "0"}),
-                ("CPUExecutionProvider", {}),
-            ])
+            sess0b = ort.InferenceSession(
+                YOLO_ONNX,
+                so,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider", {"device_id": "0"}),
+                    ("CPUExecutionProvider", {}),
+                ],
+            )
             _os.chdir(_prev_cwd)
             t0b = _bench(lambda: sess0b.run(["output0"], {in_name: inp_np}))
             _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
@@ -146,22 +162,27 @@ def bench_yoloface8n():
     # ── Tier 1 — PyTorch FP32 ────────────────────────────────────────────
     sys.path.insert(0, str(ROOT))
     from custom_kernels.yoloface_8n.yoloface8n_torch import (
-        YoloFace8nTorch, build_cuda_graph_runner,
+        YoloFace8nTorch,
+        build_cuda_graph_runner,
     )
 
-    m_fp32 = YoloFace8nTorch.from_onnx(YOLO_ONNX, compute_dtype=torch.float32).cuda().eval()
+    m_fp32 = (
+        YoloFace8nTorch.from_onnx(YOLO_ONNX, compute_dtype=torch.float32).cuda().eval()
+    )
     with torch.no_grad():
         t1 = _bench(lambda: m_fp32(inp_f32))
     _print_row("1", "PyTorch FP32 pure ops", t1, t0)
 
     # ── Tier 2 — PyTorch FP16 ─────────────────────────────────────────────
-    m_fp16 = YoloFace8nTorch.from_onnx(YOLO_ONNX, compute_dtype=torch.float16).cuda().eval()
+    m_fp16 = (
+        YoloFace8nTorch.from_onnx(YOLO_ONNX, compute_dtype=torch.float16).cuda().eval()
+    )
     with torch.no_grad():
         t2 = _bench(lambda: m_fp16(inp_f32))
     _print_row("2", "PyTorch FP16 (TensorCore conv dispatch)", t2, t0)
 
     # ── Accuracy check ────────────────────────────────────────────────────
-    ort_out = sess0.run(["output0"], {in_name: inp_np})[0]   # (1, 20, 8400)
+    ort_out = sess0.run(["output0"], {in_name: inp_np})[0]  # (1, 20, 8400)
     with torch.no_grad():
         pt_out = m_fp16(inp_f32)
     _check_accuracy(ort_out, pt_out)
@@ -170,7 +191,7 @@ def bench_yoloface8n():
     try:
         runner = build_cuda_graph_runner(m_fp16)
         with torch.no_grad():
-            _ = runner(inp_f32)   # trigger first-call (already captured in constructor)
+            _ = runner(inp_f32)  # trigger first-call (already captured in constructor)
         t3 = _bench(lambda: runner(inp_f32))
         _print_row("3", "FP16 + CUDA graph (single captured graph)", t3, t0)
     except Exception as e:
@@ -193,6 +214,7 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     try:
         import onnxruntime as ort
+
         print(f"ORT:     {ort.__version__}")
     except ImportError:
         print("ORT:     not available (skipping Tier 0/0b)")

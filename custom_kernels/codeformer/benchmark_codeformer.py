@@ -13,6 +13,7 @@ Optional env vars:
     WARMUP=10                      warm-up iterations
     ITERS=50                       timed iterations
 """
+
 from __future__ import annotations
 
 import os
@@ -25,12 +26,13 @@ import torch
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROOT      = pathlib.Path(__file__).parent.parent.parent
-ONNX_DIR  = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
-WARMUP    = int(os.environ.get("WARMUP", 10))
-ITERS     = int(os.environ.get("ITERS",  50))
+ROOT = pathlib.Path(__file__).parent.parent.parent
+ONNX_DIR = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
+WARMUP = int(os.environ.get("WARMUP", 10))
+ITERS = int(os.environ.get("ITERS", 50))
 
-CF_ONNX   = str(ONNX_DIR / "codeformer_fp16.onnx")
+CF_ONNX = str(ONNX_DIR / "codeformer_fp16.onnx")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,6 +55,7 @@ def _bench(fn, warmup=WARMUP, iters=ITERS) -> float:
 
 def _ort_session(onnx_path: str, provider: str = "CUDAExecutionProvider"):
     import onnxruntime as ort
+
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(onnx_path, sess_options=opts, providers=[provider])
@@ -70,37 +73,44 @@ def bench_codeformer():
     print("\n=== CodeFormer (1,3,512,512) -> (1,3,512,512) ===")
     print(f"  warm-up={WARMUP}, iters={ITERS}\n")
     print(f"  {'Tier':<6} | {'Method':<44} | {'ms':>8} | {'speedup':>7}")
-    print(f"  {'-'*6}-+-{'-'*44}-+-{'-'*8}-+-{'-'*7}")
+    print(f"  {'-' * 6}-+-{'-' * 44}-+-{'-' * 8}-+-{'-' * 7}")
 
-    inp     = torch.randn(1, 3, 512, 512, dtype=torch.float32, device="cuda")
-    inp_np  = inp.cpu().numpy()
-    w_val   = 0.5  # fidelity weight for all tiers
+    inp = torch.randn(1, 3, 512, 512, dtype=torch.float32, device="cuda")
+    inp_np = inp.cpu().numpy()
+    w_val = 0.5  # fidelity weight for all tiers
 
     # ── Tier 0 — ORT FP32 CUDA EP ────────────────────────────────────────
     import numpy as np
-    sess0   = _ort_session(CF_ONNX, "CUDAExecutionProvider")
-    in_name = sess0.get_inputs()[0].name     # "x"
-    w_name  = sess0.get_inputs()[1].name     # "w"  (float64 scalar)
+
+    sess0 = _ort_session(CF_ONNX, "CUDAExecutionProvider")
+    in_name = sess0.get_inputs()[0].name  # "x"
+    w_name = sess0.get_inputs()[1].name  # "w"  (float64 scalar)
     out_name = sess0.get_outputs()[0].name
-    w_np    = np.array([w_val], dtype=np.float64)
+    w_np = np.array([w_val], dtype=np.float64)
     t0 = _bench(lambda: sess0.run([out_name], {in_name: inp_np, w_name: w_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
     # ── Tier 0b — ORT TensorRT EP ─────────────────────────────────────────
     t0b = t0
     try:
-        import tensorrt  # registers nvinfer DLL path on Windows
+        pass  # registers nvinfer DLL path on Windows
     except Exception:
         pass
     import onnxruntime as _ort
+
     if "TensorrtExecutionProvider" not in _ort.get_available_providers():
-        print(f"  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)")
+        print(
+            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
+        )
     else:
         ctx = ROOT / "tensorrt-engines" / "codeformer_fp16_ctx.onnx"
         if not ctx.exists():
-            print(f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})")
+            print(
+                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
+            )
         else:
             import os as _os
+
             _prev_cwd = _os.getcwd()
             _os.chdir(str(ROOT))
             trt_opts = {
@@ -116,27 +126,39 @@ def bench_codeformer():
             }
             so = _ort.SessionOptions()
             so.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort.InferenceSession(CF_ONNX, so, providers=[
-                ("TensorrtExecutionProvider", trt_opts),
-                ("CUDAExecutionProvider", {"device_id": "0"}),
-                ("CPUExecutionProvider", {}),
-            ])
+            sess0b = _ort.InferenceSession(
+                CF_ONNX,
+                so,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider", {"device_id": "0"}),
+                    ("CPUExecutionProvider", {}),
+                ],
+            )
             _os.chdir(_prev_cwd)
-            t0b = _bench(lambda: sess0b.run([out_name], {in_name: inp_np, w_name: w_np}))
+            t0b = _bench(
+                lambda: sess0b.run([out_name], {in_name: inp_np, w_name: w_np})
+            )
             _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
 
     # ── Tier 1 — PyTorch FP32 ────────────────────────────────────────────
     sys.path.insert(0, str(ROOT))
     from custom_kernels.codeformer.codeformer_torch import (
-        CodeFormerTorch, build_cuda_graph_runner,
+        CodeFormerTorch,
+        build_cuda_graph_runner,
     )
-    cf_fp32 = CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float32).cuda().eval()
+
+    cf_fp32 = (
+        CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float32).cuda().eval()
+    )
     with torch.no_grad():
         t1 = _bench(lambda: cf_fp32(inp, fidelity_weight=w_val))
     _print_row("1", "PyTorch FP32 pure ops", t1, t0)
 
     # ── Tier 2 — PyTorch FP16 + Triton GroupNorm+SiLU ─────────────────────
-    cf_fp16 = CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float16).cuda().eval()
+    cf_fp16 = (
+        CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float16).cuda().eval()
+    )
     with torch.no_grad():
         t2 = _bench(lambda: cf_fp16(inp, fidelity_weight=w_val))
     _print_row("2", "PyTorch FP16 + Triton GroupNorm+SiLU", t2, t0)
@@ -155,10 +177,14 @@ def bench_codeformer():
     # ── Tier 4 — FP16 + Triton + SDPA 4D + GEMM + CUDA graph ──────────────
     t4 = t3
     try:
-        cf_gemm = CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float16).cuda().eval()
+        cf_gemm = (
+            CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float16)
+            .cuda()
+            .eval()
+        )
         cf_gemm.to_gemm_mode()
         with torch.no_grad():
-            _ = cf_gemm(inp, fidelity_weight=w_val)   # warm up JIT / cuDNN
+            _ = cf_gemm(inp, fidelity_weight=w_val)  # warm up JIT / cuDNN
         runner4 = build_cuda_graph_runner(cf_gemm, inp_shape=(1, 3, 512, 512))
         with torch.no_grad():
             _ = runner4(inp)
@@ -170,7 +196,11 @@ def bench_codeformer():
     # ── Tier 5 — FP16 + Triton + SDPA 4D + GEMM + NHWC + CUDA graph ───────
     t5 = t4
     try:
-        cf_cl = CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float16).cuda().eval()
+        cf_cl = (
+            CodeFormerTorch.from_onnx(CF_ONNX, compute_dtype=torch.float16)
+            .cuda()
+            .eval()
+        )
         cf_cl.to_channels_last().to_gemm_mode()
         with torch.no_grad():
             _ = cf_cl(inp, fidelity_weight=w_val)
@@ -202,11 +232,13 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     try:
         import triton
+
         print(f"Triton:  {triton.__version__}")
     except ImportError:
         print("Triton:  not available (GroupNorm PyTorch fallback will be used)")
     try:
         import onnxruntime as ort
+
         print(f"ORT:     {ort.__version__}")
     except ImportError:
         print("ORT:     not available (skipping Tier 0/0b)")

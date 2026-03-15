@@ -27,6 +27,7 @@ Usage:
     model = GPENTorch.from_onnx("model_assets/GPEN-BFR-512.onnx").cuda().eval()
     output = model(input_f32_cuda)   # [1,3,H,W] float32 in/out
 """
+
 from __future__ import annotations
 
 import importlib.util
@@ -46,32 +47,33 @@ import torch.nn.functional as F
 try:
     from custom_kernels.triton_ops import (
         TRITON_AVAILABLE as _TRITON_AVAILABLE,
-        triton_demod     as _triton_demod,
+        triton_demod as _triton_demod,
         triton_fused_gpen_act as _triton_gpen_act,
     )
 except Exception:
-    _TRITON_AVAILABLE  = False
-    _triton_demod      = None
-    _triton_gpen_act   = None
+    _TRITON_AVAILABLE = False
+    _triton_demod = None  # type: ignore[assignment]
+    _triton_gpen_act = None  # type: ignore[assignment]
 
 # ---------------------------------------------------------------------------
 # Reuse the fused demod kernel from gfpgan_v1_4
 # ---------------------------------------------------------------------------
 
-_GFPGAN_DIR       = Path(__file__).parent.parent / "gfpgan_v1_4"
+_GFPGAN_DIR = Path(__file__).parent.parent / "gfpgan_v1_4"
 _LEGACY_BUILD_DIR = _GFPGAN_DIR / "_demod_build"
-_EXT_NAME         = "gfpgan_demod_ext"
+_EXT_NAME = "gfpgan_demod_ext"
 # Primary location: multi-arch fat binary in model_assets/custom_kernels/
-_SHARED_DIR       = Path(__file__).parent.parent.parent / "model_assets" / "custom_kernels"
+_SHARED_DIR = Path(__file__).parent.parent.parent / "model_assets" / "custom_kernels"
 _SHARED_DIR.mkdir(parents=True, exist_ok=True)
 
-_ext_obj = False   # False = not tried, None = failed, module = loaded
+_ext_obj = False  # False = not tried, None = failed, module = loaded
 
 
 def _add_dll_dirs():
     if sys.platform == "win32":
         try:
             import torch as _t
+
             tlib = Path(_t.__file__).parent / "lib"
             if tlib.is_dir():
                 os.add_dll_directory(str(tlib))
@@ -85,9 +87,11 @@ def _try_load_pyd(pyd_path: Path, tag: str) -> bool:
         return False
     try:
         spec = importlib.util.spec_from_file_location(_EXT_NAME, str(pyd_path))
-        mod  = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        _ext_obj = mod
+        assert spec is not None
+        mod = importlib.util.module_from_spec(spec)
+        assert spec.loader is not None
+        spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        _ext_obj = mod  # type: ignore[assignment]
         print(f"[GPENTorch] Demod extension loaded ({tag}).")
         return True
     except Exception as e:
@@ -145,14 +149,33 @@ torch::Tensor fused_demod(torch::Tensor w,torch::Tensor s,float eps){
 }
 PYBIND11_MODULE(TORCH_EXTENSION_NAME,m){m.def("fused_demod",&fused_demod,"Fused demod");}
 """
+    import sys as _sys
+    import shutil as _shutil
+
+    if (
+        _sys.platform == "win32"
+        and _shutil.which("cl") is None
+        and _shutil.which("cl.exe") is None
+    ):
+        print(
+            "[GPENTorch] Demod CUDA extension not found and CL.exe is unavailable.\n"
+            "  Run: python custom_kernels/build_kernels.py  (requires Visual Studio Build Tools)\n"
+            "  -> Using pure-PyTorch demod fallback."
+        )
+        _ext_obj = None
+        return
     print("[GPENTorch] Compiling demod extension for current GPU (requires MSVC)...")
     try:
         from torch.utils.cpp_extension import load_inline
-        _ext_obj = load_inline(name=_EXT_NAME, cuda_sources=[_CUDA_SRC],
-                               cpp_sources=[_CPP_SRC],
-                               build_directory=str(_SHARED_DIR),
-                               extra_cuda_cflags=["--use_fast_math", "-O3"],
-                               verbose=False)
+
+        _ext_obj = load_inline(
+            name=_EXT_NAME,
+            cuda_sources=[_CUDA_SRC],
+            cpp_sources=[_CPP_SRC],
+            build_directory=str(_SHARED_DIR),
+            extra_cuda_cflags=["--use_fast_math", "-O3"],
+            verbose=False,
+        )
         print("[GPENTorch] Demod extension compiled and ready.")
     except Exception as e:
         print(f"[GPENTorch] Demod compile failed: {e}  -> using pure-PyTorch fallback.")
@@ -166,12 +189,14 @@ def _get_demod_fn():
     return None if _ext_obj is None else _ext_obj.fused_demod
 
 
-def _fused_demod(w: torch.Tensor, style: torch.Tensor,
-                 eps: float = 1e-8) -> torch.Tensor:
+def _fused_demod(
+    w: torch.Tensor, style: torch.Tensor, eps: float = 1e-8
+) -> torch.Tensor:
     # Priority 1: Triton (Windows-friendly, no MSVC needed)
     if _TRITON_AVAILABLE and _triton_demod is not None:
-        return _triton_demod(w.to(torch.float16).contiguous(),
-                             style.contiguous().float(), eps)
+        return _triton_demod(
+            w.to(torch.float16).contiguous(), style.contiguous().float(), eps
+        )
     # Priority 2: CUDA C++ extension (if pre-built or JIT-compiled)
     fn = _get_demod_fn()
     if fn is not None:
@@ -185,6 +210,7 @@ def _fused_demod(w: torch.Tensor, style: torch.Tensor,
 # ONNX weight extraction helpers
 # ---------------------------------------------------------------------------
 
+
 def _load_onnx_weights(path: str) -> dict:
     """
     Load all ONNX initializers by name, then attach additional positional
@@ -196,8 +222,7 @@ def _load_onnx_weights(path: str) -> dict:
     from onnx import numpy_helper
 
     m = onnx.load(path)
-    w = {i.name: numpy_helper.to_array(i).copy()
-         for i in m.graph.initializer}
+    w = {i.name: numpy_helper.to_array(i).copy() for i in m.graph.initializer}
     init_shapes = {k: v.shape for k, v in w.items()}
 
     # ── Detect model I/O sizes ──────────────────────────────────────────
@@ -207,7 +232,7 @@ def _load_onnx_weights(path: str) -> dict:
         if inp.type.HasField("tensor_type"):
             dims = [d.dim_value for d in inp.type.tensor_type.shape.dim]
             if len(dims) == 4:
-                in_shape = dims          # [1, 3, H, W]
+                in_shape = dims  # [1, 3, H, W]
                 break
     out_shape = None
     for outp in m.graph.output:
@@ -216,35 +241,35 @@ def _load_onnx_weights(path: str) -> dict:
             if len(dims) == 4:
                 out_shape = dims
                 break
-    w["_meta_in_hw"]  = np.array(in_shape[2:4]  if in_shape  else [0, 0])
+    w["_meta_in_hw"] = np.array(in_shape[2:4] if in_shape else [0, 0])
     w["_meta_out_hw"] = np.array(out_shape[2:4] if out_shape else [0, 0])
 
     # ── Collect Conv nodes (ignore 4×4 FIR blur convs that have no bias) ──
     # Encoder strided convs have shape [C_out, C_in, 3, 3] and bias [C_out]
-    enc_conv_weights: list = []   # (weight_key, bias_key)
-    enc_conv0_weight: Optional[str] = None   # 1×1 first layer
-    enc_conv0_bias:   Optional[str] = None
+    enc_conv_weights: list = []  # (weight_key, bias_key)
+    enc_conv0_weight: Optional[str] = None  # 1×1 first layer
+    enc_conv0_bias: Optional[str] = None
 
     for node in m.graph.node:
         if node.op_type != "Conv":
             continue
         if len(node.input) < 3:
-            continue       # FIR blur conv has only weight (no bias input)
-        wk  = node.input[1]
-        bk  = node.input[2]
+            continue  # FIR blur conv has only weight (no bias input)
+        wk = node.input[1]
+        bk = node.input[2]
         if wk not in init_shapes or bk not in init_shapes:
             continue
-        ws  = init_shapes[wk]
-        bs  = init_shapes[bk]
+        ws = init_shapes[wk]
+        bs = init_shapes[bk]
         if len(ws) != 4 or len(bs) != 1:
             continue
         C_out, C_in, kH, kW = ws
         if C_in == 1:
-            continue       # skip depthwise FIR kernels (they'd be [C,1,4,4])
+            continue  # skip depthwise FIR kernels (they'd be [C,1,4,4])
         if kH == 1 and kW == 1 and C_in == 3:
             # ecd0: 1×1 conv, 3 input channels
             enc_conv0_weight = wk
-            enc_conv0_bias   = bk
+            enc_conv0_bias = bk
         elif kH == 3 and kW == 3 and node.input[0].startswith("/ecd"):
             enc_conv_weights.append((wk, bk))
 
@@ -252,8 +277,8 @@ def _load_onnx_weights(path: str) -> dict:
         w["_enc0_w"] = w[enc_conv0_weight]
         w["_enc0_b"] = w[enc_conv0_bias]
     for i, (wk, bk) in enumerate(enc_conv_weights):
-        w[f"_enc{i+1}_w"] = w[wk]
-        w[f"_enc{i+1}_b"] = w[bk]
+        w[f"_enc{i + 1}_w"] = w[wk]
+        w[f"_enc{i + 1}_b"] = w[bk]
     w["_num_enc_strided"] = np.array(len(enc_conv_weights))
 
     # ── Bottleneck FC ────────────────────────────────────────────────────
@@ -303,7 +328,7 @@ def _load_onnx_weights(path: str) -> dict:
 
     # ── Generator conv weights (position order) ─────────────────────────
     # Identify Mul initializers with shape [1,C_out,C_in,kH,kW]
-    gen_mul_keys:  list = []   # (key, C_out, C_in, kH, kW)
+    gen_mul_keys: list = []  # (key, C_out, C_in, kH, kW)
     for node in m.graph.node:
         if node.op_type != "Mul":
             continue
@@ -313,20 +338,23 @@ def _load_onnx_weights(path: str) -> dict:
                 if sh[0] == 1:
                     gen_mul_keys.append((inp, sh[1], sh[2], sh[3], sh[4]))
 
-    w["_gen_mul_keys"] = gen_mul_keys   # list kept for reference
+    w["_gen_mul_keys"] = gen_mul_keys  # type: ignore[assignment]  # list kept for reference
 
     # ── Generator modulation Gemms ────────────────────────────────────────
     # Detect by first input being a Gather output ("/generator/Gather_*").
     # This uniquely identifies modulation Gemms (style MLP Gemms use /style/
     # paths and the FC uses Reshape inputs).
-    gen_mod_pairs: list = []   # (mod_w_key, mod_b_key_or_None)
+    gen_mod_pairs: list = []  # (mod_w_key, mod_b_key_or_None)
     for node in m.graph.node:
         if node.op_type not in ("Gemm", "MatMul"):
             continue
         if not node.input:
             continue
         first_input = node.input[0]
-        if "/generator/Gather" not in first_input and "Gather_output" not in first_input:
+        if (
+            "/generator/Gather" not in first_input
+            and "Gather_output" not in first_input
+        ):
             continue
         wk = node.input[1] if len(node.input) > 1 else ""
         if wk not in init_shapes:
@@ -353,7 +381,9 @@ def _load_onnx_weights(path: str) -> dict:
     act_bias_keys: list = []
     in_generator = False
     for node in m.graph.node:
-        if "/generator/" in "".join(node.input) or "/generator/" in "".join(node.output):
+        if "/generator/" in "".join(node.input) or "/generator/" in "".join(
+            node.output
+        ):
             in_generator = True
         if not in_generator:
             continue
@@ -394,7 +424,7 @@ def _load_onnx_weights(path: str) -> dict:
     if "generator.conv1.noise.weight" in w:
         w[f"_noise{_noise_idx}"] = w["generator.conv1.noise.weight"]
         _noise_idx += 1
-    for _ci in range(200):   # up to 200 generator convs
+    for _ci in range(200):  # up to 200 generator convs
         nk = f"generator.convs.{_ci}.noise.weight"
         if nk not in w:
             break
@@ -408,15 +438,21 @@ def _load_onnx_weights(path: str) -> dict:
 # GPENTorch
 # ---------------------------------------------------------------------------
 
+
 class GPENTorch(torch.nn.Module):
     """
     FP16 PyTorch reimplementation of GPEN-BFR.
     Supports 256/512/1024/2048 output sizes.
     """
 
-    def __init__(self, in_size: int, out_size: int,
-                 n_enc: int, n_loop: int,
-                 compute_dtype: torch.dtype = torch.float16):
+    def __init__(
+        self,
+        in_size: int,
+        out_size: int,
+        n_enc: int,
+        n_loop: int,
+        compute_dtype: torch.dtype = torch.float16,
+    ):
         """
         in_size:       spatial input H (= W), e.g. 256 or 512
         out_size:      spatial output H (= W), e.g. 256, 512, 1024, 2048
@@ -425,21 +461,22 @@ class GPENTorch(torch.nn.Module):
         compute_dtype: torch.float16 (fast) or torch.float32 (reference)
         """
         super().__init__()
-        self.in_size       = in_size
-        self.out_size      = out_size
-        self.n_enc         = n_enc
-        self.n_loop        = n_loop
+        self.in_size = in_size
+        self.out_size = out_size
+        self.n_enc = n_enc
+        self.n_loop = n_loop
         self.compute_dtype = compute_dtype
 
     @classmethod
-    def from_onnx(cls, onnx_path: str,
-                  compute_dtype: torch.dtype = torch.float16) -> "GPENTorch":
+    def from_onnx(
+        cls, onnx_path: str, compute_dtype: torch.dtype = torch.float16
+    ) -> "GPENTorch":
         w = _load_onnx_weights(onnx_path)
 
-        in_hw   = int(w["_meta_in_hw"][0])
-        out_hw  = int(w["_meta_out_hw"][0])
-        n_enc   = int(w["_num_enc_strided"])
-        n_loop  = int(math.log2(out_hw)) - 2   # 4×4 → out_hw
+        in_hw = int(w["_meta_in_hw"][0])
+        out_hw = int(w["_meta_out_hw"][0])
+        n_enc = int(w["_num_enc_strided"])
+        n_loop = int(math.log2(out_hw)) - 2  # 4×4 → out_hw
 
         model = cls(in_hw, out_hw, n_enc, n_loop, compute_dtype)
         model._load_weights(w)
@@ -450,7 +487,7 @@ class GPENTorch(torch.nn.Module):
     # ------------------------------------------------------------------
 
     def _load_weights(self, w: dict):
-        rb     = self.register_buffer
+        rb = self.register_buffer
         cdtype = self.compute_dtype
 
         def h(k):
@@ -474,15 +511,17 @@ class GPENTorch(torch.nn.Module):
         # ── Bottleneck linear (FP32 for accuracy) ────────────────────────
         # ONNX Gemm stores weight as [in, out] (A @ B format);
         # F.linear needs [out, in], so transpose.
-        rb("fc_w", f32("_fc_w").T.contiguous())   # MatMul A@B: B[in,out] → T → [out,in]
+        rb("fc_w", f32("_fc_w").T.contiguous())  # MatMul A@B: B[in,out] → T → [out,in]
         rb("fc_b", f32("_fc_b").squeeze())
 
         # ── Style MLP (FP32) ─────────────────────────────────────────────
         # ONNX Gemm with transB=0: C = A @ B (NOT A @ B^T).
         # F.linear computes x @ W.T, so we must store W = B.T.
-        n_mlp = int(w["_num_mlp"].item() if hasattr(w["_num_mlp"], 'item') else w["_num_mlp"])
+        n_mlp = int(
+            w["_num_mlp"].item() if hasattr(w["_num_mlp"], "item") else w["_num_mlp"]
+        )
         for i in range(n_mlp):
-            rb(f"mlp{i}_w", f32(f"_mlp{i}_w").T.contiguous())   # transB=0 → need .T
+            rb(f"mlp{i}_w", f32(f"_mlp{i}_w").T.contiguous())  # transB=0 → need .T
             rb(f"mlp{i}_b", f32(f"_mlp{i}_b").squeeze())
         self._n_mlp = n_mlp
 
@@ -492,7 +531,11 @@ class GPENTorch(torch.nn.Module):
         # ── Generator modulation weights (FP32 for accuracy) ─────────────
         # ONNX Gemm with transB=1: weight [C_mod, 512] already in [out, in]
         # format for F.linear(style[1,512], W[C_mod,512]) → [1, C_mod].
-        n_mods  = int(w["_num_gen_mods"].item() if hasattr(w["_num_gen_mods"], 'item') else w["_num_gen_mods"])
+        n_mods = int(
+            w["_num_gen_mods"].item()
+            if hasattr(w["_num_gen_mods"], "item")
+            else w["_num_gen_mods"]
+        )
         conv1_mod_b_key = "generator.conv1.conv.modulation.bias"
         rb("gmod0_w", f32("_gmod0_w"))
         if conv1_mod_b_key in w:
@@ -505,26 +548,33 @@ class GPENTorch(torch.nn.Module):
         self._n_mods = n_mods
 
         # ── Generator conv kernels ────────────────────────────────────────
-        gen_mul_keys = w["_gen_mul_keys"]   # list of (key, C_out, C_in, kH, kW)
+        gen_mul_keys = w["_gen_mul_keys"]  # list of (key, C_out, C_in, kH, kW)
         for i, (k, C_out, C_in, kH, kW) in enumerate(gen_mul_keys):
             rb(f"gconv{i}_w", h(k))
         self._n_gconv = len(gen_mul_keys)
         # Record shapes for index lookup
-        self._gconv_shapes = [(C_out, C_in, kH, kW)
-                              for (_, C_out, C_in, kH, kW) in gen_mul_keys]
+        self._gconv_shapes = [
+            (C_out, C_in, kH, kW) for (_, C_out, C_in, kH, kW) in gen_mul_keys
+        ]
 
         # ── Activate biases ───────────────────────────────────────────────
-        n_gact = int(w["_num_gact"].item() if hasattr(w["_num_gact"], 'item') else w["_num_gact"])
+        n_gact = int(
+            w["_num_gact"].item() if hasattr(w["_num_gact"], "item") else w["_num_gact"]
+        )
         for i in range(n_gact):
             rb(f"gact{i}", h(f"_gact{i}"))
         self._n_gact = n_gact
 
         # ── to_rgb biases [3] ─────────────────────────────────────────────
-        n_trgb = int(w["_num_trgb"].item() if hasattr(w["_num_trgb"], 'item') else w["_num_trgb"])
+        n_trgb = int(
+            w["_num_trgb"].item() if hasattr(w["_num_trgb"], "item") else w["_num_trgb"]
+        )
         for i in range(n_trgb):
             arr = w[f"_trgb_b{i}"]
-            rb(f"trgb_b{i}",
-               torch.from_numpy(arr).to(cdtype).view(1, 3, 1, 1).contiguous())
+            rb(
+                f"trgb_b{i}",
+                torch.from_numpy(arr).to(cdtype).view(1, 3, 1, 1).contiguous(),
+            )
         self._n_trgb = n_trgb
 
         # ── Noise (encoder-feature injection) weights ─────────────────────
@@ -532,26 +582,55 @@ class GPENTorch(torch.nn.Module):
         n_styled = 1 + 2 * self.n_loop
         for i in range(n_styled):
             nk = f"_noise{i}"
-            val = (torch.from_numpy(w[nk]).to(cdtype).contiguous()
-                   if nk in w else None)
+            val = torch.from_numpy(w[nk]).to(cdtype).contiguous() if nk in w else None
             rb(f"noise{i}", val)
 
         # ── FIR kernels ───────────────────────────────────────────────────
         # Encoder FIR: [1,3,3,1]/8 outer product /8 = bilinear blur for downsample
-        _enc_fir = torch.tensor([
-            0.015625, 0.046875, 0.046875, 0.015625,
-            0.046875, 0.140625, 0.140625, 0.046875,
-            0.046875, 0.140625, 0.140625, 0.046875,
-            0.015625, 0.046875, 0.046875, 0.015625,
-        ], dtype=cdtype).view(1, 1, 4, 4)
+        _enc_fir = torch.tensor(
+            [
+                0.015625,
+                0.046875,
+                0.046875,
+                0.015625,
+                0.046875,
+                0.140625,
+                0.140625,
+                0.046875,
+                0.046875,
+                0.140625,
+                0.140625,
+                0.046875,
+                0.015625,
+                0.046875,
+                0.046875,
+                0.015625,
+            ],
+            dtype=cdtype,
+        ).view(1, 1, 4, 4)
         rb("enc_fir", _enc_fir)
         # Generator FIR: [1,3,3,1]/4 outer product /4 = bilinear blur for upsample
-        _gen_fir = torch.tensor([
-            0.0625, 0.1875, 0.1875, 0.0625,
-            0.1875, 0.5625, 0.5625, 0.1875,
-            0.1875, 0.5625, 0.5625, 0.1875,
-            0.0625, 0.1875, 0.1875, 0.0625,
-        ], dtype=cdtype).view(1, 1, 4, 4)
+        _gen_fir = torch.tensor(
+            [
+                0.0625,
+                0.1875,
+                0.1875,
+                0.0625,
+                0.1875,
+                0.5625,
+                0.5625,
+                0.1875,
+                0.1875,
+                0.5625,
+                0.5625,
+                0.1875,
+                0.0625,
+                0.1875,
+                0.1875,
+                0.0625,
+            ],
+            dtype=cdtype,
+        ).view(1, 1, 4, 4)
         rb("gen_fir", _gen_fir)
 
         # ── Build index maps (fixed once we know shapes) ──────────────────
@@ -596,10 +675,10 @@ class GPENTorch(torch.nn.Module):
         Input  [1, C, H, W]  →  Output [1, C, H+1, W+1]
         After this, apply strided 3×3 enc conv with stride=2, padding=0.
         """
-        C   = x.shape[1]
+        C = x.shape[1]
         fir = self._buffers["enc_fir"].expand(C, 1, 4, 4)
-        x   = F.pad(x, (2, 2, 2, 2))         # [1, C, H+4, W+4]
-        return F.conv2d(x, fir, groups=C)     # [1, C, H+1, W+1]
+        x = F.pad(x, (2, 2, 2, 2))  # [1, C, H+4, W+4]
+        return F.conv2d(x, fir, groups=C)  # [1, C, H+1, W+1]
 
     def _gen_fir_blur(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -610,51 +689,52 @@ class GPENTorch(torch.nn.Module):
         H+2 - 4 + 1 = H - 1. So output is H-1.
         For conv_transpose output of 9 → pad→11 → fir→8:  9+2-4+1=8. ✓
         """
-        C   = x.shape[1]
+        C = x.shape[1]
         fir = self._buffers["gen_fir"].expand(C, 1, 4, 4)
-        x   = F.pad(x, (1, 1, 1, 1))         # [1, C, H+2, W+2]
-        return F.conv2d(x, fir, groups=C)     # [1, C, H-1, W-1]
+        x = F.pad(x, (1, 1, 1, 1))  # [1, C, H+2, W+2]
+        return F.conv2d(x, fir, groups=C)  # [1, C, H-1, W-1]
 
     # ------------------------------------------------------------------
     # Primitive helpers
     # ------------------------------------------------------------------
 
-    def _styled_conv(self,
-                     x:         torch.Tensor,   # [1, C_in,  H,  W]  FP16
-                     gconv_idx: int,            # index into gconv* buffers
-                     gmod_idx:  int,            # index into gmod* buffers
-                     gact_idx:  int,            # index into gact* buffers
-                     latent:    torch.Tensor,   # [1, 512] FP32
-                     enc_feat:  torch.Tensor,   # [1, C_out, H', W'] FP16
-                     noise_w:   Optional[torch.Tensor],  # scalar [1] FP16 or None
-                     upsample:  bool = False,
-                     ) -> torch.Tensor:
+    def _styled_conv(
+        self,
+        x: torch.Tensor,  # [1, C_in,  H,  W]  FP16
+        gconv_idx: int,  # index into gconv* buffers
+        gmod_idx: int,  # index into gmod* buffers
+        gact_idx: int,  # index into gact* buffers
+        latent: torch.Tensor,  # [1, 512] FP32
+        enc_feat: torch.Tensor,  # [1, C_out, H', W'] FP16
+        noise_w: Optional[torch.Tensor],  # scalar [1] FP16 or None
+        upsample: bool = False,
+    ) -> torch.Tensor:
         """
         Modulated conv (with demod) + noise-inject via Concat + activate.
         Returns [1, 2*C_out, H', W'].
         """
         g = self._buffers
 
-        weight  = g[f"gconv{gconv_idx}_w"]   # [1, C_out, C_in, kH, kW] FP16
-        mod_w   = g[f"gmod{gmod_idx}_w"]     # [C_in, 512] FP32
-        mod_b   = g[f"gmod{gmod_idx}_b"]     # [C_in] FP32
-        act_b   = g[f"gact{gact_idx}"]       # [1, 2*C_out, 1, 1] FP16
+        weight = g[f"gconv{gconv_idx}_w"]  # [1, C_out, C_in, kH, kW] FP16
+        mod_w = g[f"gmod{gmod_idx}_w"]  # [C_in, 512] FP32
+        mod_b = g[f"gmod{gmod_idx}_b"]  # [C_in] FP32
+        act_b = g[f"gact{gact_idx}"]  # [1, 2*C_out, 1, 1] FP16
 
-        C_out = weight.shape[1]
-        C_in  = weight.shape[2]
-        kH    = weight.shape[3]
+        _C_out = weight.shape[1]
+        _C_in = weight.shape[2]
+        kH = weight.shape[3]
 
         # Modulation: style [1, C_in]
-        style  = F.linear(latent, mod_w, mod_b)     # [1, C_in] FP32
-        w_f32  = weight[0].float()                  # [C_out, C_in, kH, kW]
-        w_dem  = _fused_demod(w_f32, style[0]).to(self.compute_dtype)
+        style = F.linear(latent, mod_w, mod_b)  # [1, C_in] FP32
+        w_f32 = weight[0].float()  # [C_out, C_in, kH, kW]
+        w_dem = _fused_demod(w_f32, style[0]).to(self.compute_dtype)
 
         if upsample:
             # GPEN uses ConvTranspose (stride=2, no-pad) then FIR anti-alias blur.
             # Transpose kernel [C_out, C_in, kH, kW] → [C_in, C_out, kH, kW].
             w_up = w_dem.permute(1, 0, 2, 3).contiguous()  # [C_in, C_out, kH, kW]
-            out  = F.conv_transpose2d(x, w_up, stride=2, padding=0)
-            out  = self._gen_fir_blur(out)          # [1, C_out, 2H, 2H]
+            out = F.conv_transpose2d(x, w_up, stride=2, padding=0)
+            out = self._gen_fir_blur(out)  # [1, C_out, 2H, 2H]
         else:
             out = F.conv2d(x, w_dem, padding=kH // 2)  # [1, C_out, H', W']
 
@@ -666,44 +746,53 @@ class GPENTorch(torch.nn.Module):
         else:
             noise_term = torch.zeros_like(out)
 
-        if _TRITON_AVAILABLE and _triton_gpen_act is not None and out.dtype == torch.float16:
+        if (
+            _TRITON_AVAILABLE
+            and _triton_gpen_act is not None
+            and out.dtype == torch.float16
+        ):
             # Triton kernel now handles broadcasting of noise_term and act_b internally
-            return _triton_gpen_act(out, noise_term, act_b, 0.2, 2.0 ** 0.5)
+            return _triton_gpen_act(out, noise_term, act_b, 0.2, 2.0**0.5)
 
-        doubled = torch.cat([out, noise_term], dim=1)   # [1, 2*C_out, H', W']
+        doubled = torch.cat([out, noise_term], dim=1)  # [1, 2*C_out, H', W']
         doubled = doubled + act_b
         doubled = F.leaky_relu(doubled, 0.2)
-        doubled = doubled * (2.0 ** 0.5)
+        doubled = doubled * (2.0**0.5)
         return doubled
 
-    def _torgb_conv(self,
-                    x:         torch.Tensor,   # [1, C_in, H, W] FP16  (2*C_out from styled conv)
-                    gconv_idx: int,
-                    gmod_idx:  int,
-                    trgb_idx:  int,
-                    latent:    torch.Tensor,   # [1, 512] FP32
-                    skip:      Optional[torch.Tensor] = None,
-                    ) -> torch.Tensor:
+    def _torgb_conv(
+        self,
+        x: torch.Tensor,  # [1, C_in, H, W] FP16  (2*C_out from styled conv)
+        gconv_idx: int,
+        gmod_idx: int,
+        trgb_idx: int,
+        latent: torch.Tensor,  # [1, 512] FP32
+        skip: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         to-RGB 1×1 modulated conv (no demod) + bias + optional skip upsample.
         """
         g = self._buffers
 
-        weight = g[f"gconv{gconv_idx}_w"]   # [1, 3, C_in, 1, 1] FP16
-        mod_w  = g[f"gmod{gmod_idx}_w"]     # [C_in, 512] FP32
-        mod_b  = g[f"gmod{gmod_idx}_b"]     # [C_in] FP32
-        bias   = g[f"trgb_b{trgb_idx}"]     # [1, 3, 1, 1] FP16
+        weight = g[f"gconv{gconv_idx}_w"]  # [1, 3, C_in, 1, 1] FP16
+        mod_w = g[f"gmod{gmod_idx}_w"]  # [C_in, 512] FP32
+        mod_b = g[f"gmod{gmod_idx}_b"]  # [C_in] FP32
+        bias = g[f"trgb_b{trgb_idx}"]  # [1, 3, 1, 1] FP16
 
         C_in = weight.shape[2]
 
-        style  = F.linear(latent, mod_w, mod_b)   # [1, C_in] FP32
-        w_comp = (weight[0].float() * style[0].view(1, C_in, 1, 1)).to(self.compute_dtype)
+        style = F.linear(latent, mod_w, mod_b)  # [1, C_in] FP32
+        w_comp = (weight[0].float() * style[0].view(1, C_in, 1, 1)).to(
+            self.compute_dtype
+        )
 
-        rgb = F.conv2d(x, w_comp) + bias           # [1, 3, H, W]
+        rgb = F.conv2d(x, w_comp) + bias  # [1, 3, H, W]
 
         if skip is not None:
-            skip = F.interpolate(skip, scale_factor=2, mode='bilinear', align_corners=False)
-            rgb  = rgb + skip
+            skip = F.interpolate(
+                skip, scale_factor=2, mode="bilinear", align_corners=False
+            )
+            rgb = rgb + skip
 
         return rgb
 
@@ -716,42 +805,51 @@ class GPENTorch(torch.nn.Module):
         x:       [1, 3, H, W] float32 CUDA
         returns: [1, 3, H, W] float32 CUDA  (H = W = out_size)
         """
-        x  = x.to(self.compute_dtype)
-        g  = self._buffers
+        x = x.to(self.compute_dtype)
+        g = self._buffers
 
-        _SQRT2 = 2.0 ** 0.5
+        _SQRT2 = 2.0**0.5
 
         # ── Encoder ───────────────────────────────────────────────────────
         # ecd0: 1×1 conv (no downsample): Conv → LeakyRelu → Mul(sqrt(2))
         feat = F.leaky_relu(F.conv2d(x, g["enc0_w"], g["enc0_b"]), 0.2) * _SQRT2
-        enc_feats: List[torch.Tensor] = [feat]   # enc_feats[0] = ecd0 output
+        enc_feats: List[torch.Tensor] = [feat]  # enc_feats[0] = ecd0 output
 
         # ecd1..N: FIR blur (pad 2 + depthwise 4×4) → 3×3 strided conv no-pad
         # ONNX: FIR(x) → [1,C,H+1,W+1] → Conv(stride=2,pad=0) → [1,C_out,H/2,W/2]
         for i in range(1, self.n_enc + 1):
-            feat_fir = self._enc_fir_down(feat)   # [1, C, H+1, W+1]
-            feat = F.leaky_relu(
-                F.conv2d(feat_fir, g[f"enc{i}_w"], g[f"enc{i}_b"],
-                         stride=2, padding=0), 0.2) * _SQRT2
+            feat_fir = self._enc_fir_down(feat)  # [1, C, H+1, W+1]
+            feat = (
+                F.leaky_relu(
+                    F.conv2d(
+                        feat_fir, g[f"enc{i}_w"], g[f"enc{i}_b"], stride=2, padding=0
+                    ),
+                    0.2,
+                )
+                * _SQRT2
+            )
             enc_feats.append(feat)
         # enc_feats ordering: [ecd0, ecd1, ..., ecd_N]  (deepest = last)
 
         # ── Bottleneck linear ─────────────────────────────────────────────
         # ONNX: Gemm → LeakyRelu → Mul(sqrt(2))  (NOT just a linear layer)
-        feat_flat = feat.float().view(1, -1)   # flatten 4×4 deepest feat
+        feat_flat = feat.float().view(1, -1)  # flatten 4×4 deepest feat
         z = F.leaky_relu(F.linear(feat_flat, g["fc_w"], g["fc_b"]), 0.2) * _SQRT2
 
         # ── Style MLP ─────────────────────────────────────────────────────
         # Input: pixel normalization of FC output (normalize to unit RMS)
         # Each layer: Gemm → LeakyRelu → Mul(sqrt(2))
-        rms   = torch.sqrt(z.pow(2).mean(dim=1, keepdim=True) + 1e-9)
+        rms = torch.sqrt(z.pow(2).mean(dim=1, keepdim=True) + 1e-9)
         style = z / rms
         for i in range(self._n_mlp):
-            style = F.leaky_relu(F.linear(style, g[f"mlp{i}_w"], g[f"mlp{i}_b"]), 0.2) * _SQRT2
+            style = (
+                F.leaky_relu(F.linear(style, g[f"mlp{i}_w"], g[f"mlp{i}_b"]), 0.2)
+                * _SQRT2
+            )
         # style: [1, 512]
 
         # Single style vector, tiled to [1, n_latents, 512]
-        latent = style.unsqueeze(1).expand(1, self._n_latents, 512)   # all same
+        latent = style.unsqueeze(1).expand(1, self._n_latents, 512)  # all same
 
         # ── StyleGAN2 Generator ───────────────────────────────────────────
         # Encoder features are injected deepest-first:
@@ -784,52 +882,75 @@ class GPENTorch(torch.nn.Module):
         # Noise ordering: _noise0=conv1, _noise1=convs.0, _noise2=convs.1, ...
 
         # conv1 (4×4)
-        enc_feat = enc_feats[self.n_enc].to(self.compute_dtype)   # deepest
-        nw       = g.get("noise0")
-        sg = self._styled_conv(sg, gconv_idx=0, gmod_idx=0, gact_idx=0,
-                               latent=latent[:, 0], enc_feat=enc_feat,
-                               noise_w=nw, upsample=False)
+        enc_feat = enc_feats[self.n_enc].to(self.compute_dtype)  # deepest
+        nw = g.get("noise0")
+        sg = self._styled_conv(
+            sg,
+            gconv_idx=0,
+            gmod_idx=0,
+            gact_idx=0,
+            latent=latent[:, 0],
+            enc_feat=enc_feat,
+            noise_w=nw,
+            upsample=False,
+        )
         # sg: [1, 2*C_const, 4, 4]
 
         # to_rgb1
-        skip_rgb = self._torgb_conv(sg, gconv_idx=1, gmod_idx=1, trgb_idx=0,
-                                    latent=latent[:, 1])
+        skip_rgb = self._torgb_conv(
+            sg, gconv_idx=1, gmod_idx=1, trgb_idx=0, latent=latent[:, 1]
+        )
 
         for li in range(self.n_loop):
-            enc_depth = self.n_enc - 1 - li   # enc feature for this resolution
-            enc_feat  = enc_feats[enc_depth].to(self.compute_dtype)
+            enc_depth = self.n_enc - 1 - li  # enc feature for this resolution
+            enc_feat = enc_feats[enc_depth].to(self.compute_dtype)
 
-            ci_up   = 2 + li * 3    # gconv/gmod for convs[2*li]   (upsample)
-            ci_same = 3 + li * 3    # gconv/gmod for convs[2*li+1] (same-res)
-            ci_trgb = 4 + li * 3    # gconv/gmod for to_rgbs[li]
+            ci_up = 2 + li * 3  # gconv/gmod for convs[2*li]   (upsample)
+            ci_same = 3 + li * 3  # gconv/gmod for convs[2*li+1] (same-res)
+            ci_trgb = 4 + li * 3  # gconv/gmod for to_rgbs[li]
 
-            lat_up   = 2 * li + 1   # latent[1,3,5,7,9,11]
-            lat_same = 2 * li + 2   # latent[2,4,6,8,10,12]
-            lat_trgb = 2 * li + 3   # latent[3,5,7,9,11,13]
+            lat_up = 2 * li + 1  # latent[1,3,5,7,9,11]
+            lat_same = 2 * li + 2  # latent[2,4,6,8,10,12]
+            lat_trgb = 2 * li + 3  # latent[3,5,7,9,11,13]
 
-            noise_up   = 1 + li * 2    # _noise1,3,5,7,9,11
-            noise_same = 2 + li * 2    # _noise2,4,6,8,10,12
+            noise_up = 1 + li * 2  # _noise1,3,5,7,9,11
+            noise_same = 2 + li * 2  # _noise2,4,6,8,10,12
 
-            gact_up   = 1 + li * 2
+            gact_up = 1 + li * 2
             gact_same = 2 + li * 2
 
             nw = g.get(f"noise{noise_up}")
-            sg = self._styled_conv(sg,
-                                   gconv_idx=ci_up, gmod_idx=ci_up, gact_idx=gact_up,
-                                   latent=latent[:, lat_up], enc_feat=enc_feat,
-                                   noise_w=nw, upsample=True)
+            sg = self._styled_conv(
+                sg,
+                gconv_idx=ci_up,
+                gmod_idx=ci_up,
+                gact_idx=gact_up,
+                latent=latent[:, lat_up],
+                enc_feat=enc_feat,
+                noise_w=nw,
+                upsample=True,
+            )
 
             nw = g.get(f"noise{noise_same}")
-            sg = self._styled_conv(sg,
-                                   gconv_idx=ci_same, gmod_idx=ci_same, gact_idx=gact_same,
-                                   latent=latent[:, lat_same], enc_feat=enc_feat,
-                                   noise_w=nw, upsample=False)
+            sg = self._styled_conv(
+                sg,
+                gconv_idx=ci_same,
+                gmod_idx=ci_same,
+                gact_idx=gact_same,
+                latent=latent[:, lat_same],
+                enc_feat=enc_feat,
+                noise_w=nw,
+                upsample=False,
+            )
 
-            skip_rgb = self._torgb_conv(sg,
-                                        gconv_idx=ci_trgb, gmod_idx=ci_trgb,
-                                        trgb_idx=1 + li,
-                                        latent=latent[:, lat_trgb],
-                                        skip=skip_rgb)
+            skip_rgb = self._torgb_conv(
+                sg,
+                gconv_idx=ci_trgb,
+                gmod_idx=ci_trgb,
+                trgb_idx=1 + li,
+                latent=latent[:, lat_trgb],
+                skip=skip_rgb,
+            )
 
         return skip_rgb.float()
 
@@ -838,8 +959,8 @@ class GPENTorch(torch.nn.Module):
 # CUDA Graph runner  (same API as GFPGAN)
 # ---------------------------------------------------------------------------
 
-def build_cuda_graph_runner(model: GPENTorch,
-                             inp_shape: tuple):
+
+def build_cuda_graph_runner(model: GPENTorch, inp_shape: tuple):
     """
     Capture model() as a CUDAGraph for repeated fixed-shape inference.
     Returns a callable: (x: float32 CUDA) → float32 CUDA.

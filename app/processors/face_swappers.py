@@ -24,7 +24,10 @@ class FaceSwappers:
         )  # serialises lazy-init + CUDA graph capture
         self._custom_inference_lock = (
             threading.Lock()
-        )  # serialises parallel inference for CUDA-graph runners
+        )  # serialises parallel inference for CUDA-graph runners (B=1 CUDA graph path)
+        self._batched_inference_lock = (
+            threading.Lock()
+        )  # serialises concurrent eager forward() calls in run_inswapper_batched
         self._inswapper_torch = (
             None  # InSwapperTorch instance (PyTorch-native inference)
         )
@@ -137,43 +140,47 @@ class FaceSwappers:
         """
         if self._w600k_runner is not None:
             return self._w600k_runner
-        with self._inswapper_init_lock:
-            if self._w600k_runner is not None:
-                return self._w600k_runner
-            if self._w600k_torch is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for ArcFace (w600k).\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._inswapper_init_lock:
+                if self._w600k_runner is not None:
+                    return self._w600k_runner
+                if self._w600k_torch is None:
+                    try:
+                        import pathlib
+                        from custom_kernels.w600k_r50.w600k_r50_torch import (
+                            IResNet50Torch,
+                        )
+
+                        onnx_path = str(
+                            pathlib.Path(__file__).parent.parent.parent
+                            / "model_assets"
+                            / "w600k_r50.onnx"
+                        )
+                        m = (
+                            IResNet50Torch.from_onnx(onnx_path)
+                            .to(self.models_processor.device)
+                            .eval()
+                        )
+                        self._w600k_torch = m
+                    except Exception as e:
+                        print(f"[Custom] w600k_r50 load failed: {e}")
+                        return None
                 try:
-                    import pathlib
-                    from custom_kernels.w600k_r50.w600k_r50_torch import IResNet50Torch
+                    from custom_kernels.w600k_r50.w600k_r50_torch import (
+                        build_cuda_graph_runner,
+                    )
 
-                    onnx_path = str(
-                        pathlib.Path(__file__).parent.parent.parent
-                        / "model_assets"
-                        / "w600k_r50.onnx"
-                    )
-                    m = (
-                        IResNet50Torch.from_onnx(onnx_path)
-                        .to(self.models_processor.device)
-                        .eval()
-                    )
-                    self._w600k_torch = m
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._w600k_runner = build_cuda_graph_runner(self._w600k_torch)
                 except Exception as e:
-                    print(f"[Custom] w600k_r50 load failed: {e}")
-                    return None
-            try:
-                from custom_kernels.w600k_r50.w600k_r50_torch import (
-                    build_cuda_graph_runner,
-                )
-
-                self.models_processor.show_build_dialog.emit(
-                    "Finalizing Custom Provider",
-                    "Capturing CUDA graph for ArcFace (w600k).\nThis only happens once and improves performance.",
-                )
-                self._w600k_runner = build_cuda_graph_runner(self._w600k_torch)
-            except Exception as e:
-                print(f"[Custom] w600k_r50 graph runner failed, using eager: {e}")
-                self._w600k_runner = self._w600k_torch
-            finally:
-                self.models_processor.hide_build_dialog.emit()
+                    print(f"[Custom] w600k_r50 graph runner failed, using eager: {e}")
+                    self._w600k_runner = self._w600k_torch
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._w600k_runner
 
     def run_recognize_direct(
@@ -323,9 +330,13 @@ class FaceSwappers:
                 with torch.no_grad():
                     # FS-LOCK-01: CUDA graphrunners with static buffers are not thread-safe.
                     # Lock ensures only one FrameWorker thread uses the runner at a time.
+                    # BUG-C06 fix: .cpu() transfer must be inside the lock — the static output
+                    # buffer must not be read after releasing the lock (another thread could
+                    # begin a new replay immediately, overwriting the static buffer).
                     with self._custom_inference_lock:
                         embedding = runner(img)
-                return embedding.cpu().numpy().flatten(), cropped_image
+                        embedding_np = embedding.cpu().numpy().flatten()
+                return embedding_np, cropped_image
             # runner unavailable — fall through to ORT
 
         # FS-PERF-02: cache input/output names by session id to avoid repeated ONNX introspection
@@ -578,8 +589,14 @@ class FaceSwappers:
         """
         if self._inswapper_runner_b1 is not None:
             return self._inswapper_runner_b1
-        with self._inswapper_init_lock:
-            if self._inswapper_runner_b1 is None:
+        self.models_processor.show_build_dialog.emit(
+            "Finalizing Custom Provider",
+            "Capturing CUDA graph for Inswapper128 (Batch=1).\nThis only happens once and improves performance.",
+        )
+        try:
+            with self._inswapper_init_lock:
+                if self._inswapper_runner_b1 is not None:
+                    return self._inswapper_runner_b1
                 from custom_kernels.inswapper_128.inswapper_torch import (
                     build_cuda_graph_runner,
                 )
@@ -609,15 +626,12 @@ class FaceSwappers:
                     1, 3, 128, 128, device="cuda", dtype=torch.float32
                 )
                 source_ex = torch.zeros(1, 512, device="cuda", dtype=torch.float32)
+                print("[InSwapperTorch] Capturing CUDA graph (B=1)...")
                 try:
-                    self.models_processor.show_build_dialog.emit(
-                        "Finalizing Custom Provider",
-                        "Capturing CUDA graph for Inswapper128 (Batch=1).\nThis only happens once and improves performance.",
-                    )
-                    print("[InSwapperTorch] Capturing CUDA graph (B=1)...")
-                    self._inswapper_runner_b1 = build_cuda_graph_runner(
-                        model, target_ex, source_ex
-                    )
+                    with self.models_processor.cuda_graph_capture_lock:
+                        self._inswapper_runner_b1 = build_cuda_graph_runner(
+                            model, target_ex, source_ex
+                        )
                     print("[InSwapperTorch] CUDA graph ready.")
                 except Exception as e:
                     print(
@@ -625,8 +639,8 @@ class FaceSwappers:
                     )
                     _m = model
                     self._inswapper_runner_b1 = lambda t, s: _m(t, s)
-                finally:
-                    self.models_processor.hide_build_dialog.emit()
+        finally:
+            self.models_processor.hide_build_dialog.emit()
         return self._inswapper_runner_b1
 
     def calc_inswapper_latent(self, source_embedding):
@@ -731,9 +745,10 @@ class FaceSwappers:
 
         torch_model = self._get_inswapper_torch()
         with torch.no_grad():
-            # Eager mode (InSwapperTorch.forward) is thread-safe as it allocates
-            # new activations per call. No lock required here.
-            result = torch_model(images, embedding)  # [B, 3, 128, 128] float32
+            # FS-LOCK-03: _batched_inference_lock prevents concurrent eager
+            # forward() calls on the same module from racing on GPU memory.
+            with self._batched_inference_lock:
+                result = torch_model(images, embedding)  # [B, 3, 128, 128] float32
         output.copy_(result)
 
     def calc_swapper_latent_ghost(self, source_embedding):

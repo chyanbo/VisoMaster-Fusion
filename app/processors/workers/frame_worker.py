@@ -1172,8 +1172,29 @@ class FrameWorker(threading.Thread):
         self.VR_PERSPECTIVE_RENDER_SIZE = int(
             control.get("VR180CropResolutionSelection", "512")
         )
-        # VR-15: ensure scaling transforms are set for this resolution
-        self.set_scaling_transforms(control)
+        # VR-15: ensure scaling transforms are set for this resolution.
+        # FW-PERF-07b: mirror the standard-path dirty-check so set_scaling_transforms
+        # is not called on every VR frame when settings have not changed.
+        _vr_scaling_keys = {
+            k: control.get(k)
+            for k in (
+                "get_cropped_face_kpsTypeSelection",
+                "original_face_128_384TypeSelection",
+                "original_face_512TypeSelection",
+                "UntransformTypeSelection",
+                "ScalebackFrameTypeSelection",
+                "expression_faceeditor_t256TypeSelection",
+                "expression_faceeditor_backTypeSelection",
+                "block_shiftTypeSelection",
+                "AntialiasTypeSelection",
+            )
+        }
+        _vr_scaling_keys["VR180CropResolutionSelection"] = (
+            self.VR_PERSPECTIVE_RENDER_SIZE
+        )
+        if self._last_scaling_control != _vr_scaling_keys:
+            self.set_scaling_transforms(control)
+            self._last_scaling_control = _vr_scaling_keys
 
         # Detection interval / previous-detections setup (mirrors standard-mode logic).
         _vr_detection_interval = int(control.get("FaceDetectionIntervalSlider", 1))

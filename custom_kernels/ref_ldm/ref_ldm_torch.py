@@ -28,10 +28,10 @@ Usage:
     image_out   = dec_runner(latent)                   # → (1,3,512,512) f32
     noise_pred  = unet(x_noisy_lq, timesteps, kv_map, use_exclusive_path=True)
 """
+
 from __future__ import annotations
 
 import math
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -48,7 +48,7 @@ try:
     )
 except Exception:
     _TRITON_AVAILABLE = False
-    _triton_gn_silu   = None
+    _triton_gn_silu = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
@@ -71,24 +71,39 @@ class _GN(nn.GroupNorm):
     the kernel, then restore channels-last on output so that surrounding
     Conv2d ops can stay in the NHWC cuDNN path.
     """
+
     def __init__(self, num_channels: int, fuse_silu: bool = False):
-        super().__init__(num_groups=32, num_channels=num_channels, eps=1e-6, affine=True)
+        super().__init__(
+            num_groups=32, num_channels=num_channels, eps=1e-6, affine=True
+        )
         self.fuse_silu = fuse_silu
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # Triton GN kernel requires NCHW-contiguous layout.
         was_cl = x.is_contiguous(memory_format=torch.channels_last)
-        x_in = x.contiguous() if was_cl else x   # NCHW for kernel
+        x_in = x.contiguous() if was_cl else x  # NCHW for kernel
 
-        if _TRITON_AVAILABLE and _triton_gn_silu is not None and x_in.dtype == torch.float16:
+        if (
+            _TRITON_AVAILABLE
+            and _triton_gn_silu is not None
+            and x_in.dtype == torch.float16
+        ):
             out = _triton_gn_silu(
-                x_in, self.weight, self.bias,
-                num_groups=32, eps=self.eps, fuse_silu=self.fuse_silu,
+                x_in,
+                self.weight,
+                self.bias,
+                num_groups=32,
+                eps=self.eps,
+                fuse_silu=self.fuse_silu,
             )
         else:
             # Fallback: standard GroupNorm with safe FP32 upcast
             out = F.group_norm(
-                x_in.float(), self.num_groups, self.weight.float(), self.bias.float(), self.eps
+                x_in.float(),
+                self.num_groups,
+                self.weight.float(),
+                self.bias.float(),
+                self.eps,
             ).to(x_in.dtype)
             if self.fuse_silu:
                 out = out * torch.sigmoid(out)
@@ -101,20 +116,22 @@ class _GN(nn.GroupNorm):
 # VAE Building Blocks
 # ===========================================================================
 
+
 def _swish(x: torch.Tensor) -> torch.Tensor:
     return x * torch.sigmoid(x)
 
 
 class _VAEResBlock(nn.Module):
     """VAE residual block: GN+Swish → Conv → GN+Swish → Conv (+skip)."""
+
     def __init__(self, in_ch: int, out_ch: int, dropout: float = 0.0):
         super().__init__()
-        self.norm1 = _GN(in_ch,  fuse_silu=True)
-        self.conv1 = nn.Conv2d(in_ch,  out_ch, 3, 1, 1)
+        self.norm1 = _GN(in_ch, fuse_silu=True)
+        self.conv1 = nn.Conv2d(in_ch, out_ch, 3, 1, 1)
         self.norm2 = _GN(out_ch, fuse_silu=True)
-        self.drop  = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
+        self.drop = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
         self.conv2 = nn.Conv2d(out_ch, out_ch, 3, 1, 1)
-        self.skip  = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
+        self.skip = nn.Conv2d(in_ch, out_ch, 1) if in_ch != out_ch else nn.Identity()
 
     def forward(self, x: torch.Tensor, temb=None) -> torch.Tensor:
         h = self.conv1(self.norm1(x))
@@ -124,27 +141,30 @@ class _VAEResBlock(nn.Module):
 
 class _VAEAttnBlock(nn.Module):
     """Single-head spatial self-attention for VAE mid block."""
+
     def __init__(self, in_ch: int):
         super().__init__()
-        self.norm     = _GN(in_ch, fuse_silu=False)
-        self.q        = nn.Conv2d(in_ch, in_ch, 1)
-        self.k        = nn.Conv2d(in_ch, in_ch, 1)
-        self.v        = nn.Conv2d(in_ch, in_ch, 1)
+        self.norm = _GN(in_ch, fuse_silu=False)
+        self.q = nn.Conv2d(in_ch, in_ch, 1)
+        self.k = nn.Conv2d(in_ch, in_ch, 1)
+        self.v = nn.Conv2d(in_ch, in_ch, 1)
         self.proj_out = nn.Conv2d(in_ch, in_ch, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         was_cl = x.is_contiguous(memory_format=torch.channels_last)
         h = self.norm(x)
         b, c, ht, wt = h.shape
+
         # Conv2d outputs (b, c, ht, wt); must permute channels to last dim before SDPA
         # so that spatial positions are the "sequence" dimension, not channels.
         def _to_sdpa(t: torch.Tensor) -> torch.Tensor:
             return t.reshape(b, c, ht * wt).permute(0, 2, 1).unsqueeze(1)  # (b,1,hw,c)
+
         q = _to_sdpa(self.q(h))
         k = _to_sdpa(self.k(h))
         v = _to_sdpa(self.v(h))
-        a = F.scaled_dot_product_attention(q, k, v)                         # (b,1,hw,c)
-        a = a.squeeze(1).permute(0, 2, 1).reshape(b, c, ht, wt)            # (b,c,ht,wt)
+        a = F.scaled_dot_product_attention(q, k, v)  # (b,1,hw,c)
+        a = a.squeeze(1).permute(0, 2, 1).reshape(b, c, ht, wt)  # (b,c,ht,wt)
         out = x + self.proj_out(a)
         # Restore channels-last if the input was in that format — reshape/permute operations
         # above break the layout guarantee that cuDNN needs for surrounding conv ops.
@@ -173,6 +193,7 @@ class _VAEUpsample(nn.Module):
 # VAE Encoder
 # ===========================================================================
 
+
 class RefLDMEncoderTorch(nn.Module):
     """
     VAE encoder: image (1,3,512,512)f32 → latent (1,8,64,64)f32.
@@ -180,10 +201,11 @@ class RefLDMEncoderTorch(nn.Module):
     Config: ch=128, ch_mult=[1,1,2,4], num_res_blocks=2, attn_resolutions=[],
             z_channels=8, double_z=False.
     """
-    _CH       = 128
-    _CH_MULT  = (1, 1, 2, 4)
-    _NRB      = 2
-    _Z_CH     = 8
+
+    _CH = 128
+    _CH_MULT = (1, 1, 2, 4)
+    _NRB = 2
+    _Z_CH = 8
 
     def __init__(self):
         super().__init__()
@@ -193,7 +215,7 @@ class RefLDMEncoderTorch(nn.Module):
         self.encoder = nn.Module()
         self.encoder.conv_in = nn.Conv2d(3, ch, 3, 1, 1)
 
-        in_ch_mult = (1,) + tuple(mult)
+        _in_ch_mult = (1,) + tuple(mult)
         self.encoder.down = nn.ModuleList()
         block_in = ch
         for i in range(num_res):
@@ -204,14 +226,14 @@ class RefLDMEncoderTorch(nn.Module):
                 block_in = block_out
             lvl = nn.Module()
             lvl.block = blk
-            lvl.attn  = nn.ModuleList()
+            lvl.attn = nn.ModuleList()
             if i != num_res - 1:
                 lvl.downsample = _VAEDownsample(block_in)
             self.encoder.down.append(lvl)
 
         mid = nn.Module()
         mid.block_1 = _VAEResBlock(block_in, block_in)
-        mid.attn_1  = _VAEAttnBlock(block_in)
+        mid.attn_1 = _VAEAttnBlock(block_in)
         mid.block_2 = _VAEResBlock(block_in, block_in)
         self.encoder.mid = mid
 
@@ -260,10 +282,16 @@ class RefLDMEncoderTorch(nn.Module):
         return self.quant_conv(h).float()
 
     @classmethod
-    def from_onnx(cls, onnx_path: str, compute_dtype: torch.dtype = torch.float16,
-                  verbose: bool = False) -> "RefLDMEncoderTorch":
-        import onnx, re as _re
+    def from_onnx(
+        cls,
+        onnx_path: str,
+        compute_dtype: torch.dtype = torch.float16,
+        verbose: bool = False,
+    ) -> "RefLDMEncoderTorch":
+        import onnx
+        import re as _re
         from onnx import numpy_helper
+
         onnx_model = onnx.load(onnx_path)
         w = {
             init.name: torch.from_numpy(numpy_helper.to_array(init).copy())
@@ -279,8 +307,8 @@ class RefLDMEncoderTorch(nn.Module):
         #    These are stored positionally in forward-execution order.
         #    Shape (C,1,1): Mul → weight (gamma), Add → bias (beta).
         _enc_gn_keys: List[str] = []
-        for _i in range(4):       # down.0 … down.3
-            for _j in range(2):   # block.0, block.1
+        for _i in range(4):  # down.0 … down.3
+            for _j in range(2):  # block.0, block.1
                 _enc_gn_keys += [
                     f"encoder.down.{_i}.block.{_j}.norm1.weight",
                     f"encoder.down.{_i}.block.{_j}.norm1.bias",
@@ -288,12 +316,18 @@ class RefLDMEncoderTorch(nn.Module):
                     f"encoder.down.{_i}.block.{_j}.norm2.bias",
                 ]
         _enc_gn_keys += [
-            "encoder.mid.block_1.norm1.weight", "encoder.mid.block_1.norm1.bias",
-            "encoder.mid.block_1.norm2.weight", "encoder.mid.block_1.norm2.bias",
-            "encoder.mid.attn_1.norm.weight",   "encoder.mid.attn_1.norm.bias",
-            "encoder.mid.block_2.norm1.weight", "encoder.mid.block_2.norm1.bias",
-            "encoder.mid.block_2.norm2.weight", "encoder.mid.block_2.norm2.bias",
-            "encoder.norm_out.weight",          "encoder.norm_out.bias",
+            "encoder.mid.block_1.norm1.weight",
+            "encoder.mid.block_1.norm1.bias",
+            "encoder.mid.block_1.norm2.weight",
+            "encoder.mid.block_1.norm2.bias",
+            "encoder.mid.attn_1.norm.weight",
+            "encoder.mid.attn_1.norm.bias",
+            "encoder.mid.block_2.norm1.weight",
+            "encoder.mid.block_2.norm1.bias",
+            "encoder.mid.block_2.norm2.weight",
+            "encoder.mid.block_2.norm2.bias",
+            "encoder.norm_out.weight",
+            "encoder.norm_out.bias",
         ]
         _anon: List[Tuple[int, torch.Tensor]] = []
         for _name, _t in w.items():
@@ -302,14 +336,17 @@ class RefLDMEncoderTorch(nn.Module):
                 _anon.append((int(_m.group(2)), _t))
         _anon.sort(key=lambda x: x[0])
         if len(_anon) != len(_enc_gn_keys):
-            print(f"[RefLDMEncoder] WARNING: {len(_anon)} anon GN tensors vs "
-                  f"{len(_enc_gn_keys)} expected keys — mapping truncated")
+            print(
+                f"[RefLDMEncoder] WARNING: {len(_anon)} anon GN tensors vs "
+                f"{len(_enc_gn_keys)} expected keys — mapping truncated"
+            )
         for (_idx, _t), _pt_k in zip(_anon, _enc_gn_keys):
             w[_pt_k] = _t.squeeze(-1).squeeze(-1)  # (C,1,1) → (C,)
 
         model = cls()
-        _load_from_onnx_weights(model, w, prefixes=["", "encoder.", "first_stage_model."],
-                                verbose=verbose)
+        _load_from_onnx_weights(
+            model, w, prefixes=["", "encoder.", "first_stage_model."], verbose=verbose
+        )
         return model.to(compute_dtype)
 
 
@@ -317,8 +354,10 @@ class RefLDMEncoderTorch(nn.Module):
 # VQ Codebook (needed by decoder)
 # ===========================================================================
 
+
 class _VQLayer(nn.Module):
     """Minimal VQ nearest-neighbour lookup (inference only, no gradients)."""
+
     def __init__(self, n_embed: int = 8192, embed_dim: int = 8):
         super().__init__()
         self.embedding = nn.Embedding(n_embed, embed_dim)
@@ -327,14 +366,10 @@ class _VQLayer(nn.Module):
         # z: (B, C, H, W)  →  z_q: (B, C, H, W)
         b, c, h, w = z.shape
         z_f = z.permute(0, 2, 3, 1).reshape(-1, c).float()  # FP32 for distance
-        emb = self.embedding.weight.float()                   # (N, C)
-        d = (
-            (z_f ** 2).sum(1, keepdim=True)
-            + (emb ** 2).sum(1)
-            - 2 * z_f @ emb.t()
-        )
-        idx   = d.argmin(dim=1)
-        z_q   = self.embedding(idx).view(b, h, w, c).permute(0, 3, 1, 2)
+        emb = self.embedding.weight.float()  # (N, C)
+        d = (z_f**2).sum(1, keepdim=True) + (emb**2).sum(1) - 2 * z_f @ emb.t()
+        idx = d.argmin(dim=1)
+        z_q = self.embedding(idx).view(b, h, w, c).permute(0, 3, 1, 2)
         return z_q.to(z.dtype)
 
 
@@ -342,16 +377,18 @@ class _VQLayer(nn.Module):
 # VAE Decoder
 # ===========================================================================
 
+
 class RefLDMDecoderTorch(nn.Module):
     """
     VAE decoder: latent (1,8,64,64)f32 → image (1,3,512,512)f32.
     Includes quantize + post_quant_conv as exported in the ONNX model.
     Config: same VAE config as encoder.
     """
-    _CH       = 128
-    _CH_MULT  = (1, 1, 2, 4)
-    _NRB      = 2
-    _Z_CH     = 8
+
+    _CH = 128
+    _CH_MULT = (1, 1, 2, 4)
+    _NRB = 2
+    _Z_CH = 8
 
     def __init__(self):
         super().__init__()
@@ -359,7 +396,7 @@ class RefLDMDecoderTorch(nn.Module):
         num_res = len(mult)
 
         # VQ lookup + post-quant
-        self.quantize      = _VQLayer(n_embed=8192, embed_dim=z_ch)
+        self.quantize = _VQLayer(n_embed=8192, embed_dim=z_ch)
         self.post_quant_conv = nn.Conv2d(z_ch, z_ch, 1)
 
         # Decoder
@@ -369,7 +406,7 @@ class RefLDMDecoderTorch(nn.Module):
 
         mid = nn.Module()
         mid.block_1 = _VAEResBlock(block_in, block_in)
-        mid.attn_1  = _VAEAttnBlock(block_in)
+        mid.attn_1 = _VAEAttnBlock(block_in)
         mid.block_2 = _VAEResBlock(block_in, block_in)
         dec.mid = mid
 
@@ -382,7 +419,7 @@ class RefLDMDecoderTorch(nn.Module):
                 block_in = block_out
             lvl = nn.Module()
             lvl.block = blk
-            lvl.attn  = nn.ModuleList()
+            lvl.attn = nn.ModuleList()
             if i_lvl != 0:
                 lvl.upsample = _VAEUpsample(block_in)
             dec.up.insert(0, lvl)
@@ -403,16 +440,16 @@ class RefLDMDecoderTorch(nn.Module):
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
         # VQ step uses FP32 for distance computation, then cast to compute_dtype
-        z_q   = self.quantize(z).to(self.post_quant_conv.weight.dtype)
+        z_q = self.quantize(z).to(self.post_quant_conv.weight.dtype)
         if self._use_cl:
             z_q = z_q.contiguous(memory_format=torch.channels_last)
-        z_q   = self.post_quant_conv(z_q)
-        h     = z_q
-        dec   = self.decoder
-        h     = dec.conv_in(h)
-        h     = dec.mid.block_1(h)
-        h     = dec.mid.attn_1(h)
-        h     = dec.mid.block_2(h)
+        z_q = self.post_quant_conv(z_q)
+        h = z_q
+        dec = self.decoder
+        h = dec.conv_in(h)
+        h = dec.mid.block_1(h)
+        h = dec.mid.attn_1(h)
+        h = dec.mid.block_2(h)
         for i_lvl in reversed(range(len(dec.up))):
             for blk in dec.up[i_lvl].block:
                 h = blk(h)
@@ -423,10 +460,16 @@ class RefLDMDecoderTorch(nn.Module):
         return dec.conv_out(h).float()
 
     @classmethod
-    def from_onnx(cls, onnx_path: str, compute_dtype: torch.dtype = torch.float16,
-                  verbose: bool = False) -> "RefLDMDecoderTorch":
-        import onnx, re as _re
+    def from_onnx(
+        cls,
+        onnx_path: str,
+        compute_dtype: torch.dtype = torch.float16,
+        verbose: bool = False,
+    ) -> "RefLDMDecoderTorch":
+        import onnx
+        import re as _re
         from onnx import numpy_helper
+
         onnx_model = onnx.load(onnx_path)
         w = {
             init.name: torch.from_numpy(numpy_helper.to_array(init).copy())
@@ -441,14 +484,19 @@ class RefLDMDecoderTorch(nn.Module):
         # 2. Map anonymous onnx::Mul_XXX / onnx::Add_XXX tensors to GN param keys.
         #    Forward order: mid → up[3] → up[2] → up[1] → up[0] → norm_out.
         _dec_gn_keys: List[str] = [
-            "decoder.mid.block_1.norm1.weight", "decoder.mid.block_1.norm1.bias",
-            "decoder.mid.block_1.norm2.weight", "decoder.mid.block_1.norm2.bias",
-            "decoder.mid.attn_1.norm.weight",   "decoder.mid.attn_1.norm.bias",
-            "decoder.mid.block_2.norm1.weight", "decoder.mid.block_2.norm1.bias",
-            "decoder.mid.block_2.norm2.weight", "decoder.mid.block_2.norm2.bias",
+            "decoder.mid.block_1.norm1.weight",
+            "decoder.mid.block_1.norm1.bias",
+            "decoder.mid.block_1.norm2.weight",
+            "decoder.mid.block_1.norm2.bias",
+            "decoder.mid.attn_1.norm.weight",
+            "decoder.mid.attn_1.norm.bias",
+            "decoder.mid.block_2.norm1.weight",
+            "decoder.mid.block_2.norm1.bias",
+            "decoder.mid.block_2.norm2.weight",
+            "decoder.mid.block_2.norm2.bias",
         ]
-        for _i in [3, 2, 1, 0]:    # forward execution order (reversed levels)
-            for _j in range(3):    # nrb + 1 = 3 blocks per level
+        for _i in [3, 2, 1, 0]:  # forward execution order (reversed levels)
+            for _j in range(3):  # nrb + 1 = 3 blocks per level
                 _dec_gn_keys += [
                     f"decoder.up.{_i}.block.{_j}.norm1.weight",
                     f"decoder.up.{_i}.block.{_j}.norm1.bias",
@@ -464,16 +512,25 @@ class RefLDMDecoderTorch(nn.Module):
                 _anon.append((int(_m.group(2)), _t))
         _anon.sort(key=lambda x: x[0])
         if len(_anon) != len(_dec_gn_keys):
-            print(f"[RefLDMDecoder] WARNING: {len(_anon)} anon GN tensors vs "
-                  f"{len(_dec_gn_keys)} expected keys — mapping truncated")
+            print(
+                f"[RefLDMDecoder] WARNING: {len(_anon)} anon GN tensors vs "
+                f"{len(_dec_gn_keys)} expected keys — mapping truncated"
+            )
         for (_idx, _t), _pt_k in zip(_anon, _dec_gn_keys):
             w[_pt_k] = _t.squeeze(-1).squeeze(-1)  # (C,1,1) → (C,)
 
         model = cls()
-        _load_from_onnx_weights(model, w,
-                                prefixes=["", "decoder.", "first_stage_model.",
-                                          "first_stage_model.decoder."],
-                                verbose=verbose)
+        _load_from_onnx_weights(
+            model,
+            w,
+            prefixes=[
+                "",
+                "decoder.",
+                "first_stage_model.",
+                "first_stage_model.decoder.",
+            ],
+            verbose=verbose,
+        )
         return model.to(compute_dtype)
 
 
@@ -481,19 +538,24 @@ class RefLDMDecoderTorch(nn.Module):
 # UNet Building Blocks
 # ===========================================================================
 
+
 def _zero_module(module: nn.Module) -> nn.Module:
     for p in module.parameters():
         p.detach().zero_()
     return module
 
 
-def _timestep_embedding(timesteps: torch.Tensor, dim: int, max_period: int = 10000) -> torch.Tensor:
+def _timestep_embedding(
+    timesteps: torch.Tensor, dim: int, max_period: int = 10000
+) -> torch.Tensor:
     half = dim // 2
     freqs = torch.exp(
-        -math.log(max_period) * torch.arange(half, dtype=torch.float32, device=timesteps.device) / half
+        -math.log(max_period)
+        * torch.arange(half, dtype=torch.float32, device=timesteps.device)
+        / half
     )
-    args  = timesteps[:, None].float() * freqs[None]
-    emb   = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    args = timesteps[:, None].float() * freqs[None]
+    emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
     if dim % 2:
         emb = F.pad(emb, (0, 1))
     return emb
@@ -507,28 +569,32 @@ class _UNetResBlock(nn.Module):
     out_layers  = [GroupNorm32+SiLU (index 0), SiLU skipped, Dropout (index 2), Conv2d (index 3)]
     skip_connection = Conv2d (1×1) when channels change, else Identity
     """
-    def __init__(self, ch: int, emb_ch: int, dropout: float,
-                 out_ch: Optional[int] = None):
+
+    def __init__(
+        self, ch: int, emb_ch: int, dropout: float, out_ch: Optional[int] = None
+    ):
         super().__init__()
         out_ch = out_ch or ch
 
         # in_layers: indices 0 = GN+SiLU, 1 = SiLU (placeholder), 2 = Conv2d
-        self.in_layers  = nn.Sequential(
+        self.in_layers = nn.Sequential(
             _GN(ch, fuse_silu=True),
-            nn.Identity(),                          # index 1 placeholder (SiLU fused into GN)
-            nn.Conv2d(ch, out_ch, 3, 1, 1),        # index 2 — "in_layers.2" in ONNX
+            nn.Identity(),  # index 1 placeholder (SiLU fused into GN)
+            nn.Conv2d(ch, out_ch, 3, 1, 1),  # index 2 — "in_layers.2" in ONNX
         )
         # emb_layers: indices 0 = SiLU, 1 = Linear
         self.emb_layers = nn.Sequential(
             nn.SiLU(),
-            nn.Linear(emb_ch, out_ch),             # index 1 — "emb_layers.1" in ONNX
+            nn.Linear(emb_ch, out_ch),  # index 1 — "emb_layers.1" in ONNX
         )
         # out_layers: indices 0 = GN+SiLU, 1 = SiLU placeholder, 2 = Dropout, 3 = Conv2d
         self.out_layers = nn.Sequential(
             _GN(out_ch, fuse_silu=True),
-            nn.Identity(),                          # index 1 placeholder
+            nn.Identity(),  # index 1 placeholder
             nn.Dropout(dropout) if dropout > 0 else nn.Identity(),
-            _zero_module(nn.Conv2d(out_ch, out_ch, 3, 1, 1)),  # index 3 — "out_layers.3"
+            _zero_module(
+                nn.Conv2d(out_ch, out_ch, 3, 1, 1)
+            ),  # index 3 — "out_layers.3"
         )
         # skip_connection — "skip_connection" in ONNX (or absent when ch == out_ch)
         self.skip_connection: nn.Module = (
@@ -536,15 +602,16 @@ class _UNetResBlock(nn.Module):
         )
 
     def forward(self, x: torch.Tensor, emb: torch.Tensor) -> torch.Tensor:
-        h     = self.in_layers(x)
+        h = self.in_layers(x)
         emb_o = self.emb_layers(emb).to(h.dtype)
-        h     = h + emb_o[:, :, None, None]
-        h     = self.out_layers(h)
+        h = h + emb_o[:, :, None, None]
+        h = self.out_layers(h)
         return self.skip_connection(x) + h
 
 
 class _UNetDownsample(nn.Module):
     """Strided-Conv downsampler — matches ONNX 'input_blocks.N.0.op' weight."""
+
     def __init__(self, ch: int):
         super().__init__()
         self.op = nn.Conv2d(ch, ch, 3, stride=2, padding=1)
@@ -555,6 +622,7 @@ class _UNetDownsample(nn.Module):
 
 class _UNetUpsample(nn.Module):
     """Nearest-neighbour upsample + Conv — matches ONNX 'output_blocks.N.M.conv' weight."""
+
     def __init__(self, ch: int):
         super().__init__()
         self.conv = nn.Conv2d(ch, ch, 3, 1, 1)
@@ -568,18 +636,19 @@ class _UNetAttnBlock(nn.Module):
     Multi-head self-attention for the UNet.
     During denoising supports external reference K/V (concat or exclusive).
     """
+
     def __init__(self, ch: int, num_head_channels: int = 32):
         super().__init__()
-        self.n_heads  = ch // num_head_channels
-        self.norm     = _GN(ch, fuse_silu=False)
-        self.qkv      = nn.Conv1d(ch, ch * 3, 1)
+        self.n_heads = ch // num_head_channels
+        self.norm = _GN(ch, fuse_silu=False)
+        self.qkv = nn.Conv1d(ch, ch * 3, 1)
         self.proj_out = _zero_module(nn.Conv1d(ch, ch, 1))
 
     def forward(
         self,
-        x:             torch.Tensor,
-        ext_k:         Optional[torch.Tensor] = None,
-        ext_v:         Optional[torch.Tensor] = None,
+        x: torch.Tensor,
+        ext_k: Optional[torch.Tensor] = None,
+        ext_v: Optional[torch.Tensor] = None,
         use_exclusive: bool = False,
     ) -> torch.Tensor:
         # Remember channels-last — reshape/permute below break the layout guarantee.
@@ -587,19 +656,21 @@ class _UNetAttnBlock(nn.Module):
 
         b, c, *spatial = x.shape
         hw = x.numel() // (b * c)
-        r  = x.reshape(b, c, hw)
-        qkv = self.qkv(self.norm(r))                    # (b, 3*c, hw)
-        nh  = self.n_heads
-        ch  = c // nh
+        r = x.reshape(b, c, hw)
+        qkv = self.qkv(self.norm(r))  # (b, 3*c, hw)
+        nh = self.n_heads
+        ch = c // nh
 
         # Reshape to 4D (b, nh, ch, hw) then permute to (b, nh, hw, ch) for SDPA.
         # 4D input is required by PyTorch's fused Flash Attention / Memory-Efficient
         # Attention kernels; 3D input (b*nh, hw, ch) falls back to the slow "math"
         # implementation which is ~3× slower on Ampere+.
-        q, k, v = qkv.reshape(b, nh, ch * 3, hw).split(ch, dim=2)  # each (b, nh, ch, hw)
-        qt = q.permute(0, 1, 3, 2)   # (b, nh, hw, ch)  — Q
-        kt = k.permute(0, 1, 3, 2)   # (b, nh, hw, ch)  — self K
-        vt = v.permute(0, 1, 3, 2)   # (b, nh, hw, ch)  — self V
+        q, k, v = qkv.reshape(b, nh, ch * 3, hw).split(
+            ch, dim=2
+        )  # each (b, nh, ch, hw)
+        qt = q.permute(0, 1, 3, 2)  # (b, nh, hw, ch)  — Q
+        kt = k.permute(0, 1, 3, 2)  # (b, nh, hw, ch)  — self K
+        vt = v.permute(0, 1, 3, 2)  # (b, nh, hw, ch)  — self V
 
         # External K/V routing — always concatenate self + external K/V.
         # The ONNX model always concatenates regardless of use_exclusive;
@@ -610,16 +681,16 @@ class _UNetAttnBlock(nn.Module):
             ek = ext_k.to(dtype=qt.dtype, device=qt.device)  # (nh, ch, ref_seq)
             ev = ext_v.to(dtype=qt.dtype, device=qt.device)
             # Unsqueeze batch dim and transpose to (1, nh, ref_seq, ch) for SDPA
-            ek_t = ek.unsqueeze(0).permute(0, 1, 3, 2)   # (1, nh, ref_seq, ch)
+            ek_t = ek.unsqueeze(0).permute(0, 1, 3, 2)  # (1, nh, ref_seq, ch)
             ev_t = ev.unsqueeze(0).permute(0, 1, 3, 2)
-            k_use = torch.cat([kt, ek_t], dim=2)   # (b, nh, hw+ref_seq, ch)
+            k_use = torch.cat([kt, ek_t], dim=2)  # (b, nh, hw+ref_seq, ch)
             v_use = torch.cat([vt, ev_t], dim=2)
         else:
             k_use, v_use = kt, vt
 
         # 4D SDPA — dispatches to Flash Attention or Memory-Efficient Attention
         a = F.scaled_dot_product_attention(qt, k_use, v_use)  # (b, nh, hw, ch)
-        h = a.permute(0, 1, 3, 2).reshape(b, c, hw)           # (b, c, hw)
+        h = a.permute(0, 1, 3, 2).reshape(b, c, hw)  # (b, c, hw)
         h = self.proj_out(h)
         out = (r + h).reshape(b, c, *spatial)
         return out.contiguous(memory_format=torch.channels_last) if was_cl else out
@@ -630,13 +701,14 @@ class _UNetTES(nn.Sequential):
     TimestepEmbedSequential — routes timestep emb and external K/V to children.
     Mirrors UNet_TimestepEmbedSequential from ref_ldm_kv_embedding.py.
     """
-    def forward(                                        # type: ignore[override]
+
+    def forward(  # type: ignore[override]
         self,
-        x:             torch.Tensor,
-        emb:           torch.Tensor,
-        ext_kv_map:    Optional[Dict] = None,
+        x: torch.Tensor,
+        emb: torch.Tensor,
+        ext_kv_map: Optional[Dict] = None,
         use_exclusive: bool = False,
-        block_name:    str  = "",
+        block_name: str = "",
     ) -> torch.Tensor:
         for i, layer in enumerate(self):
             if isinstance(layer, _UNetAttnBlock):
@@ -644,7 +716,7 @@ class _UNetTES(nn.Sequential):
                 entry = ext_kv_map.get(path) if ext_kv_map else None
                 ek = entry.get("k") if entry else None
                 ev = entry.get("v") if entry else None
-                x  = layer(x, ext_k=ek, ext_v=ev, use_exclusive=use_exclusive)
+                x = layer(x, ext_k=ek, ext_v=ev, use_exclusive=use_exclusive)
             elif isinstance(layer, _UNetResBlock):
                 x = layer(x, emb)
             else:
@@ -656,6 +728,7 @@ class _UNetTES(nn.Sequential):
 # UNet
 # ===========================================================================
 
+
 class RefLDMUNetTorch(nn.Module):
     """
     Denoising UNet with external K/V reference conditioning.
@@ -663,13 +736,14 @@ class RefLDMUNetTorch(nn.Module):
             attention_resolutions=[2,4,8], num_head_channels=32,
             in_channels=16, out_channels=8.
     """
-    _MC   = 160
+
+    _MC = 160
     _MULT = (1, 2, 2, 4)
-    _NRB  = 2
-    _AR   = {2, 4, 8}
-    _NHC  = 32
-    _IC   = 16
-    _OC   = 8
+    _NRB = 2
+    _AR = {2, 4, 8}
+    _NHC = 32
+    _IC = 16
+    _OC = 8
 
     def __init__(self):
         super().__init__()
@@ -680,20 +754,24 @@ class RefLDMUNetTorch(nn.Module):
 
         # Timestep embedding
         self.time_embed = nn.Sequential(
-            nn.Linear(mc, emb_dim), nn.SiLU(), nn.Linear(emb_dim, emb_dim),
+            nn.Linear(mc, emb_dim),
+            nn.SiLU(),
+            nn.Linear(emb_dim, emb_dim),
         )
 
         # Input blocks (down path)
-        self.input_blocks: nn.ModuleList = nn.ModuleList([
-            _UNetTES(nn.Conv2d(ic, mc, 3, 1, 1))
-        ])
-        ch    = mc
-        ds    = 1
+        self.input_blocks: nn.ModuleList = nn.ModuleList(
+            [_UNetTES(nn.Conv2d(ic, mc, 3, 1, 1))]
+        )
+        ch = mc
+        ds = 1
         skips = [mc]
 
         for level, m in enumerate(mult):
             for _ in range(nrb):
-                layers: List[nn.Module] = [_UNetResBlock(ch, emb_dim, 0.0, out_ch=m * mc)]
+                layers: List[nn.Module] = [
+                    _UNetResBlock(ch, emb_dim, 0.0, out_ch=m * mc)
+                ]
                 ch = m * mc
                 if ds in ar:
                     layers.append(_UNetAttnBlock(ch, nhc))
@@ -744,39 +822,62 @@ class RefLDMUNetTorch(nn.Module):
 
     def forward(
         self,
-        x:             torch.Tensor,          # (1,16,64,64)  f32
-        timesteps:     torch.Tensor,          # (1,)  int64
-        kv_map:        Optional[Dict] = None, # {path: {"k": tensor, "v": tensor}}
+        x: torch.Tensor,  # (1,16,64,64)  f32
+        timesteps: torch.Tensor,  # (1,)  int64
+        kv_map: Optional[Dict] = None,  # {path: {"k": tensor, "v": tensor}}
         use_exclusive: bool = False,
     ) -> torch.Tensor:
-        x16  = x.to(self.input_blocks[0][0].weight.dtype)
+        x16 = x.to(self.input_blocks[0][0].weight.dtype)
         if self._use_cl:
             x16 = x16.contiguous(memory_format=torch.channels_last)
-        t_emb = _timestep_embedding(timesteps, self.time_embed[0].in_features).to(x16.dtype)
-        emb   = self.time_embed(t_emb)
+        t_emb = _timestep_embedding(timesteps, self.time_embed[0].in_features).to(
+            x16.dtype
+        )
+        emb = self.time_embed(t_emb)
 
         hs: List[torch.Tensor] = []
-        h  = x16
+        h = x16
         for i, blk in enumerate(self.input_blocks):
-            h = blk(h, emb, ext_kv_map=kv_map, use_exclusive=use_exclusive,
-                    block_name=f"input_blocks.{i}")
+            h = blk(
+                h,
+                emb,
+                ext_kv_map=kv_map,
+                use_exclusive=use_exclusive,
+                block_name=f"input_blocks.{i}",
+            )
             hs.append(h)
 
-        h = self.middle_block(h, emb, ext_kv_map=kv_map, use_exclusive=use_exclusive,
-                              block_name="middle_block")
+        h = self.middle_block(
+            h,
+            emb,
+            ext_kv_map=kv_map,
+            use_exclusive=use_exclusive,
+            block_name="middle_block",
+        )
 
         for i, blk in enumerate(self.output_blocks):
             h = torch.cat([h, hs.pop()], dim=1)
-            h = blk(h, emb, ext_kv_map=kv_map, use_exclusive=use_exclusive,
-                    block_name=f"output_blocks.{i}")
+            h = blk(
+                h,
+                emb,
+                ext_kv_map=kv_map,
+                use_exclusive=use_exclusive,
+                block_name=f"output_blocks.{i}",
+            )
 
         return self.out(h).float()
 
     @classmethod
-    def from_onnx(cls, onnx_path: str, compute_dtype: torch.dtype = torch.float16,
-                  verbose: bool = False) -> "RefLDMUNetTorch":
-        import onnx, re
+    def from_onnx(
+        cls,
+        onnx_path: str,
+        compute_dtype: torch.dtype = torch.float16,
+        verbose: bool = False,
+    ) -> "RefLDMUNetTorch":
+        import onnx
+        import re
         from onnx import numpy_helper
+
         onnx_model = onnx.load(onnx_path)
         w = {
             init.name: torch.from_numpy(numpy_helper.to_array(init).copy())
@@ -831,9 +932,12 @@ class RefLDMUNetTorch(nn.Module):
             w[pt_key] = tensor.squeeze()  # (C,1,1) or (C,1) → (C,)
 
         model = cls()
-        _load_from_onnx_weights(model, w,
-                                prefixes=["unet_model.", "", "model.diffusion_model.", "diffusion_model."],
-                                verbose=verbose)
+        _load_from_onnx_weights(
+            model,
+            w,
+            prefixes=["unet_model.", "", "model.diffusion_model.", "diffusion_model."],
+            verbose=verbose,
+        )
         return model.to(compute_dtype)
 
 
@@ -841,11 +945,12 @@ class RefLDMUNetTorch(nn.Module):
 # Weight loading helper
 # ===========================================================================
 
+
 def _load_from_onnx_weights(
-    model:    nn.Module,
-    onnx_w:   Dict[str, torch.Tensor],
-    prefixes: List[str] = ("",),
-    verbose:  bool = False,
+    model: nn.Module,
+    onnx_w: Dict[str, torch.Tensor],
+    prefixes: List[str] = ("",),  # type: ignore[assignment]
+    verbose: bool = False,
 ) -> Tuple[List[str], List[str]]:
     """
     Map ONNX initialiser names → PyTorch state-dict keys.
@@ -853,9 +958,9 @@ def _load_from_onnx_weights(
     Strategy: try each prefix in turn; if the shape matches, use that tensor.
     Falls back to matching by suffix (parameter name without any prefix).
     """
-    sd       = model.state_dict()
-    mapped   = {}
-    suffix_map = {k.rsplit(".", 1)[-1]: k for k in sd}  # last component → full key
+    sd = model.state_dict()
+    mapped = {}
+    _suffix_map = {k.rsplit(".", 1)[-1]: k for k in sd}  # last component → full key
 
     for pt_k, pt_v in sd.items():
         found: Optional[torch.Tensor] = None
@@ -873,7 +978,7 @@ def _load_from_onnx_weights(
                 bare = onnx_k
                 for pfx in prefixes:
                     if bare.startswith(pfx):
-                        bare = bare[len(pfx):]
+                        bare = bare[len(pfx) :]
                         break
                 if bare == pt_k and onnx_v.shape == pt_v.shape:
                     found = onnx_v
@@ -884,8 +989,10 @@ def _load_from_onnx_weights(
 
     missing, unexpected = model.load_state_dict(mapped, strict=False)
     loaded = len(sd) - len(missing)
-    print(f"[RefLDMTorch] loaded {loaded}/{len(sd)} parameters from ONNX "
-          f"({len(missing)} missing, {len(unexpected)} unexpected).")
+    print(
+        f"[RefLDMTorch] loaded {loaded}/{len(sd)} parameters from ONNX "
+        f"({len(missing)} missing, {len(unexpected)} unexpected)."
+    )
     if verbose and missing:
         print(f"  Missing: {missing[:5]} {'...' if len(missing) > 5 else ''}")
     return missing, unexpected
@@ -895,10 +1002,11 @@ def _load_from_onnx_weights(
 # CUDA Graph runner  (VAE encoder and decoder only — fixed shapes)
 # ===========================================================================
 
+
 def build_cuda_graph_runner(
-    model:     nn.Module,
+    model: nn.Module,
     inp_shape: Tuple[int, ...],
-    warmup:    int = 3,
+    warmup: int = 3,
 ) -> "CUDAGraphRunner":
     """
     Capture a CUDA graph for a fixed-shape model.
@@ -911,7 +1019,7 @@ class CUDAGraphRunner:
     """Wraps a fixed-shape model in a CUDA graph for minimal kernel-launch overhead."""
 
     def __init__(self, model: nn.Module, inp_shape: Tuple[int, ...], warmup: int = 3):
-        self.model     = model
+        self.model = model
         self.inp_shape = inp_shape
 
         # Allocate static I/O buffers on the same device as model params
@@ -924,7 +1032,7 @@ class CUDAGraphRunner:
                 _ = model(self._inp)
 
         # Capture
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         self._stream = torch.cuda.Stream()
         torch.cuda.synchronize()
 
@@ -943,6 +1051,7 @@ class CUDAGraphRunner:
 # ===========================================================================
 # CUDA Graph runner for UNet  (handles dynamic K/V via static fp16 buffers)
 # ===========================================================================
+
 
 class UNetCUDAGraphRunner:
     """
@@ -976,17 +1085,17 @@ class UNetCUDAGraphRunner:
 
     def __init__(
         self,
-        model:            "RefLDMUNetTorch",
-        x_shape:          Tuple[int, ...],
-        ts_example:       torch.Tensor,
-        kv_map_template:  Dict,
-        use_exclusive:    bool = True,
-        warmup:           int  = 3,
+        model: "RefLDMUNetTorch",
+        x_shape: Tuple[int, ...],
+        ts_example: torch.Tensor,
+        kv_map_template: Dict,
+        use_exclusive: bool = True,
+        warmup: int = 3,
     ) -> None:
         device = next(model.parameters()).device
 
         # --- Static input tensors (fixed GPU addresses) ---
-        self._static_x  = torch.zeros(x_shape, dtype=torch.float32, device=device)
+        self._static_x = torch.zeros(x_shape, dtype=torch.float32, device=device)
         self._static_ts = ts_example.clone().to(device)
 
         # --- Static K/V buffers in fp16 (matching model compute dtype) ---
@@ -1004,8 +1113,12 @@ class UNetCUDAGraphRunner:
         print("[UNetCUDAGraph] Warming up (Triton JIT / cuDNN autotune)...")
         with torch.no_grad():
             for _ in range(warmup):
-                model(self._static_x, self._static_ts,
-                      kv_map=self._static_kv, use_exclusive=use_exclusive)
+                model(
+                    self._static_x,
+                    self._static_ts,
+                    kv_map=self._static_kv,
+                    use_exclusive=use_exclusive,
+                )
         torch.cuda.synchronize(device)
 
         # --- Capture ---
@@ -1014,17 +1127,19 @@ class UNetCUDAGraphRunner:
         with torch.no_grad():
             with torch.cuda.graph(self._graph):
                 self._static_out = model(
-                    self._static_x, self._static_ts,
-                    kv_map=self._static_kv, use_exclusive=use_exclusive,
+                    self._static_x,
+                    self._static_ts,
+                    kv_map=self._static_kv,
+                    use_exclusive=use_exclusive,
                 )
         torch.cuda.synchronize(device)
         print("[UNetCUDAGraph] CUDA graph captured.")
 
     def __call__(
         self,
-        x:             torch.Tensor,
-        timesteps:     torch.Tensor,
-        kv_map:        Dict,
+        x: torch.Tensor,
+        timesteps: torch.Tensor,
+        kv_map: Dict,
         use_exclusive: bool = True,
     ) -> torch.Tensor:
         """Replay the captured CUDA graph with new inputs.
@@ -1045,13 +1160,19 @@ class UNetCUDAGraphRunner:
 
 
 def build_unet_cuda_graph_runner(
-    model:           "RefLDMUNetTorch",
-    x_shape:         Tuple[int, ...],
-    ts_example:      torch.Tensor,
+    model: "RefLDMUNetTorch",
+    x_shape: Tuple[int, ...],
+    ts_example: torch.Tensor,
     kv_map_template: Dict,
-    use_exclusive:   bool = True,
-    warmup:          int  = 3,
+    use_exclusive: bool = True,
+    warmup: int = 3,
 ) -> UNetCUDAGraphRunner:
     """Convenience factory — see ``UNetCUDAGraphRunner`` for full documentation."""
-    return UNetCUDAGraphRunner(model, x_shape, ts_example, kv_map_template,
-                               use_exclusive=use_exclusive, warmup=warmup)
+    return UNetCUDAGraphRunner(
+        model,
+        x_shape,
+        ts_example,
+        kv_map_template,
+        use_exclusive=use_exclusive,
+        warmup=warmup,
+    )

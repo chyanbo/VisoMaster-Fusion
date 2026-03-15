@@ -18,6 +18,7 @@ Usage:
         logits = runner(x)   # (1,3,512,512) float32 → (1,19,512,512) float32
     labels = logits.argmax(dim=1).squeeze(0)  # (512,512) long
 """
+
 from __future__ import annotations
 
 from typing import Optional
@@ -32,15 +33,23 @@ import torch.nn.functional as F
 # Shared primitives
 # ---------------------------------------------------------------------------
 
+
 class _CBR(nn.Module):
     """
     BN-folded Conv2d + optional in-place ReLU.
     The Conv2d is stored as *.conv* so positional weight loading works cleanly.
     """
 
-    def __init__(self, c1: int, c2: int, k: int,
-                 s: int = 1, p: int = 0,
-                 act: bool = True, bias: bool = True):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        k: int,
+        s: int = 1,
+        p: int = 0,
+        act: bool = True,
+        bias: bool = True,
+    ):
         super().__init__()
         self.conv = nn.Conv2d(c1, c2, k, s, p, bias=bias)
         self.act = act
@@ -54,6 +63,7 @@ class _CBR(nn.Module):
 # ResNet-34 backbone
 # ---------------------------------------------------------------------------
 
+
 class _BasicBlock(nn.Module):
     """ResNet-34 BasicBlock (BN folded into conv bias)."""
 
@@ -64,7 +74,8 @@ class _BasicBlock(nn.Module):
         # 1×1 downsampling shortcut when stride>1 or channel change
         self.downsample: Optional[_CBR] = (
             _CBR(in_ch, out_ch, 1, stride, 0, act=False)
-            if stride != 1 or in_ch != out_ch else None
+            if stride != 1 or in_ch != out_ch
+            else None
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -83,37 +94,46 @@ class _Backbone(nn.Module):
         self.maxpool = nn.MaxPool2d(3, 2, 1)
         # Layer 1: 3 × BasicBlock(64→64, stride=1)
         self.layer1 = nn.Sequential(
-            _BasicBlock(64, 64), _BasicBlock(64, 64), _BasicBlock(64, 64),
+            _BasicBlock(64, 64),
+            _BasicBlock(64, 64),
+            _BasicBlock(64, 64),
         )
         # Layer 2: 4 × BasicBlock(64→128 first, then 128→128)  →  64×64
         self.layer2 = nn.Sequential(
             _BasicBlock(64, 128, stride=2),
-            _BasicBlock(128, 128), _BasicBlock(128, 128), _BasicBlock(128, 128),
+            _BasicBlock(128, 128),
+            _BasicBlock(128, 128),
+            _BasicBlock(128, 128),
         )
         # Layer 3: 6 × BasicBlock(128→256 first, then 256→256)  →  32×32
         self.layer3 = nn.Sequential(
             _BasicBlock(128, 256, stride=2),
-            _BasicBlock(256, 256), _BasicBlock(256, 256),
-            _BasicBlock(256, 256), _BasicBlock(256, 256), _BasicBlock(256, 256),
+            _BasicBlock(256, 256),
+            _BasicBlock(256, 256),
+            _BasicBlock(256, 256),
+            _BasicBlock(256, 256),
+            _BasicBlock(256, 256),
         )
         # Layer 4: 3 × BasicBlock(256→512 first, then 512→512)  →  16×16
         self.layer4 = nn.Sequential(
             _BasicBlock(256, 512, stride=2),
-            _BasicBlock(512, 512), _BasicBlock(512, 512),
+            _BasicBlock(512, 512),
+            _BasicBlock(512, 512),
         )
 
     def forward(self, x: torch.Tensor):
-        x = self.maxpool(self.conv1(x))   # 64ch, 128×128
-        x = self.layer1(x)                # 64ch, 128×128  (not used by neck)
-        c3 = self.layer2(x)               # 128ch, 64×64   → FFM spatial path
-        c4 = self.layer3(c3)              # 256ch, 32×32   → ARM16
-        c5 = self.layer4(c4)              # 512ch, 16×16   → ARM32 + conv_avg
+        x = self.maxpool(self.conv1(x))  # 64ch, 128×128
+        x = self.layer1(x)  # 64ch, 128×128  (not used by neck)
+        c3 = self.layer2(x)  # 128ch, 64×64   → FFM spatial path
+        c4 = self.layer3(c3)  # 256ch, 32×32   → ARM16
+        c5 = self.layer4(c4)  # 512ch, 16×16   → ARM32 + conv_avg
         return c3, c4, c5
 
 
 # ---------------------------------------------------------------------------
 # Context Path: ARM + FFM
 # ---------------------------------------------------------------------------
+
 
 class _ARM(nn.Module):
     """
@@ -146,11 +166,11 @@ class _FFM(nn.Module):
         # ffm.conv_block: 1×1 conv + ReLU (has bias — BN folded)
         self.conv_block = _CBR(256, 256, 1, act=True, bias=True)
         # SE squeeze/excite — no bias (exported with bias=False)
-        self.conv1 = nn.Conv2d(256, 64, 1, bias=False)   # ffm.conv1.weight
-        self.conv2 = nn.Conv2d(64, 256, 1, bias=False)   # ffm.conv2.weight
+        self.conv1 = nn.Conv2d(256, 64, 1, bias=False)  # ffm.conv1.weight
+        self.conv2 = nn.Conv2d(64, 256, 1, bias=False)  # ffm.conv2.weight
 
     def forward(self, spatial: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
-        x = torch.cat([spatial, context], 1)          # (B, 256, H, W)
+        x = torch.cat([spatial, context], 1)  # (B, 256, H, W)
         feat = self.conv_block(x)
         # SE attention
         attn = F.adaptive_avg_pool2d(feat, 1)
@@ -168,11 +188,11 @@ class _ContextPath(nn.Module):
     def __init__(self):
         super().__init__()
         # Global context: GlobalAvgPool(layer4) → Conv1×1(512→128) + ReLU
-        self.conv_avg   = _CBR(512, 128, 1, act=True)
+        self.conv_avg = _CBR(512, 128, 1, act=True)
         # ARM modules
-        self.arm32      = _ARM(512, 128)
+        self.arm32 = _ARM(512, 128)
         self.conv_head32 = _CBR(128, 128, 3, 1, 1, act=True)
-        self.arm16      = _ARM(256, 128)
+        self.arm16 = _ARM(256, 128)
         self.conv_head16 = _CBR(128, 128, 3, 1, 1, act=True)
         # Feature Fusion Module
         self.ffm = _FFM()
@@ -183,21 +203,23 @@ class _ContextPath(nn.Module):
         # c5 = layer4 output: 512ch, 16×16
 
         # Global context: GAP → conv → resize to layer4 spatial
-        ctx = self.conv_avg(F.adaptive_avg_pool2d(c5, 1))           # 128ch, 1×1
+        ctx = self.conv_avg(F.adaptive_avg_pool2d(c5, 1))  # 128ch, 1×1
         ctx = F.interpolate(ctx, size=c5.shape[2:], mode="nearest")  # 128ch, 16×16
 
         # ARM32: attend layer4, add global context → resize ×2 → conv_head32
-        arm32_out  = self.arm32(c5) + ctx                                              # 128ch, 16×16
+        arm32_out = self.arm32(c5) + ctx  # 128ch, 16×16
         head32_out = self.conv_head32(
-            F.interpolate(arm32_out, scale_factor=2, mode="nearest"))                  # 128ch, 32×32
+            F.interpolate(arm32_out, scale_factor=2, mode="nearest")
+        )  # 128ch, 32×32
 
         # ARM16: attend layer3, add arm32 context → resize ×2 → conv_head16
-        arm16_out  = self.arm16(c4) + head32_out                                       # 128ch, 32×32
+        arm16_out = self.arm16(c4) + head32_out  # 128ch, 32×32
         head16_out = self.conv_head16(
-            F.interpolate(arm16_out, scale_factor=2, mode="nearest"))                  # 128ch, 64×64
+            F.interpolate(arm16_out, scale_factor=2, mode="nearest")
+        )  # 128ch, 64×64
 
         # FFM: fuse layer2 (spatial path) with head16 (context path)
-        ffm_out = self.ffm(c3, head16_out)                                             # 256ch, 64×64
+        ffm_out = self.ffm(c3, head16_out)  # 256ch, 64×64
 
         return ffm_out, head16_out, head32_out
 
@@ -205,6 +227,7 @@ class _ContextPath(nn.Module):
 # ---------------------------------------------------------------------------
 # Output heads
 # ---------------------------------------------------------------------------
+
 
 class _OutputHead(nn.Module):
     """
@@ -214,7 +237,7 @@ class _OutputHead(nn.Module):
     def __init__(self, in_ch: int, mid_ch: int, num_classes: int = 19):
         super().__init__()
         self.conv_block = _CBR(in_ch, mid_ch, 3, 1, 1, act=True, bias=True)
-        self.conv = nn.Conv2d(mid_ch, num_classes, 1, bias=False)   # no bias
+        self.conv = nn.Conv2d(mid_ch, num_classes, 1, bias=False)  # no bias
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(self.conv_block(x))
@@ -224,6 +247,7 @@ class _OutputHead(nn.Module):
 # ---------------------------------------------------------------------------
 # Top-level model
 # ---------------------------------------------------------------------------
+
 
 class FaceParserResnet34Torch(nn.Module):
     """
@@ -240,10 +264,10 @@ class FaceParserResnet34Torch(nn.Module):
 
     def __init__(self, compute_dtype: torch.dtype = torch.float16):
         super().__init__()
-        self.backbone   = _Backbone()
-        self.context    = _ContextPath()
+        self.backbone = _Backbone()
+        self.context = _ContextPath()
         # Primary output: 256ch FFM → 19 classes
-        self.conv_out   = _OutputHead(256, 256)
+        self.conv_out = _OutputHead(256, 256)
         # Auxiliary outputs (kept for weight loading completeness; not returned)
         self.conv_out16 = _OutputHead(128, 64)
         self.conv_out32 = _OutputHead(128, 64)
@@ -254,16 +278,18 @@ class FaceParserResnet34Torch(nn.Module):
         x = x.to(self._compute_dtype)
         c3, c4, c5 = self.backbone(x)
         ffm_out, head16_out, head32_out = self.context(c3, c4, c5)
-        return self.conv_out(ffm_out).float()   # always return float32
+        return self.conv_out(ffm_out).float()  # always return float32
 
     # ------------------------------------------------------------------
     @classmethod
-    def from_onnx(cls,
-                  onnx_path: str,
-                  compute_dtype: torch.dtype = torch.float16,
-                  ) -> "FaceParserResnet34Torch":
+    def from_onnx(
+        cls,
+        onnx_path: str,
+        compute_dtype: torch.dtype = torch.float16,
+    ) -> "FaceParserResnet34Torch":
         """Load all 52 Conv2d weights positionally from faceparser_resnet34.onnx."""
         import onnx
+
         model_onnx = onnx.load(onnx_path)
 
         def _np(name: str) -> np.ndarray:
@@ -280,7 +306,7 @@ class FaceParserResnet34Torch(nn.Module):
 
         # --- Positional Conv loading ---
         conv_nodes = [n for n in model_onnx.graph.node if n.op_type == "Conv"]
-        pt_convs   = _conv_modules_in_forward_order(model)
+        pt_convs = _conv_modules_in_forward_order(model)
         assert len(conv_nodes) == len(pt_convs), (
             f"ONNX has {len(conv_nodes)} Conv nodes but model has {len(pt_convs)}"
         )
@@ -303,6 +329,7 @@ class FaceParserResnet34Torch(nn.Module):
 # ---------------------------------------------------------------------------
 # Weight enumeration helper
 # ---------------------------------------------------------------------------
+
 
 def _conv_modules_in_forward_order(model: FaceParserResnet34Torch) -> list[nn.Conv2d]:
     """
@@ -348,24 +375,24 @@ def _conv_modules_in_forward_order(model: FaceParserResnet34Torch) -> list[nn.Co
     convs += [
         ct.conv_avg.conv,
         ct.arm32.conv_block.conv,
-        ct.arm32.attention,          # plain nn.Conv2d (no _CBR wrapper)
+        ct.arm32.attention,  # plain nn.Conv2d (no _CBR wrapper)
         ct.conv_head32.conv,
         ct.arm16.conv_block.conv,
-        ct.arm16.attention,          # plain nn.Conv2d
+        ct.arm16.attention,  # plain nn.Conv2d
         ct.conv_head16.conv,
         ct.ffm.conv_block.conv,
-        ct.ffm.conv1,                # plain nn.Conv2d, bias=False
-        ct.ffm.conv2,                # plain nn.Conv2d, bias=False
+        ct.ffm.conv1,  # plain nn.Conv2d, bias=False
+        ct.ffm.conv2,  # plain nn.Conv2d, bias=False
     ]
 
     # Output heads (primary + two auxiliary)
     convs += [
         model.conv_out.conv_block.conv,
-        model.conv_out.conv,         # plain nn.Conv2d, bias=False
+        model.conv_out.conv,  # plain nn.Conv2d, bias=False
         model.conv_out16.conv_block.conv,
-        model.conv_out16.conv,       # plain nn.Conv2d, bias=False
+        model.conv_out16.conv,  # plain nn.Conv2d, bias=False
         model.conv_out32.conv_block.conv,
-        model.conv_out32.conv,       # plain nn.Conv2d, bias=False
+        model.conv_out32.conv,  # plain nn.Conv2d, bias=False
     ]
 
     return convs
@@ -374,6 +401,7 @@ def _conv_modules_in_forward_order(model: FaceParserResnet34Torch) -> list[nn.Co
 # ---------------------------------------------------------------------------
 # CUDA graph runner (fixed 512×512 — single captured graph)
 # ---------------------------------------------------------------------------
+
 
 class _CapturedGraph:
     """Wraps a single CUDA-graph capture for the fixed 512×512 input."""
@@ -388,7 +416,7 @@ class _CapturedGraph:
 
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self._graph):
-            self._out = model(self._inp)   # (1, 19, 512, 512) float32
+            self._out = model(self._inp)  # (1, 19, 512, 512) float32
 
     def __call__(self, inp: torch.Tensor) -> torch.Tensor:
         self._inp.copy_(inp)
@@ -397,7 +425,7 @@ class _CapturedGraph:
 
 
 def build_cuda_graph_runner(
-        model: FaceParserResnet34Torch,
+    model: FaceParserResnet34Torch,
 ) -> "_CapturedGraph | FaceParserResnet34Torch":
     """
     Capture a single CUDA graph for the fixed 512×512 input.

@@ -21,12 +21,12 @@ FC     : Flatten → (N,576) → Linear(576,212)           → (N,212)
 Output : (N, 212)  =  106 × (x, y)  in model space
          post-proc: (pred + 1) * 96.0  →  pixel coords in 192×192 crop
 """
+
 from __future__ import annotations
 
 import pathlib
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 # ---------------------------------------------------------------------------
@@ -35,85 +35,89 @@ import torch.nn.functional as F
 class Det106Torch(nn.Module):
     """MobileNetV1-style 106-point face landmark detector."""
 
-    NUM_REPEATS = 5   # DW+PW blocks at 12×12 feature map (256-ch)
+    NUM_REPEATS = 5  # DW+PW blocks at 12×12 feature map (256-ch)
 
     def __init__(self, compute_dtype: torch.dtype = torch.float16):
         super().__init__()
         self.compute_dtype = compute_dtype
 
         # Pre-processing constants (kept as buffers → move to device with .cuda())
-        self.register_buffer("_sub", torch.tensor(127.5,    dtype=torch.float32))
+        self.register_buffer("_sub", torch.tensor(127.5, dtype=torch.float32))
         self.register_buffer("_mul", torch.tensor(0.0078125, dtype=torch.float32))
 
         # ── Stem ──────────────────────────────────────────────────────────────
-        self.stem_conv  = nn.Conv2d(3,   16, 3, stride=2, padding=1, bias=True)
+        self.stem_conv = nn.Conv2d(3, 16, 3, stride=2, padding=1, bias=True)
         self.stem_prelu = nn.PReLU(16)
 
         # ── Block 1: DW(16,s=1) + PW(16→32) ─────────────────────────────────
-        self.dw16        = nn.Conv2d(16,  16, 3, stride=1, padding=1, groups=16, bias=True)
-        self.prelu_dw16  = nn.PReLU(16)
-        self.pw16        = nn.Conv2d(16,  32, 1, bias=True)
-        self.prelu_pw16  = nn.PReLU(32)
+        self.dw16 = nn.Conv2d(16, 16, 3, stride=1, padding=1, groups=16, bias=True)
+        self.prelu_dw16 = nn.PReLU(16)
+        self.pw16 = nn.Conv2d(16, 32, 1, bias=True)
+        self.prelu_pw16 = nn.PReLU(32)
 
         # ── Block 2: DW(32,s=2) + PW(32→64) ─────────────────────────────────
-        self.dw32        = nn.Conv2d(32,  32, 3, stride=2, padding=1, groups=32, bias=True)
-        self.prelu_dw32  = nn.PReLU(32)
-        self.pw32        = nn.Conv2d(32,  64, 1, bias=True)
-        self.prelu_pw32  = nn.PReLU(64)
+        self.dw32 = nn.Conv2d(32, 32, 3, stride=2, padding=1, groups=32, bias=True)
+        self.prelu_dw32 = nn.PReLU(32)
+        self.pw32 = nn.Conv2d(32, 64, 1, bias=True)
+        self.prelu_pw32 = nn.PReLU(64)
 
         # ── Block 3: DW(64,s=1) + PW(64→64) ─────────────────────────────────
-        self.dw64a       = nn.Conv2d(64,  64, 3, stride=1, padding=1, groups=64, bias=True)
+        self.dw64a = nn.Conv2d(64, 64, 3, stride=1, padding=1, groups=64, bias=True)
         self.prelu_dw64a = nn.PReLU(64)
-        self.pw64a       = nn.Conv2d(64,  64, 1, bias=True)
+        self.pw64a = nn.Conv2d(64, 64, 1, bias=True)
         self.prelu_pw64a = nn.PReLU(64)
 
         # ── Block 4: DW(64,s=2) + PW(64→128) ────────────────────────────────
-        self.dw64b       = nn.Conv2d(64,  64,  3, stride=2, padding=1, groups=64, bias=True)
+        self.dw64b = nn.Conv2d(64, 64, 3, stride=2, padding=1, groups=64, bias=True)
         self.prelu_dw64b = nn.PReLU(64)
-        self.pw64b       = nn.Conv2d(64,  128, 1, bias=True)
+        self.pw64b = nn.Conv2d(64, 128, 1, bias=True)
         self.prelu_pw64b = nn.PReLU(128)
 
         # ── Block 5: DW(128,s=1) + PW(128→128) ──────────────────────────────
-        self.dw128a       = nn.Conv2d(128, 128, 3, stride=1, padding=1, groups=128, bias=True)
+        self.dw128a = nn.Conv2d(128, 128, 3, stride=1, padding=1, groups=128, bias=True)
         self.prelu_dw128a = nn.PReLU(128)
-        self.pw128a       = nn.Conv2d(128, 128, 1, bias=True)
+        self.pw128a = nn.Conv2d(128, 128, 1, bias=True)
         self.prelu_pw128a = nn.PReLU(128)
 
         # ── Block 6: DW(128,s=2) + PW(128→256) ──────────────────────────────
-        self.dw128b       = nn.Conv2d(128, 128, 3, stride=2, padding=1, groups=128, bias=True)
+        self.dw128b = nn.Conv2d(128, 128, 3, stride=2, padding=1, groups=128, bias=True)
         self.prelu_dw128b = nn.PReLU(128)
-        self.pw128b       = nn.Conv2d(128, 256, 1, bias=True)
+        self.pw128b = nn.Conv2d(128, 256, 1, bias=True)
         self.prelu_pw128b = nn.PReLU(256)
 
         # ── 5× DW+PW repeats at 12×12, 256 channels ──────────────────────────
-        self.rep_dw  = nn.ModuleList([
-            nn.Conv2d(256, 256, 3, stride=1, padding=1, groups=256, bias=True)
-            for _ in range(self.NUM_REPEATS)
-        ])
+        self.rep_dw = nn.ModuleList(
+            [
+                nn.Conv2d(256, 256, 3, stride=1, padding=1, groups=256, bias=True)
+                for _ in range(self.NUM_REPEATS)
+            ]
+        )
         self.rep_pdw = nn.ModuleList([nn.PReLU(256) for _ in range(self.NUM_REPEATS)])
-        self.rep_pw  = nn.ModuleList([
-            nn.Conv2d(256, 256, 1, bias=True) for _ in range(self.NUM_REPEATS)
-        ])
+        self.rep_pw = nn.ModuleList(
+            [nn.Conv2d(256, 256, 1, bias=True) for _ in range(self.NUM_REPEATS)]
+        )
         self.rep_ppw = nn.ModuleList([nn.PReLU(256) for _ in range(self.NUM_REPEATS)])
 
         # ── Block 7: DW(256,s=2) + PW(256→512) ──────────────────────────────
-        self.dw256_s2       = nn.Conv2d(256, 256, 3, stride=2, padding=1, groups=256, bias=True)
+        self.dw256_s2 = nn.Conv2d(
+            256, 256, 3, stride=2, padding=1, groups=256, bias=True
+        )
         self.prelu_dw256_s2 = nn.PReLU(256)
-        self.pw256          = nn.Conv2d(256, 512, 1, bias=True)
-        self.prelu_pw256    = nn.PReLU(512)
+        self.pw256 = nn.Conv2d(256, 512, 1, bias=True)
+        self.prelu_pw256 = nn.PReLU(512)
 
         # ── Block 8: DW(512,s=1) + PW(512→512) ──────────────────────────────
-        self.dw512       = nn.Conv2d(512, 512, 3, stride=1, padding=1, groups=512, bias=True)
+        self.dw512 = nn.Conv2d(512, 512, 3, stride=1, padding=1, groups=512, bias=True)
         self.prelu_dw512 = nn.PReLU(512)
-        self.pw512       = nn.Conv2d(512, 512, 1, bias=True)
+        self.pw512 = nn.Conv2d(512, 512, 1, bias=True)
         self.prelu_pw512 = nn.PReLU(512)
 
         # ── Final regular conv 512→64, stride=2, 6→3 ─────────────────────────
-        self.conv_final  = nn.Conv2d(512, 64, 3, stride=2, padding=1, bias=True)
+        self.conv_final = nn.Conv2d(512, 64, 3, stride=2, padding=1, bias=True)
         self.prelu_final = nn.PReLU(64)
 
         # ── Fully-connected head ──────────────────────────────────────────────
-        self.fc = nn.Linear(576, 212, bias=True)   # 64×3×3 = 576
+        self.fc = nn.Linear(576, 212, bias=True)  # 64×3×3 = 576
 
     # -------------------------------------------------------------------------
 
@@ -154,7 +158,9 @@ class Det106Torch(nn.Module):
         h = self.prelu_pw128b(self.pw128b(h))
 
         # 5× repeat at 12×12
-        for dw, pdw, pw, ppw in zip(self.rep_dw, self.rep_pdw, self.rep_pw, self.rep_ppw):
+        for dw, pdw, pw, ppw in zip(
+            self.rep_dw, self.rep_pdw, self.rep_pw, self.rep_ppw
+        ):
             h = ppw(pw(pdw(dw(h))))
 
         # Block 7
@@ -196,89 +202,121 @@ class Det106Torch(nn.Module):
         from onnx import numpy_helper
 
         proto = onnx.load(str(onnx_path))
-        inits: dict[str, "numpy.ndarray"] = {
+        inits: dict = {
             i.name: numpy_helper.to_array(i) for i in proto.graph.initializer
         }
 
         # ── Collect positional weights in topological order ───────────────────
-        conv_params: list[tuple] = []   # (weight_arr, bias_arr | None)
-        prelu_slopes: list        = []
+        conv_params: list[tuple] = []  # (weight_arr, bias_arr | None)
+        prelu_slopes: list = []
 
         gemm_node = None
 
         for node in proto.graph.node:
             if node.op_type == "Conv":
-                w   = inits[node.input[1]]
-                b   = inits[node.input[2]] if len(node.input) > 2 else None
+                w = inits[node.input[1]]
+                b = inits[node.input[2]] if len(node.input) > 2 else None
                 conv_params.append((w, b))
             elif node.op_type == "PRelu":
                 prelu_slopes.append(inits[node.input[1]])
             elif node.op_type == "Gemm":
                 gemm_node = node
 
-        assert len(conv_params)  == 28, f"Expected 28 Conv nodes, got {len(conv_params)}"
-        assert len(prelu_slopes) == 28, f"Expected 28 PReLU nodes, got {len(prelu_slopes)}"
+        assert len(conv_params) == 28, f"Expected 28 Conv nodes, got {len(conv_params)}"
+        assert len(prelu_slopes) == 28, (
+            f"Expected 28 PReLU nodes, got {len(prelu_slopes)}"
+        )
 
         # ── Build model and assign weights ────────────────────────────────────
         m = cls(compute_dtype=compute_dtype)
 
-        ci = 0   # conv index
-        pi = 0   # prelu index
+        ci = 0  # conv index
+        pi = 0  # prelu index
 
         def _c(layer: nn.Conv2d) -> None:
             nonlocal ci
-            w, b = conv_params[ci]; ci += 1
+            w, b = conv_params[ci]
+            ci += 1
             layer.weight.data = torch.tensor(w, dtype=compute_dtype)
             if b is not None and layer.bias is not None:
                 layer.bias.data = torch.tensor(b, dtype=compute_dtype)
 
         def _p(layer: nn.PReLU) -> None:
             nonlocal pi
-            slope = prelu_slopes[pi]; pi += 1
+            slope = prelu_slopes[pi]
+            pi += 1
             # ONNX slope shape (C,1,1) → PyTorch PReLU weight shape (C,)
             layer.weight.data = torch.tensor(slope.reshape(-1), dtype=compute_dtype)
 
         # Stem
-        _c(m.stem_conv);  _p(m.stem_prelu)
+        _c(m.stem_conv)
+        _p(m.stem_prelu)
 
         # Block 1
-        _c(m.dw16);  _p(m.prelu_dw16);  _c(m.pw16);  _p(m.prelu_pw16)
+        _c(m.dw16)
+        _p(m.prelu_dw16)
+        _c(m.pw16)
+        _p(m.prelu_pw16)
         # Block 2
-        _c(m.dw32);  _p(m.prelu_dw32);  _c(m.pw32);  _p(m.prelu_pw32)
+        _c(m.dw32)
+        _p(m.prelu_dw32)
+        _c(m.pw32)
+        _p(m.prelu_pw32)
         # Block 3
-        _c(m.dw64a); _p(m.prelu_dw64a); _c(m.pw64a); _p(m.prelu_pw64a)
+        _c(m.dw64a)
+        _p(m.prelu_dw64a)
+        _c(m.pw64a)
+        _p(m.prelu_pw64a)
         # Block 4
-        _c(m.dw64b); _p(m.prelu_dw64b); _c(m.pw64b); _p(m.prelu_pw64b)
+        _c(m.dw64b)
+        _p(m.prelu_dw64b)
+        _c(m.pw64b)
+        _p(m.prelu_pw64b)
         # Block 5
-        _c(m.dw128a); _p(m.prelu_dw128a); _c(m.pw128a); _p(m.prelu_pw128a)
+        _c(m.dw128a)
+        _p(m.prelu_dw128a)
+        _c(m.pw128a)
+        _p(m.prelu_pw128a)
         # Block 6
-        _c(m.dw128b); _p(m.prelu_dw128b); _c(m.pw128b); _p(m.prelu_pw128b)
+        _c(m.dw128b)
+        _p(m.prelu_dw128b)
+        _c(m.pw128b)
+        _p(m.prelu_pw128b)
 
         # 5× repeats at 12×12
         for i in range(cls.NUM_REPEATS):
-            _c(m.rep_dw[i]);  _p(m.rep_pdw[i])
-            _c(m.rep_pw[i]);  _p(m.rep_ppw[i])
+            _c(m.rep_dw[i])
+            _p(m.rep_pdw[i])
+            _c(m.rep_pw[i])
+            _p(m.rep_ppw[i])
 
         # Block 7
-        _c(m.dw256_s2); _p(m.prelu_dw256_s2)
-        _c(m.pw256);    _p(m.prelu_pw256)
+        _c(m.dw256_s2)
+        _p(m.prelu_dw256_s2)
+        _c(m.pw256)
+        _p(m.prelu_pw256)
 
         # Block 8
-        _c(m.dw512); _p(m.prelu_dw512)
-        _c(m.pw512); _p(m.prelu_pw512)
+        _c(m.dw512)
+        _p(m.prelu_dw512)
+        _c(m.pw512)
+        _p(m.prelu_pw512)
 
         # Final conv
-        _c(m.conv_final); _p(m.prelu_final)
+        _c(m.conv_final)
+        _p(m.prelu_final)
 
         assert ci == 28, f"Conv weight cursor mismatch: {ci}"
         assert pi == 28, f"PReLU slope cursor mismatch: {pi}"
 
         # ── Gemm (fc) — load by name from Gemm node inputs ───────────────────
         assert gemm_node is not None, "Gemm node not found"
-        fc_w = inits[gemm_node.input[1]]   # (212, 576)  transB=1 matches nn.Linear layout
-        fc_b = inits[gemm_node.input[2]]   # (212,)
+        fc_w = inits[
+            gemm_node.input[1]
+        ]  # (212, 576)  transB=1 matches nn.Linear layout
+        fc_b = inits[gemm_node.input[2]]  # (212,)
         m.fc.weight.data = torch.tensor(fc_w, dtype=compute_dtype)
-        m.fc.bias.data   = torch.tensor(fc_b, dtype=compute_dtype)
+        m.fc.bias.data = torch.tensor(fc_b, dtype=compute_dtype)
 
         return m
 
@@ -316,7 +354,7 @@ def build_cuda_graph_runner(model: Det106Torch, input_shape: tuple = (1, 3, 192,
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=warmup_stream):
         with torch.no_grad():
-            static_out = model(static_in)   # (N, 212)
+            static_out = model(static_in)  # (N, 212)
 
     def runner(x: torch.Tensor) -> torch.Tensor:
         static_in.copy_(x)

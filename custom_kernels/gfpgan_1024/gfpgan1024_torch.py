@@ -2,6 +2,7 @@
 GFPGAN-1024 PyTorch wrapper.
 Re-exports GFPGANTorch configured for the gfpgan-1024.onnx model.
 """
+
 from __future__ import annotations
 import sys
 from pathlib import Path

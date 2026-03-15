@@ -49,6 +49,7 @@ Weight loading
     corresponding PyTorch parameters in the same structural order.
     Pad pads arrays (int64) and Reshape shape constants are skipped.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -63,6 +64,7 @@ import torch.nn.functional as F
 # Building blocks
 # ---------------------------------------------------------------------------
 
+
 class _FirstBlock(nn.Module):
     """First block of stage 1 — no leading PReLU (stem PReLU serves as activation)."""
 
@@ -71,7 +73,7 @@ class _FirstBlock(nn.Module):
         H = C // 2
         self.pw_sq = nn.Conv2d(C, H, 1, bias=True)
         self.prelu = nn.PReLU(H)
-        self.dw    = nn.Conv2d(H, H, 3, padding=1, groups=H, bias=True)
+        self.dw = nn.Conv2d(H, H, 3, padding=1, groups=H, bias=True)
         self.pw_ex = nn.Conv2d(H, C, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -90,10 +92,10 @@ class _ResBlock(nn.Module):
         super().__init__()
         H = C // 2
         self.prelu_in = nn.PReLU(C)
-        self.pw_sq    = nn.Conv2d(C, H, 1, bias=True)
+        self.pw_sq = nn.Conv2d(C, H, 1, bias=True)
         self.prelu_sq = nn.PReLU(H)
-        self.dw       = nn.Conv2d(H, H, 3, padding=1, groups=H, bias=True)
-        self.pw_ex    = nn.Conv2d(H, C, 1, bias=True)
+        self.dw = nn.Conv2d(H, H, 3, padding=1, groups=H, bias=True)
+        self.pw_ex = nn.Conv2d(H, C, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.prelu_in(x)
@@ -103,6 +105,7 @@ class _ResBlock(nn.Module):
 # ---------------------------------------------------------------------------
 # Full FaceLandmark478 model
 # ---------------------------------------------------------------------------
+
 
 class FaceLandmark478Torch(nn.Module):
     """
@@ -120,27 +123,27 @@ class FaceLandmark478Torch(nn.Module):
         # ── Stem ─────────────────────────────────────────────────────────────
         # Conv(3→16, 3×3, stride=2) — asymmetric pad [top=0,left=0,bot=1,right=1]
         # applied via F.pad before the conv (padding=0 here)
-        self.stem_conv  = nn.Conv2d(3,  16, 3, stride=2, padding=0, bias=True)
+        self.stem_conv = nn.Conv2d(3, 16, 3, stride=2, padding=0, bias=True)
         self.stem_prelu = nn.PReLU(16)
 
         # ── Stage 1: 128×128, 16 ch — 4 blocks ──────────────────────────────
-        self.s1_b1  = _FirstBlock(16)
-        self.s1_b2  = _ResBlock(16)
-        self.s1_b3  = _ResBlock(16)
-        self.s1_b4  = _ResBlock(16)
-        self.s1_act = nn.PReLU(16)          # pre-transition activation
+        self.s1_b1 = _FirstBlock(16)
+        self.s1_b2 = _ResBlock(16)
+        self.s1_b3 = _ResBlock(16)
+        self.s1_b4 = _ResBlock(16)
+        self.s1_act = nn.PReLU(16)  # pre-transition activation
 
         # ── Transition 1→2: MaxPool + Conv(16→16, 2×2) + Pad(16→32) ─────────
         self.t12_conv = nn.Conv2d(16, 16, 2, stride=2, padding=0, bias=True)
 
         # ── Stage 2: 64×64, 32 ch — 5 blocks (first = expand-only) ──────────
         self.s2_tb_prelu = nn.PReLU(16)
-        self.s2_tb_dw    = nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=True)
-        self.s2_tb_pwex  = nn.Conv2d(16, 32, 1, bias=True)
-        self.s2_b2  = _ResBlock(32)
-        self.s2_b3  = _ResBlock(32)
-        self.s2_b4  = _ResBlock(32)
-        self.s2_b5  = _ResBlock(32)
+        self.s2_tb_dw = nn.Conv2d(16, 16, 3, padding=1, groups=16, bias=True)
+        self.s2_tb_pwex = nn.Conv2d(16, 32, 1, bias=True)
+        self.s2_b2 = _ResBlock(32)
+        self.s2_b3 = _ResBlock(32)
+        self.s2_b4 = _ResBlock(32)
+        self.s2_b5 = _ResBlock(32)
         self.s2_act = nn.PReLU(32)
 
         # ── Transition 2→3: MaxPool + Conv(32→32, 2×2) + Pad(32→64) ─────────
@@ -148,12 +151,12 @@ class FaceLandmark478Torch(nn.Module):
 
         # ── Stage 3: 32×32, 64 ch — 5 blocks ────────────────────────────────
         self.s3_tb_prelu = nn.PReLU(32)
-        self.s3_tb_dw    = nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=True)
-        self.s3_tb_pwex  = nn.Conv2d(32, 64, 1, bias=True)
-        self.s3_b2  = _ResBlock(64)
-        self.s3_b3  = _ResBlock(64)
-        self.s3_b4  = _ResBlock(64)
-        self.s3_b5  = _ResBlock(64)
+        self.s3_tb_dw = nn.Conv2d(32, 32, 3, padding=1, groups=32, bias=True)
+        self.s3_tb_pwex = nn.Conv2d(32, 64, 1, bias=True)
+        self.s3_b2 = _ResBlock(64)
+        self.s3_b3 = _ResBlock(64)
+        self.s3_b4 = _ResBlock(64)
+        self.s3_b5 = _ResBlock(64)
         self.s3_act = nn.PReLU(64)
 
         # ── Transition 3→4: MaxPool + Conv(64→64, 2×2) + Pad(64→128) ────────
@@ -161,12 +164,12 @@ class FaceLandmark478Torch(nn.Module):
 
         # ── Stage 4: 16×16, 128 ch — 5 blocks ───────────────────────────────
         self.s4_tb_prelu = nn.PReLU(64)
-        self.s4_tb_dw    = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
-        self.s4_tb_pwex  = nn.Conv2d(64, 128, 1, bias=True)
-        self.s4_b2  = _ResBlock(128)
-        self.s4_b3  = _ResBlock(128)
-        self.s4_b4  = _ResBlock(128)
-        self.s4_b5  = _ResBlock(128)
+        self.s4_tb_dw = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
+        self.s4_tb_pwex = nn.Conv2d(64, 128, 1, bias=True)
+        self.s4_b2 = _ResBlock(128)
+        self.s4_b3 = _ResBlock(128)
+        self.s4_b4 = _ResBlock(128)
+        self.s4_b5 = _ResBlock(128)
         self.s4_act = nn.PReLU(128)
 
         # ── Transition 4→5: MaxPool + Conv(128→64, 2×2) [no Pad] ─────────────
@@ -175,12 +178,12 @@ class FaceLandmark478Torch(nn.Module):
 
         # ── Stage 5: 8×8, 128 ch — 5 blocks ─────────────────────────────────
         self.s5_tb_prelu = nn.PReLU(64)
-        self.s5_tb_dw    = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
-        self.s5_tb_pwex  = nn.Conv2d(64, 128, 1, bias=True)
-        self.s5_b2  = _ResBlock(128)
-        self.s5_b3  = _ResBlock(128)
-        self.s5_b4  = _ResBlock(128)
-        self.s5_b5  = _ResBlock(128)
+        self.s5_tb_dw = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
+        self.s5_tb_pwex = nn.Conv2d(64, 128, 1, bias=True)
+        self.s5_b2 = _ResBlock(128)
+        self.s5_b3 = _ResBlock(128)
+        self.s5_b4 = _ResBlock(128)
+        self.s5_b5 = _ResBlock(128)
         self.s5_act = nn.PReLU(128)
 
         # ── Transition 5→6: MaxPool + Conv(128→64, 2×2) ─────────────────────
@@ -188,12 +191,12 @@ class FaceLandmark478Torch(nn.Module):
 
         # ── Stage 6: 4×4, 128 ch — 5 blocks ─────────────────────────────────
         self.s6_tb_prelu = nn.PReLU(64)
-        self.s6_tb_dw    = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
-        self.s6_tb_pwex  = nn.Conv2d(64, 128, 1, bias=True)
-        self.s6_b2  = _ResBlock(128)
-        self.s6_b3  = _ResBlock(128)
-        self.s6_b4  = _ResBlock(128)
-        self.s6_b5  = _ResBlock(128)
+        self.s6_tb_dw = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
+        self.s6_tb_pwex = nn.Conv2d(64, 128, 1, bias=True)
+        self.s6_b2 = _ResBlock(128)
+        self.s6_b3 = _ResBlock(128)
+        self.s6_b4 = _ResBlock(128)
+        self.s6_b5 = _ResBlock(128)
         self.s6_act = nn.PReLU(128)
 
         # ── Transition 6→7: MaxPool + Conv(128→64, 2×2) ─────────────────────
@@ -201,18 +204,18 @@ class FaceLandmark478Torch(nn.Module):
 
         # ── Stage 7: 2×2, 128 ch — 5 blocks (no separate stage_act) ─────────
         self.s7_tb_prelu = nn.PReLU(64)
-        self.s7_tb_dw    = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
-        self.s7_tb_pwex  = nn.Conv2d(64, 128, 1, bias=True)
-        self.s7_b2  = _ResBlock(128)
-        self.s7_b3  = _ResBlock(128)
-        self.s7_b4  = _ResBlock(128)
-        self.s7_b5  = _ResBlock(128)
+        self.s7_tb_dw = nn.Conv2d(64, 64, 3, padding=1, groups=64, bias=True)
+        self.s7_tb_pwex = nn.Conv2d(64, 128, 1, bias=True)
+        self.s7_b2 = _ResBlock(128)
+        self.s7_b3 = _ResBlock(128)
+        self.s7_b4 = _ResBlock(128)
+        self.s7_b5 = _ResBlock(128)
 
         # ── Head (operates on 2×2 spatial) ───────────────────────────────────
-        self.head_act   = nn.PReLU(128)                       # node 214
-        self.head_score = nn.Conv2d(128,    1, 2, bias=True)  # node 215 → score
-        self.head_vis   = nn.Conv2d(128,    1, 2, bias=True)  # node 216 → vis
-        self.head_lmk   = nn.Conv2d(128, 1434, 2, bias=True)  # node 217 → landmarks
+        self.head_act = nn.PReLU(128)  # node 214
+        self.head_score = nn.Conv2d(128, 1, 2, bias=True)  # node 215 → score
+        self.head_vis = nn.Conv2d(128, 1, 2, bias=True)  # node 216 → vis
+        self.head_lmk = nn.Conv2d(128, 1434, 2, bias=True)  # node 217 → landmarks
 
     # ------------------------------------------------------------------
 
@@ -230,64 +233,82 @@ class FaceLandmark478Torch(nn.Module):
 
         # Stem — asymmetric spatial pad: top=0, left=0, bottom=1, right=1
         h = F.pad(h, (0, 1, 0, 1))
-        h = self.stem_prelu(self.stem_conv(h))              # (N, 16, 128, 128)
+        h = self.stem_prelu(self.stem_conv(h))  # (N, 16, 128, 128)
 
         # Stage 1
         h = self.s1_b1(h)
         h = self.s1_b2(h)
         h = self.s1_b3(h)
         h = self.s1_b4(h)
-        h = self.s1_act(h)                                  # (N, 16, 128, 128)
+        h = self.s1_act(h)  # (N, 16, 128, 128)
 
         # Transition 1→2: MaxPool → Pad = skip; strided Conv → PReLU → DW → PW_ex = main
-        skip = F.pad(F.max_pool2d(h, 2, stride=2), (0, 0, 0, 0, 0, 16))  # (N, 32, 64, 64)
+        skip = F.pad(
+            F.max_pool2d(h, 2, stride=2), (0, 0, 0, 0, 0, 16)
+        )  # (N, 32, 64, 64)
         h = self.s2_tb_pwex(self.s2_tb_dw(self.s2_tb_prelu(self.t12_conv(h)))) + skip
-        h = self.s2_b2(h); h = self.s2_b3(h)
-        h = self.s2_b4(h); h = self.s2_b5(h)
-        h = self.s2_act(h)                                  # (N, 32, 64, 64)
+        h = self.s2_b2(h)
+        h = self.s2_b3(h)
+        h = self.s2_b4(h)
+        h = self.s2_b5(h)
+        h = self.s2_act(h)  # (N, 32, 64, 64)
 
         # Transition 2→3: MaxPool → Pad = skip; strided Conv → PReLU → DW → PW_ex = main
-        skip = F.pad(F.max_pool2d(h, 2, stride=2), (0, 0, 0, 0, 0, 32))  # (N, 64, 32, 32)
+        skip = F.pad(
+            F.max_pool2d(h, 2, stride=2), (0, 0, 0, 0, 0, 32)
+        )  # (N, 64, 32, 32)
         h = self.s3_tb_pwex(self.s3_tb_dw(self.s3_tb_prelu(self.t23_conv(h)))) + skip
-        h = self.s3_b2(h); h = self.s3_b3(h)
-        h = self.s3_b4(h); h = self.s3_b5(h)
-        h = self.s3_act(h)                                  # (N, 64, 32, 32)
+        h = self.s3_b2(h)
+        h = self.s3_b3(h)
+        h = self.s3_b4(h)
+        h = self.s3_b5(h)
+        h = self.s3_act(h)  # (N, 64, 32, 32)
 
         # Transition 3→4: MaxPool → Pad = skip; strided Conv → PReLU → DW → PW_ex = main
-        skip = F.pad(F.max_pool2d(h, 2, stride=2), (0, 0, 0, 0, 0, 64))  # (N, 128, 16, 16)
+        skip = F.pad(
+            F.max_pool2d(h, 2, stride=2), (0, 0, 0, 0, 0, 64)
+        )  # (N, 128, 16, 16)
         h = self.s4_tb_pwex(self.s4_tb_dw(self.s4_tb_prelu(self.t34_conv(h)))) + skip
-        h = self.s4_b2(h); h = self.s4_b3(h)
-        h = self.s4_b4(h); h = self.s4_b5(h)
-        h = self.s4_act(h)                                  # (N, 128, 16, 16)
+        h = self.s4_b2(h)
+        h = self.s4_b3(h)
+        h = self.s4_b4(h)
+        h = self.s4_b5(h)
+        h = self.s4_act(h)  # (N, 128, 16, 16)
 
         # Transition 4→5: MaxPool (skip=128ch) + strided Conv (128→64, processed)
-        skip = F.max_pool2d(h, 2, stride=2)                 # (N, 128, 8, 8)
+        skip = F.max_pool2d(h, 2, stride=2)  # (N, 128, 8, 8)
         h = self.s5_tb_pwex(self.s5_tb_dw(self.s5_tb_prelu(self.t45_conv(h)))) + skip
-        h = self.s5_b2(h); h = self.s5_b3(h)
-        h = self.s5_b4(h); h = self.s5_b5(h)
-        h = self.s5_act(h)                                  # (N, 128, 8, 8)
+        h = self.s5_b2(h)
+        h = self.s5_b3(h)
+        h = self.s5_b4(h)
+        h = self.s5_b5(h)
+        h = self.s5_act(h)  # (N, 128, 8, 8)
 
         # Transition 5→6
-        skip = F.max_pool2d(h, 2, stride=2)                 # (N, 128, 4, 4)
+        skip = F.max_pool2d(h, 2, stride=2)  # (N, 128, 4, 4)
         h = self.s6_tb_pwex(self.s6_tb_dw(self.s6_tb_prelu(self.t56_conv(h)))) + skip
-        h = self.s6_b2(h); h = self.s6_b3(h)
-        h = self.s6_b4(h); h = self.s6_b5(h)
-        h = self.s6_act(h)                                  # (N, 128, 4, 4)
+        h = self.s6_b2(h)
+        h = self.s6_b3(h)
+        h = self.s6_b4(h)
+        h = self.s6_b5(h)
+        h = self.s6_act(h)  # (N, 128, 4, 4)
 
         # Transition 6→7
-        skip = F.max_pool2d(h, 2, stride=2)                 # (N, 128, 2, 2)
+        skip = F.max_pool2d(h, 2, stride=2)  # (N, 128, 2, 2)
         h = self.s7_tb_pwex(self.s7_tb_dw(self.s7_tb_prelu(self.t67_conv(h)))) + skip
-        h = self.s7_b2(h); h = self.s7_b3(h)
-        h = self.s7_b4(h); h = self.s7_b5(h)               # (N, 128, 2, 2)
+        h = self.s7_b2(h)
+        h = self.s7_b3(h)
+        h = self.s7_b4(h)
+        h = self.s7_b5(h)  # (N, 128, 2, 2)
 
         # Head
-        h = self.head_act(h)                                # (N, 128, 2, 2)
-        score_raw = self.head_score(h)                      # (N, 1, 1, 1)
-        vis       = self.head_vis(h).float()                # (N, 1, 1, 1)
-        lmk_raw   = self.head_lmk(h)                       # (N, 1434, 1, 1)
+        h = self.head_act(h)  # (N, 128, 2, 2)
+        score_raw = self.head_score(h)  # (N, 1, 1, 1)
+        vis = self.head_vis(h).float()  # (N, 1, 1, 1)
+        lmk_raw = self.head_lmk(h)  # (N, 1434, 1, 1)
 
-        score = torch.sigmoid(score_raw).reshape(N, 1).float()        # (N, 1)
-        lmk   = lmk_raw.permute(0, 2, 3, 1).reshape(N, 1, 1, 1434).float()  # (N,1,1,1434)
+        score = torch.sigmoid(score_raw).reshape(N, 1).float()  # (N, 1)
+        lmk = lmk_raw.permute(0, 2, 3, 1).reshape(N, 1, 1, 1434).float()  # (N,1,1,1434)
 
         return lmk, vis, score
 
@@ -312,14 +333,13 @@ class FaceLandmark478Torch(nn.Module):
         import onnx
         from onnx import numpy_helper
 
-        proto    = onnx.load(str(onnx_path))
-        g        = proto.graph
-        init_map = {init.name: numpy_helper.to_array(init)
-                    for init in g.initializer}
+        proto = onnx.load(str(onnx_path))
+        g = proto.graph
+        init_map = {init.name: numpy_helper.to_array(init) for init in g.initializer}
 
         # ── Collect Conv weights and PReLU slopes in node order ───────────
-        conv_params:  list = []   # (weight_arr, bias_arr | None)
-        prelu_params: list = []   # slope_arr
+        conv_params: list = []  # (weight_arr, bias_arr | None)
+        prelu_params: list = []  # slope_arr
 
         for node in g.node:
             if node.op_type == "Conv":
@@ -333,14 +353,15 @@ class FaceLandmark478Torch(nn.Module):
                     prelu_params.append(s)
 
         # ── Build model ───────────────────────────────────────────────────
-        m  = cls(compute_dtype=compute_dtype)
-        ci = 0   # conv index
-        pi = 0   # prelu index
+        m = cls(compute_dtype=compute_dtype)
+        ci = 0  # conv index
+        pi = 0  # prelu index
 
         def _c(layer):
             """Assign next Conv weight+bias."""
             nonlocal ci
-            w, b = conv_params[ci]; ci += 1
+            w, b = conv_params[ci]
+            ci += 1
             layer.weight.data = torch.from_numpy(w.copy()).to(compute_dtype)
             if b is not None and layer.bias is not None:
                 layer.bias.data = torch.from_numpy(b.copy()).to(compute_dtype)
@@ -348,35 +369,45 @@ class FaceLandmark478Torch(nn.Module):
         def _p(layer):
             """Assign next PReLU slope (ONNX shape (1,C,1,1) → PyTorch (C,))."""
             nonlocal pi
-            s = prelu_params[pi]; pi += 1
+            s = prelu_params[pi]
+            pi += 1
             layer.weight.data = torch.from_numpy(s.reshape(-1).copy()).to(compute_dtype)
 
         # Stem
-        _c(m.stem_conv);  _p(m.stem_prelu)
+        _c(m.stem_conv)
+        _p(m.stem_prelu)
 
         # Stage 1 — block 1 (FirstBlock: pw_sq, prelu, dw, pw_ex)
-        _c(m.s1_b1.pw_sq); _p(m.s1_b1.prelu)
-        _c(m.s1_b1.dw);    _c(m.s1_b1.pw_ex)
+        _c(m.s1_b1.pw_sq)
+        _p(m.s1_b1.prelu)
+        _c(m.s1_b1.dw)
+        _c(m.s1_b1.pw_ex)
 
         # Stage 1 — blocks 2-4 (ResBlock)
         for blk in (m.s1_b2, m.s1_b3, m.s1_b4):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
 
-        _p(m.s1_act)        # s1 final activation
+        _p(m.s1_act)  # s1 final activation
 
         # Transition 1→2
-        _c(m.t12_conv)      # Pad node pads are int64 — no weight to assign
+        _c(m.t12_conv)  # Pad node pads are int64 — no weight to assign
 
         # Stage 2 — transition block (prelu, dw, pw_ex)
-        _p(m.s2_tb_prelu); _c(m.s2_tb_dw); _c(m.s2_tb_pwex)
+        _p(m.s2_tb_prelu)
+        _c(m.s2_tb_dw)
+        _c(m.s2_tb_pwex)
 
         # Stage 2 — blocks 2-5
         for blk in (m.s2_b2, m.s2_b3, m.s2_b4, m.s2_b5):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
 
         _p(m.s2_act)
 
@@ -384,65 +415,89 @@ class FaceLandmark478Torch(nn.Module):
         _c(m.t23_conv)
 
         # Stage 3
-        _p(m.s3_tb_prelu); _c(m.s3_tb_dw); _c(m.s3_tb_pwex)
+        _p(m.s3_tb_prelu)
+        _c(m.s3_tb_dw)
+        _c(m.s3_tb_pwex)
         for blk in (m.s3_b2, m.s3_b3, m.s3_b4, m.s3_b5):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
         _p(m.s3_act)
 
         # Transition 3→4
         _c(m.t34_conv)
 
         # Stage 4
-        _p(m.s4_tb_prelu); _c(m.s4_tb_dw); _c(m.s4_tb_pwex)
+        _p(m.s4_tb_prelu)
+        _c(m.s4_tb_dw)
+        _c(m.s4_tb_pwex)
         for blk in (m.s4_b2, m.s4_b3, m.s4_b4, m.s4_b5):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
         _p(m.s4_act)
 
         # Transition 4→5
         _c(m.t45_conv)
 
         # Stage 5
-        _p(m.s5_tb_prelu); _c(m.s5_tb_dw); _c(m.s5_tb_pwex)
+        _p(m.s5_tb_prelu)
+        _c(m.s5_tb_dw)
+        _c(m.s5_tb_pwex)
         for blk in (m.s5_b2, m.s5_b3, m.s5_b4, m.s5_b5):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
         _p(m.s5_act)
 
         # Transition 5→6
         _c(m.t56_conv)
 
         # Stage 6
-        _p(m.s6_tb_prelu); _c(m.s6_tb_dw); _c(m.s6_tb_pwex)
+        _p(m.s6_tb_prelu)
+        _c(m.s6_tb_dw)
+        _c(m.s6_tb_pwex)
         for blk in (m.s6_b2, m.s6_b3, m.s6_b4, m.s6_b5):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
         _p(m.s6_act)
 
         # Transition 6→7
         _c(m.t67_conv)
 
         # Stage 7 (no separate stage_act — head_act follows immediately)
-        _p(m.s7_tb_prelu); _c(m.s7_tb_dw); _c(m.s7_tb_pwex)
+        _p(m.s7_tb_prelu)
+        _c(m.s7_tb_dw)
+        _c(m.s7_tb_pwex)
         for blk in (m.s7_b2, m.s7_b3, m.s7_b4, m.s7_b5):
             _p(blk.prelu_in)
-            _c(blk.pw_sq); _p(blk.prelu_sq)
-            _c(blk.dw);    _c(blk.pw_ex)
+            _c(blk.pw_sq)
+            _p(blk.prelu_sq)
+            _c(blk.dw)
+            _c(blk.pw_ex)
 
         # Head
         _p(m.head_act)
-        _c(m.head_score)   # node 215
-        _c(m.head_vis)     # node 216
-        _c(m.head_lmk)     # node 217
+        _c(m.head_score)  # node 215
+        _c(m.head_vis)  # node 216
+        _c(m.head_lmk)  # node 217
 
         print(f"[face_landmark478] loaded: {ci} Conv + {pi} PReLU weight tensors")
-        assert ci == len(conv_params),  f"Conv mismatch: assigned {ci}/{len(conv_params)}"
-        assert pi == len(prelu_params), f"PReLU mismatch: assigned {pi}/{len(prelu_params)}"
+        assert ci == len(conv_params), (
+            f"Conv mismatch: assigned {ci}/{len(conv_params)}"
+        )
+        assert pi == len(prelu_params), (
+            f"PReLU mismatch: assigned {pi}/{len(prelu_params)}"
+        )
         return m
 
 
@@ -450,16 +505,17 @@ class FaceLandmark478Torch(nn.Module):
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 class FaceLandmark478CUDAGraphRunner:
     """Wraps FaceLandmark478Torch in a CUDA graph for minimal kernel-launch overhead."""
 
-    def __init__(self, model: FaceLandmark478Torch,
-                 input_shape: tuple = (1, 3, 256, 256)):
-        self.model  = model
+    def __init__(
+        self, model: FaceLandmark478Torch, input_shape: tuple = (1, 3, 256, 256)
+    ):
+        self.model = model
         self.device = next(model.parameters()).device
 
-        self._x_buf = torch.zeros(input_shape, dtype=torch.float32,
-                                  device=self.device)
+        self._x_buf = torch.zeros(input_shape, dtype=torch.float32, device=self.device)
 
         # Warm-up (cuDNN auto-tune, workspace allocation)
         with torch.no_grad():
@@ -471,7 +527,7 @@ class FaceLandmark478CUDAGraphRunner:
         self._graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(self._graph):
-                self._out = model(self._x_buf)   # (lmk, vis, score)
+                self._out = model(self._x_buf)  # (lmk, vis, score)
 
     def __call__(self, x: torch.Tensor):
         """

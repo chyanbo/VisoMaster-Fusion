@@ -22,6 +22,7 @@ Output directory:  model_assets/custom_kernels/
   style_block_ext.pyd     -- InSwapper cuBLASLt HGEMM with fused BIAS epilogue (Phase 3)
   triton_cache/           -- Triton JIT compiled kernels (GPU-arch specific)
 """
+
 from __future__ import annotations
 
 import os
@@ -48,12 +49,15 @@ def _find_hostx64_cl() -> str | None:
     Only ``Hostx64`` variants are considered.  The ``HostX86`` (32-bit host)
     crashes with INTERNAL COMPILER ERROR on large PyTorch headers.
     """
-    import subprocess, glob as _glob
+    import subprocess
+    import glob as _glob
 
     cl_dirs: list[str] = []
 
     # --- 1. vswhere (canonical, drive-agnostic) ---
-    vswhere = Path(r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe")
+    vswhere = Path(
+        r"C:\Program Files (x86)\Microsoft Visual Studio\Installer\vswhere.exe"
+    )
     if vswhere.exists():
         try:
             # Ask vswhere for all VS installs (latest first) that provide
@@ -61,13 +65,16 @@ def _find_hostx64_cl() -> str | None:
             result = subprocess.run(
                 [
                     str(vswhere),
-                    "-all",                # all products (Community, BuildTools, …)
-                    "-prerelease",         # include Preview if present
-                    "-requires", "Microsoft.VisualCpp.Tools.HostX64.TargetX64",
+                    "-all",  # all products (Community, BuildTools, …)
+                    "-prerelease",  # include Preview if present
+                    "-requires",
+                    "Microsoft.VisualCpp.Tools.HostX64.TargetX64",
                     "-find",
                     r"VC\Tools\MSVC\**\bin\Hostx64\x64\cl.exe",
                 ],
-                capture_output=True, text=True, timeout=15,
+                capture_output=True,
+                text=True,
+                timeout=15,
             )
             for line in result.stdout.strip().splitlines():
                 p = Path(line.strip())
@@ -125,6 +132,7 @@ def _ensure_msvc_on_path() -> None:
 
     if cl_x64 is None:
         import shutil
+
         cl_x64 = shutil.which("cl")  # last-resort: whatever is on PATH
 
     if cl_x64 is None:
@@ -148,6 +156,7 @@ def _ensure_msvc_on_path() -> None:
     _kits_root: Path | None = None
     try:
         import winreg
+
         for _hive in [winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER]:
             for _kp in [
                 r"SOFTWARE\Microsoft\Windows Kits\Installed Roots",
@@ -186,10 +195,14 @@ def _ensure_msvc_on_path() -> None:
             sdk_incs.append(str(sdk_ver_dir / "shared"))
             sdk_incs.append(str(sdk_ver_dir / "um"))
             _wk_lib = _kits_root / "Lib" / sdk_ver_dir.name
-            sdk_libs.extend([str(_wk_lib / "ucrt" / "x64"), str(_wk_lib / "um" / "x64")])
+            sdk_libs.extend(
+                [str(_wk_lib / "ucrt" / "x64"), str(_wk_lib / "um" / "x64")]
+            )
 
-    os.environ["INCLUDE"] = os.pathsep.join([inc] + sdk_incs + [os.environ.get("INCLUDE", "")])
-    os.environ["LIB"]     = os.pathsep.join([lib] + sdk_libs + [os.environ.get("LIB", "")])
+    os.environ["INCLUDE"] = os.pathsep.join(
+        [inc] + sdk_incs + [os.environ.get("INCLUDE", "")]
+    )
+    os.environ["LIB"] = os.pathsep.join([lib] + sdk_libs + [os.environ.get("LIB", "")])
 
     # Override NVCC's registry-based host-compiler detection (the registry may
     # point to a HostX86 binary even when Hostx64 is on PATH).
@@ -203,7 +216,9 @@ def _ensure_msvc_on_path() -> None:
     if sdk_incs:
         print(f"[build_kernels] Windows SDK inc: {sdk_incs[0]}")
     else:
-        print("[build_kernels] WARNING: Windows SDK not found — stddef.h may be missing.")
+        print(
+            "[build_kernels] WARNING: Windows SDK not found — stddef.h may be missing."
+        )
 
 
 _ensure_msvc_on_path()
@@ -225,19 +240,22 @@ ARCH_FLAGS = [
     "-gencode=arch=compute_86,code=sm_86",
     "-gencode=arch=compute_89,code=sm_89",
     "-gencode=arch=compute_90,code=sm_90",
-    "-gencode=arch=compute_120,code=sm_120",   # Blackwell (RTX 50xx) — requires CUDA 12.8+
+    "-gencode=arch=compute_120,code=sm_120",  # Blackwell (RTX 50xx) — requires CUDA 12.8+
     # Forward compatibility: embed PTX for the highest supported arch so future
     # GPUs can JIT-compile from PTX at first use.
     "-gencode=arch=compute_120,code=compute_120",
 ]
 
 COMMON_CUDA_FLAGS = [
-    "--use_fast_math", "-O3", "-std=c++17",
+    "--use_fast_math",
+    "-O3",
+    "-std=c++17",
     # Workaround for MSVC 14.37 Internal Compiler Error triggered by PyTorch 2.8
     # headers (TensorOptions.h / std::make_optional noexcept template chain) when
     # cl.exe is invoked as NVCC's host compiler.  /d2SSAOptimizer- disables the
     # specific SSA optimization pass that causes the ICE.
-    "-Xcompiler", "/d2SSAOptimizer-",
+    "-Xcompiler",
+    "/d2SSAOptimizer-",
 ] + ARCH_FLAGS
 
 
@@ -248,6 +266,7 @@ def _add_dll_dirs():
     if sys.platform == "win32":
         try:
             import torch as _t
+
             tlib = Path(_t.__file__).parent / "lib"
             if tlib.is_dir():
                 os.add_dll_directory(str(tlib))
@@ -255,66 +274,141 @@ def _add_dll_dirs():
             pass
 
 
-def compile_ext(name: str, cuda_src: str, cpp_src: str,
-                extra_ldflags: "list[str] | None" = None) -> bool:
+def compile_ext(
+    name: str, cuda_src: str, cpp_src: str, extra_ldflags: "list[str] | None" = None
+) -> bool:
     """Compile a CUDA extension in a fresh subprocess and save the .pyd to OUT_DIR.
 
     Running each kernel in its own subprocess prevents CUDA 12.9 cicc.exe
     ACCESS_VIOLATION crashes that occur when two kernels are compiled back-to-back
     in the same Python process (process-memory / temp-file state pollution).
     """
-    import subprocess, shutil, glob as _glob, tempfile, json, textwrap
+    import subprocess
+    import tempfile
+    import json
+    import textwrap
 
     pyd = OUT_DIR / f"{name}.pyd"
     build_dir = OUT_DIR / f"_build_{name}"
     build_dir.mkdir(parents=True, exist_ok=True)
     print(f"\n[build_kernels] Compiling {name} ...")
-    print(f"  Target archs : {', '.join(f'sm_{a}' for a in [75,80,86,89,90,120])}")
+    print(f"  Target archs : {', '.join(f'sm_{a}' for a in [75, 80, 86, 89, 90, 120])}")
     print(f"  Output       : {pyd}")
     t0 = time.perf_counter()
 
     # Serialise sources and flags into a temp JSON so the subprocess can read them
     # without shell-escaping headaches.
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False,
-                                     encoding="utf-8") as fh:
-        json.dump({
-            "name": name,
-            "cuda_src": cuda_src,
-            "cpp_src": cpp_src,
-            "cuda_flags": COMMON_CUDA_FLAGS,
-            "extra_ldflags": extra_ldflags or [],
-            "build_dir": str(build_dir),
-            "root": str(ROOT),
-        }, fh)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, encoding="utf-8"
+    ) as fh:
+        json.dump(
+            {
+                "name": name,
+                "cuda_src": cuda_src,
+                "cpp_src": cpp_src,
+                "cuda_flags": COMMON_CUDA_FLAGS,
+                "extra_ldflags": extra_ldflags or [],
+                "build_dir": str(build_dir),
+                "root": str(ROOT),
+            },
+            fh,
+        )
         spec_path = fh.name
 
     worker_code = textwrap.dedent(r"""
-        import sys, os, json, pathlib, glob, shutil
+        import sys, os, json, pathlib, glob, shutil, hashlib
         spec_path = sys.argv[1]
         with open(spec_path, encoding="utf-8") as f:
             spec = json.load(f)
+
+        build_dir = pathlib.Path(spec["build_dir"])
+        name      = spec["name"]
+        dst       = str(build_dir.parent / (name + ".pyd"))
+
+        # ------------------------------------------------------------------
+        # Fast path: if the source + flags hash matches the last successful
+        # build, skip load_inline entirely and just copy the cached .pyd.
+        # This avoids:
+        #   1. Unnecessary MSVC/NVCC recompilation on repeated runs.
+        #   2. PyTorch 2.8 load_inline importing the existing .pyd inside the
+        #      subprocess (which occasionally causes a STATUS_ACCESS_VIOLATION
+        #      in the CUDA extension-loading machinery on Windows).
+        # ------------------------------------------------------------------
+        src_hash = hashlib.sha256(
+            (spec["cuda_src"] + spec["cpp_src"]
+             + repr(spec["cuda_flags"]) + repr(spec["extra_ldflags"])).encode()
+        ).hexdigest()
+        hash_file   = build_dir / ".build_hash"
+        cached_pyds = sorted(build_dir.glob(name + "*.pyd"))
+        if cached_pyds and hash_file.exists() and hash_file.read_text().strip() == src_hash:
+            pyd = str(cached_pyds[0])
+            shutil.copy2(pyd, dst)
+            print(f"Copied {pyd} -> {dst} (cached, no rebuild needed)", flush=True)
+            sys.exit(0)
+
+        # ------------------------------------------------------------------
+        # Slow path: source changed (or first build) — compile with load_inline.
+        # Delete any stale .pyd first so load_inline won't try to import it
+        # before recompilation completes (that import is what crashes the
+        # subprocess with 0xC0000005 when a stale binary is present).
+        # ------------------------------------------------------------------
+        for old in cached_pyds:
+            old.unlink(missing_ok=True)
+        hash_file.unlink(missing_ok=True)
+
         sys.path.insert(0, spec["root"])
         from torch.utils.cpp_extension import load_inline
+        # If cuda_src is empty, compile purely as C++ (skip NVCC entirely).
+        # This avoids cicc.exe ACCESS_VIOLATION crashes on sm_120 when the source
+        # contains complex STL headers but no actual CUDA device code.
+        cuda_srcs = [spec["cuda_src"]] if spec.get("cuda_src") else []
+        # /d2SSAOptimizer- suppresses the MSVC 14.37 SSA-optimizer ICE (C1001) that
+        # fires on pybind11/PyTorch headers.  For CUDA builds this is already passed
+        # via -Xcompiler inside extra_cuda_cflags; for pure-C++ builds we must add it
+        # directly to extra_cflags so MSVC receives it.
+        cpp_cflags = ["-O2", "/d2SSAOptimizer-"] if sys.platform == "win32" else ["-O2"]
+        ldflags = spec.get("extra_ldflags") or []
+        if not cuda_srcs:
+            # No CUDA device code -- inject CUDA toolkit include/lib paths so
+            # MSVC/GCC can resolve <cuda_fp16.h>, <cublasLt.h>, etc. directly.
+            try:
+                import os as _os
+                from torch.utils.cpp_extension import CUDA_HOME
+                if CUDA_HOME:
+                    cpp_cflags.append("-I" + _os.path.join(CUDA_HOME, "include"))
+                    if sys.platform == "win32":
+                        cuda_lib = _os.path.join(CUDA_HOME, "lib", "x64")
+                        ldflags = ["/LIBPATH:" + cuda_lib] + ldflags
+                    else:
+                        cuda_lib = _os.path.join(CUDA_HOME, "lib64")
+                        ldflags = ["-L" + cuda_lib] + ldflags
+                else:
+                    print("  Warning: CUDA_HOME not set; cuda_fp16.h may not be found", flush=True)
+            except Exception as _e:
+                print("  Warning: CUDA path injection failed: " + str(_e), flush=True)
         load_inline(
-            name=spec["name"],
-            cuda_sources=[spec["cuda_src"]],
+            name=name,
+            cuda_sources=cuda_srcs,
             cpp_sources=[spec["cpp_src"]],
-            extra_cuda_cflags=spec["cuda_flags"],
-            extra_cflags=["-O2"],
-            extra_ldflags=spec.get("extra_ldflags") or [],
-            build_directory=spec["build_dir"],
+            extra_cuda_cflags=spec["cuda_flags"] if cuda_srcs else [],
+            extra_cflags=cpp_cflags,
+            extra_ldflags=ldflags,
+            build_directory=str(build_dir),
             verbose=True,
         )
-        built = glob.glob(os.path.join(spec["build_dir"], spec["name"] + "*.pyd"))
+        built = sorted(build_dir.glob(name + "*.pyd"))
         if built:
-            dst = str(pathlib.Path(spec["build_dir"]).parent / (spec["name"] + ".pyd"))
-            shutil.copy2(built[0], dst)
+            shutil.copy2(str(built[0]), dst)
             print(f"Copied {built[0]} -> {dst}", flush=True)
+            # Save hash so the next run skips recompilation.
+            hash_file.write_text(src_hash)
     """).strip()
 
     # Write worker to a temp .py file (avoids -c command-line length limits on Windows)
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as fw:
-        fw.write(worker_code)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8"
+    ) as fw:
+        fw.write("# -*- coding: utf-8 -*-\n" + worker_code)
         worker_path = fw.name
 
     try:
@@ -589,11 +683,17 @@ def warmup_triton():
         import torch
         from custom_kernels.triton_ops import (
             TRITON_AVAILABLE,
-            triton_demod, triton_fused_gpen_act, triton_fused_gfpgan_act,
-            triton_adain, triton_group_norm_silu, triton_rmsnormmax,
-            triton_pixel_shift_extract, triton_pixel_shift_insert,
+            triton_demod,
+            triton_fused_gpen_act,
+            triton_fused_gfpgan_act,
+            triton_adain,
+            triton_group_norm_silu,
+            triton_rmsnormmax,
+            triton_pixel_shift_extract,
+            triton_pixel_shift_insert,
             triton_im2col_reflect,
         )
+
         if not TRITON_AVAILABLE:
             print("  Triton not available — skipping warm-up.")
             return
@@ -602,26 +702,26 @@ def warmup_triton():
         dtype = torch.float16
 
         # demod — GFPGAN / GPEN weight demodulation
-        w  = torch.randn(256, 256, 3, 3, dtype=dtype, device=dev)
-        s  = torch.randn(256, device=dev)
+        w = torch.randn(256, 256, 3, 3, dtype=dtype, device=dev)
+        s = torch.randn(256, device=dev)
         triton_demod(w, s)
 
         # gpen_act — GPEN fused noise-inject + activate
-        c   = torch.randn(1, 128, 32, 32, dtype=dtype, device=dev)
-        n   = torch.randn(1, 128, 32, 32, dtype=dtype, device=dev)
-        b   = torch.randn(1, 256, 1,  1,  dtype=dtype, device=dev)
+        c = torch.randn(1, 128, 32, 32, dtype=dtype, device=dev)
+        n = torch.randn(1, 128, 32, 32, dtype=dtype, device=dev)
+        b = torch.randn(1, 256, 1, 1, dtype=dtype, device=dev)
         triton_fused_gpen_act(c, n, b)
 
         # gfpgan_act — GFPGAN fused activate (with + without noise)
-        x    = torch.randn(1, 128, 32, 32, dtype=dtype, device=dev)
-        bias = torch.randn(1, 128, 1,  1,  dtype=dtype, device=dev)
+        x = torch.randn(1, 128, 32, 32, dtype=dtype, device=dev)
+        bias = torch.randn(1, 128, 1, 1, dtype=dtype, device=dev)
         triton_fused_gfpgan_act(x, n[:, :128], bias)
-        triton_fused_gfpgan_act(x, None,       bias)
+        triton_fused_gfpgan_act(x, None, bias)
 
         # adain — InSwapper Adaptive Instance Normalization (B=1 and batched B>1)
         # B=1 NCHW path (single-tile, standard mode)
         xa1 = torch.randn(1, 1024, 32, 32, dtype=dtype, device=dev)
-        sa  = torch.randn(1, 1024,  1,  1, dtype=dtype, device=dev)
+        sa = torch.randn(1, 1024, 1, 1, dtype=dtype, device=dev)
         triton_adain(xa1, sa, sa)
         # B=4 batched path (dim=2, 256px pixel-shift)
         xa4 = torch.randn(4, 1024, 32, 32, dtype=dtype, device=dev)
@@ -644,29 +744,31 @@ def warmup_triton():
         for dim in [2, 3, 4]:
             H = dim * 128
             img_hwc = torch.randn(H, H, 3, dtype=torch.float32, device=dev)
-            tiles   = triton_pixel_shift_extract(img_hwc, dim)
+            tiles = triton_pixel_shift_extract(img_hwc, dim)
             triton_pixel_shift_insert(tiles, img_hwc, dim)
 
         # group_norm_silu — ReF-LDM VAE / UNet GroupNorm + optional SiLU
         # Representative shapes: (1, 128, 32, 32) and (1, 256, 16, 16)
         for C, H in [(128, 32), (256, 16), (512, 8)]:
-            xg  = torch.randn(1, C, H, H, dtype=dtype, device=dev)
-            wg  = torch.randn(C, dtype=dtype, device=dev)
-            bg  = torch.randn(C, dtype=dtype, device=dev)
+            xg = torch.randn(1, C, H, H, dtype=dtype, device=dev)
+            wg = torch.randn(C, dtype=dtype, device=dev)
+            bg = torch.randn(C, dtype=dtype, device=dev)
             triton_group_norm_silu(xg, wg, bg, num_groups=32, fuse_silu=False)
             triton_group_norm_silu(xg, wg, bg, num_groups=32, fuse_silu=True)
 
         # rmsnormmax — XSeg per-channel RMS norm + affine + max-floor
         # Warm up for all spatial sizes encountered in XSeg enc0–enc5 / dec stages
         for C, H in [(32, 256), (64, 128), (128, 64), (256, 32), (256, 16), (256, 8)]:
-            xn     = torch.randn(1, C, H, H, dtype=dtype, device=dev)
-            gamma  = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
-            beta   = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
+            xn = torch.randn(1, C, H, H, dtype=dtype, device=dev)
+            gamma = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
+            beta = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
             maxval = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
             triton_rmsnormmax(xn, gamma, beta, maxval, eps=0.5)
 
+        from custom_kernels.triton_ops import _TRITON_CACHE
+
         print("  Triton warm-up complete. Kernels cached in:")
-        print(f"    {OUT_DIR / 'triton_cache'}")
+        print(f"    {_TRITON_CACHE}")
     except Exception as e:
         print(f"  Triton warm-up failed: {e}")
 
@@ -676,23 +778,26 @@ def warmup_triton():
 # ---------------------------------------------------------------------------
 def main():
     import torch
+
     cuda_ver = torch.version.cuda or "unknown"
     gpu_name = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "N/A"
-    print(f"\n{'='*60}")
-    print(f"VisoMaster-Fusion — Custom CUDA Kernel Builder")
-    print(f"{'='*60}")
+    print(f"\n{'=' * 60}")
+    print("VisoMaster-Fusion — Custom CUDA Kernel Builder")
+    print(f"{'=' * 60}")
     print(f"  CUDA        : {cuda_ver}")
     print(f"  GPU         : {gpu_name}")
     print(f"  PyTorch     : {torch.__version__}")
     print(f"  Output dir  : {OUT_DIR}")
-    print(f"  Arch targets: sm_75 sm_80 sm_86 sm_89 sm_90 sm_120")
+    print("  Arch targets: sm_75 sm_80 sm_86 sm_89 sm_90 sm_120")
     print()
 
     # Import cuBLASLt sources from inswapper_torch (single source of truth)
     try:
         from custom_kernels.inswapper_128.inswapper_torch import (
-            _STYLEBLOCK_CUDA_SRC, _STYLEBLOCK_CPP_SRC,
+            _STYLEBLOCK_CUDA_SRC,
+            _STYLEBLOCK_CPP_SRC,
         )
+
         _have_styleblock_src = True
     except Exception as e:
         print(f"[build_kernels] Could not import style_block sources: {e}")
@@ -700,13 +805,42 @@ def main():
 
     results = {}
 
-    results["adain_fp16_ext"]   = compile_ext("adain_fp16_ext",   _ADAIN_CUDA_SRC, _ADAIN_CPP_SRC)
-    results["gfpgan_demod_ext"] = compile_ext("gfpgan_demod_ext", _DEMOD_CUDA_SRC, _DEMOD_CPP_SRC)
+    results["adain_fp16_ext"] = compile_ext(
+        "adain_fp16_ext", _ADAIN_CUDA_SRC, _ADAIN_CPP_SRC
+    )
+    results["gfpgan_demod_ext"] = compile_ext(
+        "gfpgan_demod_ext", _DEMOD_CUDA_SRC, _DEMOD_CPP_SRC
+    )
 
     if _have_styleblock_src:
-        ldflags = ["cublasLt.lib"] if sys.platform == "win32" else ["-lcublasLt"]
+        # When compiled as C++ (no cuda_sources), PyTorch does not auto-link the
+        # CUDA runtime or CUDA-aware torch libs.  Add them explicitly.
+        ldflags = (
+            ["cublasLt.lib", "cudart.lib", "c10_cuda.lib", "torch_cuda.lib"]
+            if sys.platform == "win32"
+            else ["-lcublasLt", "-lcudart", "-lc10_cuda", "-ltorch_cuda"]
+        )
+        # style_block has no CUDA device code (no __global__ kernels) — compile
+        # as C++ via MSVC/GCC to bypass NVCC cicc.exe, which crashes with
+        # STATUS_ACCESS_VIOLATION on sm_120 when parsing complex STL headers
+        # (<mutex>, <unordered_map>, <stdexcept>) during device-code extraction.
+        # Include-order fix: on Windows, <cublasLt.h> pulls in <windows.h> before
+        # <torch/extension.h>, and the resulting macros (min/max, etc.) corrupt
+        # PyTorch C++ template instantiation in cloneable.h.  Prepend a preamble
+        # that defines NOMINMAX and includes <torch/extension.h> first so that the
+        # later duplicate includes are no-ops (include guards).
+        style_preamble = (
+            "#define NOMINMAX\n"
+            "#include <torch/extension.h>\n"
+            "#include <ATen/cuda/CUDAContext.h>\n"
+        )
+        combined_cpp = (
+            style_preamble + _STYLEBLOCK_CUDA_SRC + "\n" + _STYLEBLOCK_CPP_SRC
+        )
         results["style_block_ext"] = compile_ext(
-            "style_block_ext", _STYLEBLOCK_CUDA_SRC, _STYLEBLOCK_CPP_SRC,
+            "style_block_ext",
+            "",  # empty → no CUDA device code, skip NVCC
+            combined_cpp,
             extra_ldflags=ldflags,
         )
     else:
@@ -715,14 +849,14 @@ def main():
 
     warmup_triton()
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("Build summary:")
     for name, ok in results.items():
         status = "OK " if ok else "FAIL"
         pyd = OUT_DIR / f"{name}.pyd"
         size_kb = f"{pyd.stat().st_size // 1024} KB" if pyd.exists() else "N/A"
         print(f"  [{status}] {name}.pyd  ({size_kb})")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
     # style_block_ext failure is non-fatal — falls back to torch.mm GEMM (Tier 8)
     critical = {k: v for k, v in results.items() if k != "style_block_ext"}
@@ -733,11 +867,15 @@ def main():
     elif not results.get("style_block_ext"):
         print("\nCritical kernels built. style_block_ext failed — InSwapper will use")
         print("torch.mm GEMM (Tier 8) instead of cuBLASLt (Phase 3).")
-        print("Multi-arch fat binaries work on any NVIDIA GPU (Volta through Blackwell).")
+        print(
+            "Multi-arch fat binaries work on any NVIDIA GPU (Volta through Blackwell)."
+        )
         print("Note: sm_120 (RTX 50xx) requires CUDA Toolkit 12.8+.")
     else:
         print("\nAll kernels built successfully.")
-        print("Multi-arch fat binaries work on any NVIDIA GPU (Volta through Blackwell).")
+        print(
+            "Multi-arch fat binaries work on any NVIDIA GPU (Volta through Blackwell)."
+        )
         print("Note: sm_120 (RTX 50xx) requires CUDA Toolkit 12.8+.")
 
 

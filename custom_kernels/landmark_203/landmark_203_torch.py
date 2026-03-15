@@ -18,6 +18,7 @@ Weight loading
               loaded positionally in forward-pass order; each transposed (.T)
               before assignment to nn.Linear.weight.
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -34,12 +35,13 @@ try:
     from custom_kernels.triton_ops import triton_layernorm, TRITON_AVAILABLE
 except ImportError:
     TRITON_AVAILABLE = False
-    triton_layernorm = None
+    triton_layernorm = None  # type: ignore[assignment]
 
 
 # ---------------------------------------------------------------------------
 # Building blocks
 # ---------------------------------------------------------------------------
+
 
 class _ChannelsFirstLN(nn.Module):
     """
@@ -47,18 +49,19 @@ class _ChannelsFirstLN(nn.Module):
     spatial position (h, w).  Weight and bias stored as (C, 1, 1) to match the
     anonymous ONNX Mul/Add initialiser shapes for direct in-place loading.
     """
+
     def __init__(self, C: int, eps: float = 1e-6):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(C, 1, 1))
-        self.bias   = nn.Parameter(torch.zeros(C, 1, 1))
-        self.eps    = eps
+        self.bias = nn.Parameter(torch.zeros(C, 1, 1))
+        self.eps = eps
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # FP32 accumulation for numerical stability; keep output dtype as input.
-        xf   = x.float()
+        xf = x.float()
         mean = xf.mean(dim=1, keepdim=True)
-        var  = ((xf - mean) ** 2).mean(dim=1, keepdim=True)
-        xn   = (xf - mean) / (var + self.eps).sqrt()
+        var = ((xf - mean) ** 2).mean(dim=1, keepdim=True)
+        xn = (xf - mean) / (var + self.eps).sqrt()
         return (xn * self.weight.float() + self.bias.float()).to(x.dtype)
 
 
@@ -74,34 +77,35 @@ class _ConvNeXtBlock(nn.Module):
         gamma (layer-scale) → permute NHWC→NCHW →
         residual add.
     """
+
     def __init__(self, dim: int, use_triton_ln: bool = False):
         super().__init__()
-        self.dwconv  = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
-        self.norm    = nn.LayerNorm(dim, eps=1e-6)
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, 4 * dim)
         self.pwconv2 = nn.Linear(4 * dim, dim)
-        self.gamma   = nn.Parameter(1e-6 * torch.ones(dim))
+        self.gamma = nn.Parameter(1e-6 * torch.ones(dim))
         self._use_triton_ln = use_triton_ln and TRITON_AVAILABLE
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        h = self.dwconv(x)                   # (N, C, H, W)
-        h = h.permute(0, 2, 3, 1)            # (N, H, W, C)
+        h = self.dwconv(x)  # (N, C, H, W)
+        h = h.permute(0, 2, 3, 1)  # (N, H, W, C)
         if self._use_triton_ln and h.dtype == torch.float16:
-            h = triton_layernorm(h, self.norm.weight, self.norm.bias,
-                                 eps=self.norm.eps)
+            h = triton_layernorm(h, self.norm.weight, self.norm.bias, eps=self.norm.eps)
         else:
             h = self.norm(h.float()).to(x.dtype)
         h = self.pwconv1(h)
         h = F.gelu(h)
         h = self.pwconv2(h)
         h = self.gamma * h
-        h = h.permute(0, 3, 1, 2)            # (N, C, H, W)
+        h = h.permute(0, 3, 1, 2)  # (N, C, H, W)
         return x + h
 
 
 # ---------------------------------------------------------------------------
 # Full model
 # ---------------------------------------------------------------------------
+
 
 class Landmark203Torch(nn.Module):
     """
@@ -110,11 +114,13 @@ class Landmark203Torch(nn.Module):
     Channels : [96, 192, 384, 768]
     Depths   : [3, 3, 9, 3]
     """
-    CHANNELS = [96, 192, 384, 768]
-    DEPTHS   = [3, 3, 9, 3]
 
-    def __init__(self, compute_dtype: torch.dtype = torch.float16,
-                 use_triton_ln: bool = True):
+    CHANNELS = [96, 192, 384, 768]
+    DEPTHS = [3, 3, 9, 3]
+
+    def __init__(
+        self, compute_dtype: torch.dtype = torch.float16, use_triton_ln: bool = True
+    ):
         super().__init__()
         C = self.CHANNELS
         D = self.DEPTHS
@@ -126,43 +132,48 @@ class Landmark203Torch(nn.Module):
         # layers[1]: _ChannelsFirstLN(96) + Conv2d(96→192, k=2, s=2)
         # layers[2]: _ChannelsFirstLN(192) + Conv2d(192→384, k=2, s=2)
         # layers[3]: _ChannelsFirstLN(384) + Conv2d(384→768, k=2, s=2)
-        self.downsample_layers = nn.ModuleList([
-            nn.Sequential(
-                nn.Conv2d(3, C[0], kernel_size=4, stride=4),
-                _ChannelsFirstLN(C[0]),
-            ),
-            nn.Sequential(
-                _ChannelsFirstLN(C[0]),
-                nn.Conv2d(C[0], C[1], kernel_size=2, stride=2),
-            ),
-            nn.Sequential(
-                _ChannelsFirstLN(C[1]),
-                nn.Conv2d(C[1], C[2], kernel_size=2, stride=2),
-            ),
-            nn.Sequential(
-                _ChannelsFirstLN(C[2]),
-                nn.Conv2d(C[2], C[3], kernel_size=2, stride=2),
-            ),
-        ])
+        self.downsample_layers = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Conv2d(3, C[0], kernel_size=4, stride=4),
+                    _ChannelsFirstLN(C[0]),
+                ),
+                nn.Sequential(
+                    _ChannelsFirstLN(C[0]),
+                    nn.Conv2d(C[0], C[1], kernel_size=2, stride=2),
+                ),
+                nn.Sequential(
+                    _ChannelsFirstLN(C[1]),
+                    nn.Conv2d(C[1], C[2], kernel_size=2, stride=2),
+                ),
+                nn.Sequential(
+                    _ChannelsFirstLN(C[2]),
+                    nn.Conv2d(C[2], C[3], kernel_size=2, stride=2),
+                ),
+            ]
+        )
 
         # -- Stages --------------------------------------------------------------
-        self.stages = nn.ModuleList([
-            nn.Sequential(*[_ConvNeXtBlock(C[i], use_triton_ln=uln)
-                            for _ in range(D[i])])
-            for i in range(4)
-        ])
+        self.stages = nn.ModuleList(
+            [
+                nn.Sequential(
+                    *[_ConvNeXtBlock(C[i], use_triton_ln=uln) for _ in range(D[i])]
+                )
+                for i in range(4)
+            ]
+        )
 
         # -- Output norms --------------------------------------------------------
         # norm_s3 normalises stage-3 (384-ch) GAP features before fc_pts.
         # norm    normalises stage-4 (768-ch) GAP features for all heads.
-        self.norm_s3 = nn.LayerNorm(C[2], eps=1e-6)   # 384-ch
-        self.norm    = nn.LayerNorm(C[3], eps=1e-6)   # 768-ch
+        self.norm_s3 = nn.LayerNorm(C[2], eps=1e-6)  # 384-ch
+        self.norm = nn.LayerNorm(C[3], eps=1e-6)  # 768-ch
 
         # -- Output heads --------------------------------------------------------
         # fc_pts takes concatenated (384 + 768 = 1152) features
         self.fc_coeff = nn.Linear(C[3], 214)
-        self.fc_lmk   = nn.Linear(C[3], 262)
-        self.fc_pts   = nn.Linear(C[2] + C[3], 406)
+        self.fc_lmk = nn.Linear(C[3], 262)
+        self.fc_pts = nn.Linear(C[2] + C[3], 406)
 
     # ------------------------------------------------------------------
 
@@ -192,19 +203,21 @@ class Landmark203Torch(nn.Module):
 
         # Global average pool + norm for stage-3 features
         # norm_s3/norm are FP32 LayerNorm; cast output back to compute_dtype for FC
-        feat3 = self.norm_s3(x.float().mean([-2, -1])).to(self.compute_dtype)  # (1, 384)
+        feat3 = self.norm_s3(x.float().mean([-2, -1])).to(
+            self.compute_dtype
+        )  # (1, 384)
 
         # Transition 3 + stage 3  →  (1, 768, 7, 7)
         x = self.downsample_layers[3](x)
         x = self.stages[3](x)
 
         # Global average pool + norm for stage-4 features
-        feat4 = self.norm(x.float().mean([-2, -1])).to(self.compute_dtype)     # (1, 768)
+        feat4 = self.norm(x.float().mean([-2, -1])).to(self.compute_dtype)  # (1, 768)
 
         # Heads
-        out_coeff = self.fc_coeff(feat4)                         # (1, 214)
-        out_lmk   = self.fc_lmk(feat4)                          # (1, 262)
-        out_pts   = self.fc_pts(torch.cat([feat3, feat4], -1))   # (1, 406)
+        out_coeff = self.fc_coeff(feat4)  # (1, 214)
+        out_lmk = self.fc_lmk(feat4)  # (1, 262)
+        out_pts = self.fc_pts(torch.cat([feat3, feat4], -1))  # (1, 406)
 
         return out_coeff.float(), out_lmk.float(), out_pts.float()
 
@@ -238,19 +251,19 @@ class Landmark203Torch(nn.Module):
         init_map = {init.name: init for init in model_proto.graph.initializer}
 
         # Collect anonymous tensors in ONNX node topological order
-        named_inits:  dict[str, "np.ndarray"] = {}
-        anon_cln_mul: list = []   # (C,1,1) channel-first LN scale
-        anon_cln_add: list = []   # (C,1,1) channel-first LN bias
-        anon_matmul:  list = []   # anonymous MatMul weight matrices
+        named_inits: dict = {}
+        anon_cln_mul: list = []  # (C,1,1) channel-first LN scale
+        anon_cln_add: list = []  # (C,1,1) channel-first LN bias
+        anon_matmul: list = []  # anonymous MatMul weight matrices
 
         # First pass: categorize all initializers
         anon_mul_names: set[str] = set()
         anon_add_names: set[str] = set()
-        anon_mm_names:  set[str] = set()
+        anon_mm_names: set[str] = set()
 
         for init in model_proto.graph.initializer:
             name = init.name
-            arr  = numpy_helper.to_array(init)
+            arr = numpy_helper.to_array(init)
             if name.startswith("onnx::Mul_") and arr.ndim == 3:
                 anon_mul_names.add(name)
             elif name.startswith("onnx::Add_") and arr.ndim == 3:
@@ -263,7 +276,7 @@ class Landmark203Torch(nn.Module):
         # Second pass: collect in topological order from graph nodes
         seen_mul: set[str] = set()
         seen_add: set[str] = set()
-        seen_mm:  set[str] = set()
+        seen_mm: set[str] = set()
 
         for node in model_proto.graph.node:
             if node.op_type == "Mul":
@@ -308,7 +321,7 @@ class Landmark203Torch(nn.Module):
         loaded, skipped = [], []
         for name, arr in named_inits.items():
             if name in all_tensors:
-                t = torch.tensor(arr, dtype=torch.float32)   # always start FP32
+                t = torch.tensor(arr, dtype=torch.float32)  # always start FP32
                 target = all_tensors[name]
                 if t.shape == target.data.shape:
                     # LayerNorm weight/bias stay FP32; everything else → compute_dtype.
@@ -324,19 +337,25 @@ class Landmark203Torch(nn.Module):
 
         # ---- Load anonymous channel-first LN weights -------------------------
         cln_targets = [
-            m.downsample_layers[0][1],   # stem LN  (after Conv2d 3→96)
-            m.downsample_layers[1][0],   # dl1  LN  (before Conv2d 96→192)
-            m.downsample_layers[2][0],   # dl2  LN  (before Conv2d 192→384)
-            m.downsample_layers[3][0],   # dl3  LN  (before Conv2d 384→768)
+            m.downsample_layers[0][1],  # stem LN  (after Conv2d 3→96)
+            m.downsample_layers[1][0],  # dl1  LN  (before Conv2d 96→192)
+            m.downsample_layers[2][0],  # dl2  LN  (before Conv2d 192→384)
+            m.downsample_layers[3][0],  # dl3  LN  (before Conv2d 384→768)
         ]
 
         if len(anon_cln_mul) == 4 and len(anon_cln_add) == 4:
             for cln, mul_w, add_b in zip(cln_targets, anon_cln_mul, anon_cln_add):
-                cln.weight.data = torch.from_numpy(mul_w.copy()).to(compute_dtype)   # (C,1,1)
-                cln.bias.data   = torch.from_numpy(add_b.copy()).to(compute_dtype)   # (C,1,1)
+                cln.weight.data = torch.from_numpy(mul_w.copy()).to(
+                    compute_dtype
+                )  # (C,1,1)
+                cln.bias.data = torch.from_numpy(add_b.copy()).to(
+                    compute_dtype
+                )  # (C,1,1)
         else:
-            print(f"[landmark_203] WARNING: expected 4 anon-CLN Mul/Add pairs, "
-                  f"got {len(anon_cln_mul)} Mul / {len(anon_cln_add)} Add")
+            print(
+                f"[landmark_203] WARNING: expected 4 anon-CLN Mul/Add pairs, "
+                f"got {len(anon_cln_mul)} Mul / {len(anon_cln_add)} Add"
+            )
 
         # ---- Load anonymous MatMul weights (pwconv1, pwconv2) ----------------
         # ONNX MatMul weight shape: (in_features, out_features)
@@ -345,20 +364,32 @@ class Landmark203Torch(nn.Module):
             mm_idx = 0
             for stage in m.stages:
                 for block in stage:
-                    w1 = torch.from_numpy(anon_matmul[mm_idx]).T.contiguous().to(compute_dtype)
+                    w1 = (
+                        torch.from_numpy(anon_matmul[mm_idx].copy())
+                        .T.contiguous()
+                        .to(compute_dtype)
+                    )
                     mm_idx += 1
-                    w2 = torch.from_numpy(anon_matmul[mm_idx]).T.contiguous().to(compute_dtype)
+                    w2 = (
+                        torch.from_numpy(anon_matmul[mm_idx].copy())
+                        .T.contiguous()
+                        .to(compute_dtype)
+                    )
                     mm_idx += 1
                     block.pwconv1.weight.data = w1
                     block.pwconv2.weight.data = w2
         else:
-            print(f"[landmark_203] WARNING: expected 36 anon MatMul weights, "
-                  f"got {len(anon_matmul)}")
+            print(
+                f"[landmark_203] WARNING: expected 36 anon MatMul weights, "
+                f"got {len(anon_matmul)}"
+            )
 
         total_named = len(loaded)
-        print(f"[landmark_203] loaded: {total_named} named + "
-              f"{len(anon_cln_mul)*2} anon-CLN + {len(anon_matmul)} anon-MM "
-              f"initializers")
+        print(
+            f"[landmark_203] loaded: {total_named} named + "
+            f"{len(anon_cln_mul) * 2} anon-CLN + {len(anon_matmul)} anon-MM "
+            f"initializers"
+        )
         return m
 
 
@@ -366,17 +397,17 @@ class Landmark203Torch(nn.Module):
 # CUDA graph runner
 # ---------------------------------------------------------------------------
 
+
 class Landmark203CUDAGraphRunner:
     """Wraps a Landmark203Torch in a CUDA graph for minimal kernel-launch overhead."""
 
-    def __init__(self, model: Landmark203Torch,
-                 input_shape: tuple = (1, 3, 224, 224)):
-        self.model   = model
-        self.device  = next(model.parameters()).device
-        dtype        = torch.float32  # input is always float32
+    def __init__(self, model: Landmark203Torch, input_shape: tuple = (1, 3, 224, 224)):
+        self.model = model
+        self.device = next(model.parameters()).device
+        dtype = torch.float32  # input is always float32
 
         # Static input buffer
-        self._x_buf  = torch.zeros(input_shape, dtype=dtype, device=self.device)
+        self._x_buf = torch.zeros(input_shape, dtype=dtype, device=self.device)
 
         # Warm-up: run once outside the graph to allocate cuDNN workspace etc.
         with torch.no_grad():
@@ -385,10 +416,10 @@ class Landmark203CUDAGraphRunner:
         torch.cuda.synchronize()
 
         # Capture
-        self._graph  = torch.cuda.CUDAGraph()
+        self._graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(self._graph):
-                self._out = model(self._x_buf)   # tuple of 3 tensors
+                self._out = model(self._x_buf)  # tuple of 3 tensors
 
     def __call__(self, x: torch.Tensor):
         """

@@ -13,6 +13,7 @@ Optional env vars:
     WARMUP=10                      warm-up iterations
     ITERS=50                       timed iterations
 """
+
 from __future__ import annotations
 
 import os
@@ -25,12 +26,13 @@ import torch
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-ROOT      = pathlib.Path(__file__).parent.parent.parent
-ONNX_DIR  = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
-WARMUP    = int(os.environ.get("WARMUP", 10))
-ITERS     = int(os.environ.get("ITERS",  50))
+ROOT = pathlib.Path(__file__).parent.parent.parent
+ONNX_DIR = pathlib.Path(os.environ.get("ONNX_DIR", ROOT / "model_assets"))
+WARMUP = int(os.environ.get("WARMUP", 10))
+ITERS = int(os.environ.get("ITERS", 50))
 
-RFP_ONNX  = str(ONNX_DIR / "RestoreFormerPlusPlus.fp16.onnx")
+RFP_ONNX = str(ONNX_DIR / "RestoreFormerPlusPlus.fp16.onnx")
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -53,6 +55,7 @@ def _bench(fn, warmup=WARMUP, iters=ITERS) -> float:
 
 def _ort_session(onnx_path: str, provider: str = "CUDAExecutionProvider"):
     import onnxruntime as ort
+
     opts = ort.SessionOptions()
     opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
     return ort.InferenceSession(onnx_path, sess_options=opts, providers=[provider])
@@ -70,34 +73,39 @@ def bench_restoreformer():
     print("\n=== RestoreFormerPlusPlus (1,3,512,512) -> (1,3,512,512) ===")
     print(f"  warm-up={WARMUP}, iters={ITERS}\n")
     print(f"  {'Tier':<6} | {'Method':<44} | {'ms':>8} | {'speedup':>7}")
-    print(f"  {'-'*6}-+-{'-'*44}-+-{'-'*8}-+-{'-'*7}")
+    print(f"  {'-' * 6}-+-{'-' * 44}-+-{'-' * 8}-+-{'-' * 7}")
 
-    inp    = torch.randn(1, 3, 512, 512, dtype=torch.float32, device="cuda")
+    inp = torch.randn(1, 3, 512, 512, dtype=torch.float32, device="cuda")
     inp_np = inp.cpu().numpy()
 
     # ── Tier 0 — ORT FP32 CUDA EP ────────────────────────────────────────
-    import numpy as np
-    sess0    = _ort_session(RFP_ONNX, "CUDAExecutionProvider")
-    in_name  = sess0.get_inputs()[0].name      # "input"
-    out_name = sess0.get_outputs()[0].name     # "2359"
+    sess0 = _ort_session(RFP_ONNX, "CUDAExecutionProvider")
+    in_name = sess0.get_inputs()[0].name  # "input"
+    out_name = sess0.get_outputs()[0].name  # "2359"
     t0 = _bench(lambda: sess0.run([out_name], {in_name: inp_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
     # ── Tier 0b — ORT TensorRT EP ─────────────────────────────────────────
     t0b = t0
     try:
-        import tensorrt  # registers nvinfer DLL path on Windows
+        pass  # registers nvinfer DLL path on Windows
     except Exception:
         pass
     import onnxruntime as _ort
+
     if "TensorrtExecutionProvider" not in _ort.get_available_providers():
-        print(f"  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)")
+        print(
+            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
+        )
     else:
         ctx = ROOT / "tensorrt-engines" / "RestoreFormerPlusPlus.fp16_ctx.onnx"
         if not ctx.exists():
-            print(f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})")
+            print(
+                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
+            )
         else:
             import os as _os
+
             _prev_cwd = _os.getcwd()
             _os.chdir(str(ROOT))
             trt_opts = {
@@ -113,11 +121,15 @@ def bench_restoreformer():
             }
             so = _ort.SessionOptions()
             so.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort.InferenceSession(RFP_ONNX, so, providers=[
-                ("TensorrtExecutionProvider", trt_opts),
-                ("CUDAExecutionProvider", {"device_id": "0"}),
-                ("CPUExecutionProvider", {}),
-            ])
+            sess0b = _ort.InferenceSession(
+                RFP_ONNX,
+                so,
+                providers=[
+                    ("TensorrtExecutionProvider", trt_opts),
+                    ("CUDAExecutionProvider", {"device_id": "0"}),
+                    ("CPUExecutionProvider", {}),
+                ],
+            )
             _os.chdir(_prev_cwd)
             t0b = _bench(lambda: sess0b.run([out_name], {in_name: inp_np}))
             _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
@@ -125,19 +137,25 @@ def bench_restoreformer():
     # ── Tier 1 — PyTorch FP32 ────────────────────────────────────────────
     sys.path.insert(0, str(ROOT))
     from custom_kernels.restoreformer.restoreformer_torch import (
-        RestoreFormerPlusPlusTorch, build_cuda_graph_runner,
+        RestoreFormerPlusPlusTorch,
+        build_cuda_graph_runner,
     )
-    rfp_fp32 = RestoreFormerPlusPlusTorch.from_onnx(
-        RFP_ONNX, compute_dtype=torch.float32
-    ).cuda().eval()
+
+    rfp_fp32 = (
+        RestoreFormerPlusPlusTorch.from_onnx(RFP_ONNX, compute_dtype=torch.float32)
+        .cuda()
+        .eval()
+    )
     with torch.no_grad():
         t1 = _bench(lambda: rfp_fp32(inp))
     _print_row("1", "PyTorch FP32 pure ops", t1, t0)
 
     # ── Tier 2 — PyTorch FP16 + Triton GroupNorm+SiLU ─────────────────────
-    rfp_fp16 = RestoreFormerPlusPlusTorch.from_onnx(
-        RFP_ONNX, compute_dtype=torch.float16
-    ).cuda().eval()
+    rfp_fp16 = (
+        RestoreFormerPlusPlusTorch.from_onnx(RFP_ONNX, compute_dtype=torch.float16)
+        .cuda()
+        .eval()
+    )
     with torch.no_grad():
         t2 = _bench(lambda: rfp_fp16(inp))
     _print_row("2", "PyTorch FP16 + Triton GroupNorm+SiLU", t2, t0)
@@ -169,11 +187,13 @@ if __name__ == "__main__":
     print(f"PyTorch: {torch.__version__}")
     try:
         import triton
+
         print(f"Triton:  {triton.__version__}")
     except ImportError:
         print("Triton:  not available (GroupNorm PyTorch fallback will be used)")
     try:
         import onnxruntime as ort
+
         print(f"ORT:     {ort.__version__}")
     except ImportError:
         print("ORT:     not available (skipping Tier 0/0b)")

@@ -51,6 +51,7 @@ Weight loading
         model.5  → conv2_1    model.7  → conv2_2
         model.10 → conv3_1    model.12 → conv3_2    model.14 → conv3_3
 """
+
 from __future__ import annotations
 
 import pathlib
@@ -73,11 +74,11 @@ class VggComboTorch(nn.Module):
         self.compute_dtype = compute_dtype
 
         # VGG Block 1
-        self.conv1_1 = nn.Conv2d(  3,  64, 3, padding=1, bias=True)
-        self.conv1_2 = nn.Conv2d( 64,  64, 3, padding=1, bias=True)
+        self.conv1_1 = nn.Conv2d(3, 64, 3, padding=1, bias=True)
+        self.conv1_2 = nn.Conv2d(64, 64, 3, padding=1, bias=True)
 
         # VGG Block 2
-        self.conv2_1 = nn.Conv2d( 64, 128, 3, padding=1, bias=True)
+        self.conv2_1 = nn.Conv2d(64, 128, 3, padding=1, bias=True)
         self.conv2_2 = nn.Conv2d(128, 128, 3, padding=1, bias=True)
 
         # VGG Block 3 (partial)
@@ -106,16 +107,16 @@ class VggComboTorch(nn.Module):
         x = F.max_pool2d(x, 2, 2)
 
         # Block 3 — first conv, no ReLU yet
-        pre_relu3_1 = self.conv3_1(x)   # (N, 256, 128, 128)
+        pre_relu3_1 = self.conv3_1(x)  # (N, 256, 128, 128)
 
         # Branch B: relu3_1 → conv3_2 → relu3_2 → conv3_3
         h = F.relu(pre_relu3_1)
         h = F.relu(self.conv3_2(h))
-        pre_relu3_3 = self.conv3_3(h)   # (N, 256, 128, 128)
+        pre_relu3_3 = self.conv3_3(h)  # (N, 256, 128, 128)
 
         # Concat: [pre_relu3_1, pre_relu3_3] → (N, 512, 128, 128)
         out = torch.cat([pre_relu3_1, pre_relu3_3], dim=1)
-        return out.float()              # always return float32
+        return out.float()  # always return float32
 
     # ------------------------------------------------------------------
     # Factory
@@ -136,21 +137,22 @@ class VggComboTorch(nn.Module):
         import onnx
         from onnx import numpy_helper
 
-        proto    = onnx.load(str(onnx_path))
-        g        = proto.graph
-        init_map = {init.name: numpy_helper.to_array(init).copy()
-                    for init in g.initializer}
+        proto = onnx.load(str(onnx_path))
+        g = proto.graph
+        init_map = {
+            init.name: numpy_helper.to_array(init).copy() for init in g.initializer
+        }
 
         m = cls(compute_dtype=compute_dtype)
 
         def _load(layer: nn.Conv2d, w_name: str, b_name: str) -> None:
             layer.weight.data = torch.from_numpy(init_map[w_name]).to(compute_dtype)
-            layer.bias.data   = torch.from_numpy(init_map[b_name]).to(compute_dtype)
+            layer.bias.data = torch.from_numpy(init_map[b_name]).to(compute_dtype)
 
-        _load(m.conv1_1, "model.0.weight",  "model.0.bias")
-        _load(m.conv1_2, "model.2.weight",  "model.2.bias")
-        _load(m.conv2_1, "model.5.weight",  "model.5.bias")
-        _load(m.conv2_2, "model.7.weight",  "model.7.bias")
+        _load(m.conv1_1, "model.0.weight", "model.0.bias")
+        _load(m.conv1_2, "model.2.weight", "model.2.bias")
+        _load(m.conv2_1, "model.5.weight", "model.5.bias")
+        _load(m.conv2_2, "model.7.weight", "model.7.bias")
         _load(m.conv3_1, "model.10.weight", "model.10.bias")
         _load(m.conv3_2, "model.12.weight", "model.12.bias")
         _load(m.conv3_3, "model.14.weight", "model.14.bias")
@@ -162,6 +164,7 @@ class VggComboTorch(nn.Module):
 # ---------------------------------------------------------------------------
 # CUDA graph runner
 # ---------------------------------------------------------------------------
+
 
 class VggComboCUDAGraphRunner:
     """
@@ -177,11 +180,10 @@ class VggComboCUDAGraphRunner:
         model: VggComboTorch,
         input_shape: tuple = (1, 3, 512, 512),
     ):
-        self.model  = model
+        self.model = model
         self.device = next(model.parameters()).device
 
-        self._x_buf = torch.zeros(input_shape, dtype=torch.float32,
-                                  device=self.device)
+        self._x_buf = torch.zeros(input_shape, dtype=torch.float32, device=self.device)
 
         # Warm-up: cuDNN workspace allocation + auto-tuning
         with torch.no_grad():
@@ -193,7 +195,7 @@ class VggComboCUDAGraphRunner:
         self._graph = torch.cuda.CUDAGraph()
         with torch.no_grad():
             with torch.cuda.graph(self._graph):
-                self._out = model(self._x_buf)   # (1, 512, 128, 128) float32
+                self._out = model(self._x_buf)  # (1, 512, 128, 128) float32
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """

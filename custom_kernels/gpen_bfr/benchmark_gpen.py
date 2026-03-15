@@ -6,21 +6,24 @@ Run via:
   or plain Python:
     .venv/Scripts/python custom_kernels/gpen_bfr/benchmark_gpen.py [256|512|1024|2048]
 """
-import sys, time, os
+
+import sys
+import time
+import os
 from pathlib import Path
 
 ROOT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(ROOT))
 
 MODELS = {
-    256:  "GPEN-BFR-256.onnx",
-    512:  "GPEN-BFR-512.onnx",
+    256: "GPEN-BFR-256.onnx",
+    512: "GPEN-BFR-512.onnx",
     1024: "GPEN-BFR-1024.onnx",
     2048: "GPEN-BFR-2048.onnx",
 }
 
 WARMUP = int(os.environ.get("WARMUP", 10))
-RUNS   = int(os.environ.get("ITERS",  50))
+RUNS = int(os.environ.get("ITERS", 50))
 
 
 def ms(t0, t1, n):
@@ -31,11 +34,15 @@ def run_ort(model_path, inp_hw):
     import numpy as np
     import onnxruntime as ort
     import torch
+
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(model_path, so,
+    sess = ort.InferenceSession(
+        model_path,
+        so,
         providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
-        provider_options=[{"device_id": "0"}, {}])
+        provider_options=[{"device_id": "0"}, {}],
+    )
     inp_name = sess.get_inputs()[0].name
     inp = np.random.default_rng(0).random((1, 3, inp_hw, inp_hw)).astype("float32")
     for _ in range(WARMUP):
@@ -52,8 +59,9 @@ def run_ort_trt(model_path, inp_hw, model_stem):
     import numpy as np
     import onnxruntime as ort
     import torch
+
     try:
-        import tensorrt
+        pass
     except Exception:
         pass
     if "TensorrtExecutionProvider" not in ort.get_available_providers():
@@ -78,12 +86,15 @@ def run_ort_trt(model_path, inp_hw, model_stem):
     }
     so = ort.SessionOptions()
     so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-    sess = ort.InferenceSession(model_path, so,
+    sess = ort.InferenceSession(
+        model_path,
+        so,
         providers=[
             ("TensorrtExecutionProvider", trt_opts),
             ("CUDAExecutionProvider", {"device_id": "0"}),
             ("CPUExecutionProvider", {}),
-        ])
+        ],
+    )
     os.chdir(_prev)
     inp_name = sess.get_inputs()[0].name
     inp = np.random.default_rng(0).random((1, 3, inp_hw, inp_hw)).astype("float32")
@@ -100,6 +111,7 @@ def run_ort_trt(model_path, inp_hw, model_stem):
 def run_pytorch(model_path, inp_hw, fp16: bool):
     import torch
     from custom_kernels.gpen_bfr.gpen_torch import GPENTorch
+
     dtype = torch.float16 if fp16 else torch.float32
     model = GPENTorch.from_onnx(model_path, compute_dtype=dtype).cuda().eval()
     inp = torch.randn(1, 3, inp_hw, inp_hw, device="cuda")
@@ -118,6 +130,7 @@ def run_pytorch(model_path, inp_hw, fp16: bool):
 def run_cuda_graph(model_path, inp_hw):
     import torch
     from custom_kernels.gpen_bfr.gpen_torch import GPENTorch, build_cuda_graph_runner
+
     model = GPENTorch.from_onnx(model_path, compute_dtype=torch.float16).cuda().eval()
     inp = torch.randn(1, 3, inp_hw, inp_hw, device="cuda")
     with torch.no_grad():
@@ -141,9 +154,9 @@ def benchmark_one(size: int):
 
     # Determine input size from ONNX
     import onnx
+
     m = onnx.load(model_path)
-    in_dims = [d.dim_value for d in
-               m.graph.input[0].type.tensor_type.shape.dim]
+    in_dims = [d.dim_value for d in m.graph.input[0].type.tensor_type.shape.dim]
     inp_hw = in_dims[2] if len(in_dims) >= 3 else size
 
     results = []
@@ -184,17 +197,17 @@ def benchmark_one(size: int):
     print(f"\n{hdr}")
     print("-" * len(hdr))
     for name, t in results:
-        row = f"  {name:<40} {t:>8.2f} {cuda_ep_t/t:>10.2f}x"
+        row = f"  {name:<40} {t:>8.2f} {cuda_ep_t / t:>10.2f}x"
         if t_trt:
-            row += f" {t_trt/t:>9.2f}x"
+            row += f" {t_trt / t:>9.2f}x"
         print(row)
 
     out_path = Path(__file__).parent / f"benchmark_results_{size}.txt"
     with open(out_path, "w") as f:
         for name, t in results:
-            f.write(f"{name}: {t:.2f} ms  (vs CUDA EP: {cuda_ep_t/t:.2f}x")
+            f.write(f"{name}: {t:.2f} ms  (vs CUDA EP: {cuda_ep_t / t:.2f}x")
             if t_trt:
-                f.write(f", vs TRT EP: {t_trt/t:.2f}x")
+                f.write(f", vs TRT EP: {t_trt / t:.2f}x")
             f.write(")\n")
     print(f"\n[Saved -> {out_path}]")
 
