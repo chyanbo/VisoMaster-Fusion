@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import sys
 import copy
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 from pathlib import Path
 
 import pytest
@@ -61,7 +61,6 @@ from app.helpers.miscellaneous import ParametersDict  # noqa: E402
 
 # Import must happen AFTER stubs so the module-level `jobs_dir = ...` line
 # runs with a mocked environment.  We patch it to a temp location below.
-import app.ui.widgets.actions.job_manager_actions as _jma_module  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -390,21 +389,28 @@ def test_validate_job_data_for_loading_invalid(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def _mock_mw(project_root: Path) -> MagicMock:
+    """Minimal main_window mock with project_root_path set."""
+    mw = MagicMock()
+    mw.project_root_path = project_root
+    return mw
+
+
 def test_list_jobs_empty_dir(tmp_path):
     from app.ui.widgets.actions.job_manager_actions import list_jobs
 
-    with patch.object(_jma_module, "jobs_dir", str(tmp_path)):
-        result = list_jobs()
+    result = list_jobs(_mock_mw(tmp_path))
     assert result == []
 
 
 def test_list_jobs_returns_names_without_extension(tmp_path):
     from app.ui.widgets.actions.job_manager_actions import list_jobs
 
-    (tmp_path / "my_job.json").write_text("{}")
-    (tmp_path / "second.json").write_text("{}")
-    with patch.object(_jma_module, "jobs_dir", str(tmp_path)):
-        result = list_jobs()
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    (jobs_dir / "my_job.json").write_text("{}")
+    (jobs_dir / "second.json").write_text("{}")
+    result = list_jobs(_mock_mw(tmp_path))
     assert "my_job" in result
     assert "second" in result
     assert len(result) == 2
@@ -413,17 +419,18 @@ def test_list_jobs_returns_names_without_extension(tmp_path):
 def test_list_jobs_ignores_non_json_files(tmp_path):
     from app.ui.widgets.actions.job_manager_actions import list_jobs
 
-    (tmp_path / "job1.json").write_text("{}")
-    (tmp_path / "readme.txt").write_text("not a job")
-    (tmp_path / "data.csv").write_text("a,b")
-    with patch.object(_jma_module, "jobs_dir", str(tmp_path)):
-        result = list_jobs()
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    (jobs_dir / "job1.json").write_text("{}")
+    (jobs_dir / "readme.txt").write_text("not a job")
+    (jobs_dir / "data.csv").write_text("a,b")
+    result = list_jobs(_mock_mw(tmp_path))
     assert result == ["job1"]
 
 
-def test_list_jobs_nonexistent_dir():
+def test_list_jobs_nonexistent_dir(tmp_path):
     from app.ui.widgets.actions.job_manager_actions import list_jobs
 
-    with patch.object(_jma_module, "jobs_dir", "/does/not/exist/xyz"):
-        result = list_jobs()
+    # No "jobs" subdir created — get_jobs_dir will create it (empty) → returns []
+    result = list_jobs(_mock_mw(tmp_path))
     assert result == []

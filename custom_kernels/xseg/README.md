@@ -16,17 +16,19 @@ Model: **SN256_XSeg**  `(1,3,256,256)f32 → (1,1,256,256)f32`
 
 | Tier | Method | ms | vs CUDA EP | vs TRT EP |
 |------|--------|---:|-----------:|----------:|
-| 0 | ORT FP32 CUDA EP | 12.53 | 1.00x | 0.15x |
-| 0b | ORT TensorRT EP | 1.90 | 6.59x | 1.00x |
-| 1 | PyTorch FP32 | 5.04 | 2.49x | 0.38x |
-| 2 | PyTorch FP16 | 3.32 | 3.78x | 0.57x |
-| 3 | PT FP16 + CUDA graph (no Triton) | 1.24 | 10.10x | 1.53x |
-| **4** | **PT FP16 + Triton RMSNormMax + CUDA graph (Custom)** | **1.23** | **10.23x** | **1.54x** |
+| 0 | ORT FP32 CUDA EP | 11.55 | 1.00x | 0.31x |
+| 0b | ORT TensorRT EP | 37.54 | 0.31x | 1.00x |
+| 1 | PyTorch FP32 | 5.14 | 2.25x | 7.30x |
+| 2 | PyTorch FP16 | 3.53 | 3.27x | 10.63x |
+| 3 | PT FP16 + CUDA graph (no Triton) | 1.95 | 5.92x | 19.25x |
+| **4** | **PT FP16 + Triton RMSNormMax + CUDA graph (Custom)** | **1.95** | **5.93x** | **19.25x** |
 
 > **Application uses Tier 4** when Triton is available (Triton fused RMSNormMax
 > inside the CUDA graph replaces 5 PyTorch ops with 2 memory passes across all
 > 36 norm blocks).  Falls back to Tier 3 if Triton is unavailable, and Tier 2
 > if CUDA graph capture fails.
+>
+> **Note on VRAM Leak Fix:** A multi-threading race condition caused by missing dedicated capture streams in the graph runner, which allowed CPU-side allocations to outpace GPU execution during high-FPS scenarios (like recording), has been permanently fixed. The runner now properly uses a dedicated stream and `torch.cuda.current_stream().synchronize()` inside the locks.
 >
 > **Note on ORT CUDA EP baseline:** ORT runs ConvTranspose nodes on CPU due to
 > asymmetric padding, making the 13.04 ms baseline artificially slow.  The

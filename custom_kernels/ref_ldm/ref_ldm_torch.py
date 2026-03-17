@@ -12,10 +12,17 @@ Architecture from configs/refldm.yaml:
          attention_resolutions=[2,4,8], num_head_channels=32,
          in_channels=16, out_channels=8
 
-Speedup tiers vs ORT FP32 CUDA EP:
-  Tier 1 — PyTorch FP32                              ~1.1x
-  Tier 2 — PyTorch FP16 + Triton GroupNorm+SiLU      ~2.0x (VAE), ~1.6x (UNet)
-  Tier 3 — FP16 + Triton + CUDA graph (VAE only)     ~2.5x (VAE)
+Speedup tiers vs ORT FP32 CUDA EP (RTX 4090):
+  Tier 1 — PyTorch FP32                              ~1.0x
+  Tier 2 — PyTorch FP16 + Triton GroupNorm+SiLU      ~2.0x (VAE), ~0.7x (UNet eager)
+  Tier 3 — FP16 + Triton + CUDA graph                ~2.0x (enc), ~2.9x (dec), ~1.8x (unet)
+  Tier 4 — FP16 + Triton + CUDA graph + NHWC         ~2.9x (dec, best), ~1.8x (unet)
+
+Optimizations applied:
+  - norm_out GroupNorm has fuse_silu=True — SiLU fused inside Triton kernel, eliminating
+    a separate activation memory pass (most impactful for decoder's 512×512 output map)
+  - UNet output GN also fuses SiLU (nn.Identity placeholder preserves out.2 weight index)
+  - UNet supports CUDA graph via UNetCUDAGraphRunner with static K/V buffers
 
 Usage:
     enc  = RefLDMEncoderTorch.from_onnx("model_assets/ref_ldm_vae_encoder.onnx").cuda().eval()
@@ -237,7 +244,7 @@ class RefLDMEncoderTorch(nn.Module):
         mid.block_2 = _VAEResBlock(block_in, block_in)
         self.encoder.mid = mid
 
-        self.encoder.norm_out = _GN(block_in, fuse_silu=False)
+        self.encoder.norm_out = _GN(block_in, fuse_silu=True)
         self.encoder.conv_out = nn.Conv2d(block_in, z_ch, 3, 1, 1)
 
         self.quant_conv = nn.Conv2d(z_ch, z_ch, 1)
@@ -276,8 +283,7 @@ class RefLDMEncoderTorch(nn.Module):
         h = enc.mid.block_1(h)
         h = enc.mid.attn_1(h)
         h = enc.mid.block_2(h)
-        h = enc.norm_out(h)
-        h = _swish(h)
+        h = enc.norm_out(h)  # SiLU now fused into GN kernel
         h = enc.conv_out(h)
         return self.quant_conv(h).float()
 
@@ -351,29 +357,6 @@ class RefLDMEncoderTorch(nn.Module):
 
 
 # ===========================================================================
-# VQ Codebook (needed by decoder)
-# ===========================================================================
-
-
-class _VQLayer(nn.Module):
-    """Minimal VQ nearest-neighbour lookup (inference only, no gradients)."""
-
-    def __init__(self, n_embed: int = 8192, embed_dim: int = 8):
-        super().__init__()
-        self.embedding = nn.Embedding(n_embed, embed_dim)
-
-    def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # z: (B, C, H, W)  →  z_q: (B, C, H, W)
-        b, c, h, w = z.shape
-        z_f = z.permute(0, 2, 3, 1).reshape(-1, c).float()  # FP32 for distance
-        emb = self.embedding.weight.float()  # (N, C)
-        d = (z_f**2).sum(1, keepdim=True) + (emb**2).sum(1) - 2 * z_f @ emb.t()
-        idx = d.argmin(dim=1)
-        z_q = self.embedding(idx).view(b, h, w, c).permute(0, 3, 1, 2)
-        return z_q.to(z.dtype)
-
-
-# ===========================================================================
 # VAE Decoder
 # ===========================================================================
 
@@ -381,7 +364,8 @@ class _VQLayer(nn.Module):
 class RefLDMDecoderTorch(nn.Module):
     """
     VAE decoder: latent (1,8,64,64)f32 → image (1,3,512,512)f32.
-    Includes quantize + post_quant_conv as exported in the ONNX model.
+    The exported ONNX decoder starts directly with post_quant_conv — VQ
+    quantization is NOT included in the ONNX graph.
     Config: same VAE config as encoder.
     """
 
@@ -395,8 +379,6 @@ class RefLDMDecoderTorch(nn.Module):
         ch, mult, nrb, z_ch = self._CH, self._CH_MULT, self._NRB, self._Z_CH
         num_res = len(mult)
 
-        # VQ lookup + post-quant
-        self.quantize = _VQLayer(n_embed=8192, embed_dim=z_ch)
         self.post_quant_conv = nn.Conv2d(z_ch, z_ch, 1)
 
         # Decoder
@@ -424,7 +406,7 @@ class RefLDMDecoderTorch(nn.Module):
                 lvl.upsample = _VAEUpsample(block_in)
             dec.up.insert(0, lvl)
 
-        dec.norm_out = _GN(block_in, fuse_silu=False)
+        dec.norm_out = _GN(block_in, fuse_silu=True)
         dec.conv_out = nn.Conv2d(block_in, 3, 3, 1, 1)
         self.decoder = dec
         self._use_cl: bool = False
@@ -439,8 +421,10 @@ class RefLDMDecoderTorch(nn.Module):
         return self
 
     def forward(self, z: torch.Tensor) -> torch.Tensor:
-        # VQ step uses FP32 for distance computation, then cast to compute_dtype
-        z_q = self.quantize(z).to(self.post_quant_conv.weight.dtype)
+        # The exported ONNX decoder starts directly with post_quant_conv — VQ quantization
+        # is NOT included in the ONNX model (the upstream pipeline provides pre-quantized
+        # or raw latents directly).  Pass z through unchanged; just cast to compute dtype.
+        z_q = z.to(self.post_quant_conv.weight.dtype)
         if self._use_cl:
             z_q = z_q.contiguous(memory_format=torch.channels_last)
         z_q = self.post_quant_conv(z_q)
@@ -455,8 +439,7 @@ class RefLDMDecoderTorch(nn.Module):
                 h = blk(h)
             if hasattr(dec.up[i_lvl], "upsample"):
                 h = dec.up[i_lvl].upsample(h)
-        h = dec.norm_out(h)
-        h = _swish(h)
+        h = dec.norm_out(h)  # SiLU now fused into GN kernel
         return dec.conv_out(h).float()
 
     @classmethod
@@ -804,8 +787,10 @@ class RefLDMUNetTorch(nn.Module):
                 self.output_blocks.append(_UNetTES(*layers))
 
         self.out = nn.Sequential(
-            _GN(ch, fuse_silu=False),
-            nn.SiLU(),
+            _GN(
+                ch, fuse_silu=True
+            ),  # SiLU fused — eliminates separate activation kernel
+            nn.Identity(),  # placeholder (was nn.SiLU); index preserved for out.2 conv
             _zero_module(nn.Conv2d(ch, oc, 3, 1, 1)),
         )
         self._use_cl: bool = False
@@ -1039,7 +1024,7 @@ class CUDAGraphRunner:
         with (
             torch.no_grad(),
             torch.cuda.graph(
-                self._graph, stream=self._stream, capture_error_mode="thread_local"
+                self._graph, stream=self._stream, capture_error_mode="relaxed"
             ),
         ):
             self._out = model(self._inp)
@@ -1135,7 +1120,7 @@ class UNetCUDAGraphRunner:
             with torch.cuda.graph(
                 self._graph,
                 stream=self._capture_stream,
-                capture_error_mode="thread_local",
+                capture_error_mode="relaxed",
             ):
                 self._static_out = model(
                     self._static_x,

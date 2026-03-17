@@ -777,9 +777,7 @@ def build_cuda_graph_runner(model: GFPGANTorch, inp_shape: tuple = (1, 3, 512, 5
     graph = torch.cuda.CUDAGraph()
     with (
         torch.no_grad(),
-        torch.cuda.graph(
-            graph, stream=capture_stream, capture_error_mode="thread_local"
-        ),
+        torch.cuda.graph(graph, stream=capture_stream, capture_error_mode="relaxed"),
     ):
         static_out = model(static_inp)
     torch.cuda.synchronize(dev)

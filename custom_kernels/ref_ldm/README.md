@@ -1,8 +1,9 @@
 # ReF-LDM Custom Kernel
 
 FP16 PyTorch reimplementation of the three **ReF-LDM** denoiser ONNX models,
-with Triton fused GroupNorm+SiLU kernels and CUDA graph capture for the VAE components.
-Used by VisoMaster-Fusion when the *Custom* execution provider is selected.
+with Triton fused GroupNorm+SiLU kernels and CUDA graph capture for all three
+components.  Used by VisoMaster-Fusion when the *Custom* execution provider is
+selected.
 
 ## Models
 
@@ -14,58 +15,63 @@ Used by VisoMaster-Fusion when the *Custom* execution provider is selected.
 
 ## Benchmark Results
 
-**Hardware:** NVIDIA GeForce RTX 4090 · PyTorch 2.8.0+cu129 · CUDA 12.9 · Triton 3.6.0 · ORT 1.22.0
-**Conditions:** 50 iterations, 10 warm-up passes
+**Hardware:** NVIDIA GeForce RTX 4090 · PyTorch 2.8.0+cu129 · CUDA 12.9 · Triton 3.6.0 · ORT 1.22.0 · TensorRT 10
+**Conditions:** 200 iterations, 50 warm-up passes
 
 ### VAE Encoder (1,3,512,512) → (1,8,64,64)
 
-| Tier | Method | Latency | vs ORT CUDA EP | vs ORT TRT EP |
-|------|--------|--------:|:--------------:|:-------------:|
-| 0    | ORT FP32 CUDA EP (baseline) | 20.99 ms | 1.00× | 0.59× |
-| 0b   | ORT TensorRT EP | 12.28 ms | 1.71× | 1.00× (baseline) |
-| 1    | PyTorch FP32 pure ops | 21.72 ms | 0.97× | — |
-| 2    | PyTorch FP16 + Triton GroupNorm+SiLU | 10.80 ms | 1.94× | 0.88× |
-| **3** | **FP16 + Triton + CUDA graph** | **10.45 ms** | **2.01×** | **1.17×** |
-| 4    | FP16 + Triton + CUDA graph + NHWC | 13.94 ms | 1.51× | — |
+| Tier | Method | Latency | vs ORT CUDA EP |
+|------|--------|--------:|:--------------:|
+| 0    | ORT FP32 CUDA EP (baseline) | 20.94 ms | 1.00× |
+| 0b   | ORT TensorRT EP FP32 (app default) | 12.17 ms | 1.72× |
+| 1    | PyTorch FP32 pure ops | 21.59 ms | 0.97× |
+| 2    | PyTorch FP16 + Triton GroupNorm+SiLU | 10.52 ms | 1.99× |
+| **3** | **FP16 + Triton + CUDA graph** | **10.25 ms** | **2.04×** |
+| 4    | FP16 + Triton + CUDA graph + NHWC | 13.80 ms | 1.52× |
 
 > NHWC (Tier 4) is slower for the encoder on cuDNN 9 — the small channel counts
 > (128–512) don't benefit from NHWC at this spatial resolution. **Tier 3 is used by default.**
+> Custom kernel (Tier 3) beats TRT EP by **1.19× (10.25 vs 12.17 ms)**.
 
 ### VAE Decoder (1,8,64,64) → (1,3,512,512)
 
-| Tier | Method | Latency | vs ORT CUDA EP | vs ORT TRT EP |
-|------|--------|--------:|:--------------:|:-------------:|
-| 0    | ORT FP32 CUDA EP (baseline) | 70.67 ms | 1.00× | 0.30× |
-| 0b   | ORT TensorRT EP | 21.32 ms | 3.31× | 1.00× (baseline) |
-| 1    | PyTorch FP32 pure ops | 52.65 ms | 1.34× | — |
-| 2    | PyTorch FP16 + Triton GroupNorm+SiLU | 25.37 ms | 2.78× | 0.84× |
-| **3** | **FP16 + Triton + CUDA graph** | **25.23 ms** | **2.80×** | **0.84×** |
-| **4** | **FP16 + Triton + CUDA graph + NHWC** | **25.07 ms** | **2.82×** | **0.85×** |
+| Tier | Method | Latency | vs ORT CUDA EP |
+|------|--------|--------:|:--------------:|
+| 0    | ORT FP32 CUDA EP (baseline) | 70.08 ms | 1.00× |
+| 0b   | ORT TensorRT EP FP32 (app default) | 21.43 ms | 3.27× |
+| 1    | PyTorch FP32 pure ops | 36.05 ms | 1.94× |
+| 2    | PyTorch FP16 + Triton GroupNorm+SiLU | 17.12 ms | 4.09× |
+| **3** | **FP16 + Triton + CUDA graph** | **16.97 ms** | **4.13×** |
+| 4    | FP16 + Triton + CUDA graph + NHWC | 23.91 ms | 2.93× |
 
-> VAE Decoder Tier 4 (NHWC) provides a marginal improvement over Tier 3.
-> **Tier 4 is used by default for the decoder.**
+> The `norm_out` GroupNorm fuses the SiLU activation directly inside the Triton kernel
+> (eliminates a separate read + write of the 512×512 feature map), saving ~0.5 ms per call.
+> NHWC (Tier 4) regresses for the decoder — small channel counts (ch=128) at 512×512 spatial
+> resolution don't benefit from cuDNN NHWC layout. **Tier 3 (NCHW) is used by default.**
+> Custom kernel (Tier 3) beats TRT EP by **1.26× (16.97 vs 21.43 ms)**.
 
 ### UNet Denoiser (1,16,64,64) + K/V → (1,8,64,64)
 
-| Tier | Method | Latency | vs ORT CUDA EP | vs ORT TRT EP |
-|------|--------|--------:|:--------------:|:-------------:|
-| 0    | ORT FP32 CUDA EP — no K/V (baseline) | 9.62 ms | 1.00× | 0.55× |
-| 0b   | ORT TensorRT EP | 7.81 ms | 1.23× | 1.00× (baseline) |
-| 1    | PyTorch FP32 pure ops | 13.87 ms | 0.69× | — |
-| 2    | PyTorch FP16 + Triton GroupNorm+SiLU | 14.03 ms | 0.69× | — |
-| **3** | **FP16 + Triton + CUDA graph** | **5.34 ms** | **1.80×** | **1.46×** |
-| **4** | **FP16 + Triton + CUDA graph + NHWC** | **5.27 ms** | **1.83×** | **1.48×** |
+| Tier | Method | Latency | vs ORT CUDA EP |
+|------|--------|--------:|:--------------:|
+| 0    | ORT FP32 CUDA EP — no K/V (baseline) | 9.60 ms | 1.00× |
+| 0b   | ORT TensorRT EP FP32 (app default) | 6.67 ms | 1.44× |
+| 1    | PyTorch FP32 pure ops | 28.17 ms | 0.34× |
+| 2    | PyTorch FP16 + Triton GroupNorm+SiLU | 28.48 ms | 0.34× |
+| 3    | FP16 + Triton + CUDA graph | 5.36 ms | 1.79× |
+| **4** | **FP16 + Triton + CUDA graph + NHWC** | **5.25 ms** | **1.83×** |
 
 > The UNet CUDA graph (Tier 3/4) works because K/V tensors are **static buffers** that are
 > copied into the graph's pre-allocated memory each call — the graph sees constant shapes.
 > ORT CUDA EP baseline uses zeroed K/V; PyTorch Tiers 1–2 include real K/V concat per block,
-> explaining the higher eager latency. Once the CUDA graph is captured, kernel-launch overhead
-> is eliminated and the UNet runs at **5.27–5.34 ms** — **1.46–1.48× faster than ORT TRT EP**.
+> explaining the higher eager latency.  Once the CUDA graph is captured, kernel-launch overhead
+> is eliminated and the UNet runs at **5.25 ms** — **1.83× faster than ORT CUDA EP**.
+> Custom kernel (Tier 4) beats TRT EP by **1.27× (5.25 vs 6.67 ms)**.
 
 > **Application uses:**
 > - VAE Encoder → **Tier 3** (CUDA graph, NCHW — NHWC is slower for this model)
-> - VAE Decoder → **Tier 4** (CUDA graph + NHWC)
-> - UNet → **Tier 4** (CUDA graph + NHWC — 1.48× faster than ORT TRT EP)
+> - VAE Decoder → **Tier 3** (CUDA graph, NCHW — NHWC is slower for this model)
+> - UNet → **Tier 4** (CUDA graph + NHWC — 1.83× faster than ORT CUDA EP, 1.27× faster than TRT EP)
 
 ### Kernel Priority Chain
 
@@ -85,12 +91,16 @@ attn_resolutions=[]   (NO attention in encoder/decoder blocks)
 z_channels=8, double_z=False
 ```
 
-**Encoder** path: `conv_in → 4× DownBlock[2×ResBlock + optional Downsample] → mid[ResBlock+Attn+ResBlock] → norm_out+SiLU → conv_out → quant_conv`
+**Encoder** path: `conv_in → 4× DownBlock[2×ResBlock + optional Downsample] → mid[ResBlock+Attn+ResBlock] → norm_out+SiLU(fused) → conv_out → quant_conv`
 
-**Decoder** path: `quantize (VQ lookup) → post_quant_conv → conv_in → mid → 4× UpBlock[2×ResBlock + optional Upsample] → norm_out+SiLU → conv_out`
+**Decoder** path: `post_quant_conv → conv_in → mid → 4× UpBlock[2×ResBlock + optional Upsample] → norm_out+SiLU(fused) → conv_out`
 
-**VQ codebook**: nearest-neighbour lookup over 8192 codes of dimension 8.
-Inference-only — no straight-through gradients needed.
+> The exported ONNX decoder does **not** include a VQ lookup step — the upstream pipeline
+> passes latents directly to `post_quant_conv`.
+
+**norm_out SiLU fusion**: Both encoder and decoder fuse the final GroupNorm and SiLU
+activation into a single Triton kernel pass.  This eliminates one read + write of the
+output feature map (most significant for the decoder where spatial resolution is 512×512).
 
 ### UNet Denoiser
 
@@ -130,7 +140,8 @@ The Triton kernel fuses these into a single two-pass operation:
 | File | Purpose |
 |------|---------|
 | `ref_ldm_torch.py` | `RefLDMEncoderTorch`, `RefLDMDecoderTorch`, `RefLDMUNetTorch` + Triton kernels + CUDA graph runner |
-| `benchmark_ref_ldm.py` | 4-tier latency benchmark vs ORT baseline |
+| `benchmark_ref_ldm.py` | 5-tier latency benchmark vs ORT baseline (Tier 5: `torch.compile`, Linux only) |
+| `benchmark_results.txt` | Latest benchmark output |
 | `__init__.py` | Package marker |
 
 The Triton GroupNorm+SiLU kernel is defined in `custom_kernels/triton_ops.py`
@@ -148,22 +159,28 @@ All three ReF-LDM models are then executed via `RefLDMEncoderTorch`,
 ```python
 # Internal call path (face_restorers.py):
 from custom_kernels.ref_ldm.ref_ldm_torch import (
-    RefLDMEncoderTorch, RefLDMDecoderTorch, RefLDMUNetTorch, build_cuda_graph_runner
+    RefLDMEncoderTorch, RefLDMDecoderTorch, RefLDMUNetTorch,
+    build_cuda_graph_runner, build_unet_cuda_graph_runner,
 )
 enc  = RefLDMEncoderTorch.from_onnx(onnx_path).cuda().eval()
 dec  = RefLDMDecoderTorch.from_onnx(onnx_path).cuda().eval()
 unet = RefLDMUNetTorch.from_onnx(onnx_path).cuda().eval()
 
-enc_runner = build_cuda_graph_runner(enc, inp_shape=(1, 3, 512, 512))
-dec_runner = build_cuda_graph_runner(dec, inp_shape=(1, 8, 64, 64))
+enc_runner  = build_cuda_graph_runner(enc,  inp_shape=(1, 3, 512, 512))
+dec_runner  = build_cuda_graph_runner(dec,  inp_shape=(1, 8, 64,  64 ))
+unet_runner = build_unet_cuda_graph_runner(
+    unet, x_shape=(1, 16, 64, 64), ts_example=timestep,
+    kv_map_template=kv_map, use_exclusive=True,
+)
 
-latent    = enc_runner(image_f32_cuda)    # (1,3,512,512)f32 → (1,8,64,64)f32
-image_out = dec_runner(latent)            # (1,8,64,64)f32 → (1,3,512,512)f32
-noise_pred = unet(x_noisy_lq, timesteps, kv_map, use_exclusive=True)
+latent     = enc_runner(image_f32_cuda)              # (1,3,512,512)f32 → (1,8,64,64)f32
+image_out  = dec_runner(latent)                      # (1,8,64,64)f32 → (1,3,512,512)f32
+noise_pred = unet_runner(x_noisy, timestep, kv_map)  # denoising step
 ```
 
 VAE models are CUDA-graph-captured on first use (3 warm-up passes + capture).
-UNet is called directly (no CUDA graph) due to dynamic K/V tensors.
+UNet uses `UNetCUDAGraphRunner` which pre-allocates static K/V buffers so the
+variable reference K/V tensors are compatible with CUDA graph replay.
 
 ---
 
@@ -174,7 +191,7 @@ helper tries multiple prefix strategies:
 
 - `RefLDMEncoderTorch`: prefixes `["", "encoder.", "first_stage_model."]`
 - `RefLDMDecoderTorch`: prefixes `["", "decoder.", "first_stage_model."]`
-- `RefLDMUNetTorch`: prefixes `["", "model.diffusion_model.", "diffusion_model."]`
+- `RefLDMUNetTorch`: prefixes `["unet_model.", "", "model.diffusion_model.", "diffusion_model."]`
 
 If a prefix match fails, falls back to suffix matching (parameter name without
 any top-level namespace).
@@ -185,7 +202,9 @@ any top-level namespace).
 
 FP16 GroupNorm with FP32 accumulators in the Triton kernel provides
 accuracy equivalent to the `GroupNorm32` FP32 upcast used in the original
-LDM code, while avoiding redundant dtype conversions.
+LDM code, while avoiding redundant dtype conversions.  The fused SiLU path
+computes `out * sigmoid(out)` inside the same Triton pass — numerically
+identical to a separate SiLU call.
 
 Expected mean relative error vs ORT FP32: `< 2%` for both VAE components.
 UNet: `< 2%` mean error (K/V attention paths may show slightly higher variance
@@ -196,3 +215,12 @@ at very low sequence lengths).
 ```bat
 .venv/Scripts/python custom_kernels/ref_ldm/benchmark_ref_ldm.py
 ```
+
+Optional env vars:
+```
+WARMUP=10 ITERS=50 .venv/Scripts/python custom_kernels/ref_ldm/benchmark_ref_ldm.py
+```
+
+> **Note (Windows):** Tier 5 (`torch.compile`) is automatically skipped on Windows
+> because `torch.inductor` + Triton causes a hard native segfault in `libtriton.pyd`
+> during Inductor codegen.  Tier 5 will run correctly on Linux.

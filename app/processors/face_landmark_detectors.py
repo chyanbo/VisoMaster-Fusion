@@ -62,8 +62,6 @@ class FaceLandmarkDetectors:
         # If keep_essential is False, active_landmark_models has already been fully
         # emptied by the per-model remove() calls in the loop above; no extra
         # .clear() is needed here.
-
-        # Release Custom-kernel instances so they are rebuilt on next use.
         with self._custom_init_lock:
             self._landmark5_torch = None
             self._landmark5_runner = None
@@ -158,13 +156,6 @@ class FaceLandmarkDetectors:
                 "function": self.detect_face_landmark_478,
             },
         }
-
-    def _get_runner_lock(self, runner):
-        with self._custom_inference_lock:
-            r_id = id(runner)
-            if r_id not in self._runner_locks:
-                self._runner_locks[r_id] = threading.Lock()
-            return self._runner_locks[r_id]
 
     def run_detect_landmark(
         self,
@@ -275,6 +266,13 @@ class FaceLandmarkDetectors:
                 .view(-1, 4)
                 .to(self.models_processor.device)
             )
+
+    def _get_runner_lock(self, runner):
+        with self._custom_inference_lock:
+            r_id = id(runner)
+            if r_id not in self._runner_locks:
+                self._runner_locks[r_id] = threading.Lock()
+            return self._runner_locks[r_id]
 
     def _get_landmark5_runner(self):
         """Lazy-load the Res50Torch Custom-kernel runner for FaceLandmark5."""
@@ -842,8 +840,6 @@ class FaceLandmarkDetectors:
             runner = self._get_landmark5_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-01: CUDA graphrunners with static buffers are not thread-safe.
-                    # Lock ensures only one FrameWorker thread uses the runner at a time.
                     with self._get_runner_lock(runner):
                         conf, landmarks = runner(image)
                 # conf: (1,10752,2) float32 GPU — already softmax-applied
@@ -934,7 +930,6 @@ class FaceLandmarkDetectors:
             runner = self._get_fan2dfan4_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-02: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         lmk_xyscore, heatmaps_t = runner(crop_image)
                 face_landmark_68 = (
@@ -1007,12 +1002,10 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-
         if self.models_processor.provider_name == "Custom":
             runner = self._get_1k3d68_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-03: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         out = runner(aimg)  # (1, 3309) float32
                 pred = out[0].cpu().numpy()
@@ -1076,12 +1069,10 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-
         if self.models_processor.provider_name == "Custom":
             runner = self._get_peppapig98_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-04: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         out_t = runner(crop_image)  # (1, 98, 3)
                 landmarks_xyscore = out_t.cpu()
@@ -1139,12 +1130,10 @@ class FaceLandmarkDetectors:
             .unsqueeze(0)
             .contiguous()
         )
-
         if self.models_processor.provider_name == "Custom":
             runner = self._get_det106_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-05: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         out_t = runner(aimg)  # (1, 212)
                 pred = out_t[0].cpu().numpy().reshape((-1, 2))
@@ -1223,7 +1212,6 @@ class FaceLandmarkDetectors:
             runner = self._get_landmark203_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-06: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         _, _, out_pts_t = runner(aimg)  # (1, 406) float32
                 out_pts = out_pts_t[0].cpu().numpy().reshape((-1, 2)) * 224.0
@@ -1289,7 +1277,6 @@ class FaceLandmarkDetectors:
             runner = self._get_landmark478_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FL-LOCK-07: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         lmk_t, _vis, _score = runner(aimg)  # (1,1,1,1434)
                 landmarks = lmk_t.cpu().numpy().reshape((1, 478, 3))
@@ -1326,7 +1313,6 @@ class FaceLandmarkDetectors:
                 bs_runner = self._get_blendshapes_runner()
                 if bs_runner is not None:
                     with torch.no_grad():
-                        # FL-LOCK-08: CUDA graphrunners with static buffers are not thread-safe.
                         with self._get_runner_lock(bs_runner):
                             bs_out = bs_runner(landmark_for_score)
                             landmark_score = bs_out.cpu().numpy().flatten()

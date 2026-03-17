@@ -352,9 +352,7 @@ def build_cuda_graph_runner(model: Det106Torch, input_shape: tuple = (1, 3, 192,
 
     # Capture
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(
-        graph, stream=warmup_stream, capture_error_mode="thread_local"
-    ):
+    with torch.cuda.graph(graph, stream=warmup_stream, capture_error_mode="relaxed"):
         with torch.no_grad():
             static_out = model(static_in)  # (N, 212)
 

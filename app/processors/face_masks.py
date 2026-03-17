@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 import threading
@@ -35,13 +35,8 @@ class FaceMasks:
         self._kernel_cache_lock = threading.Lock()
         self._meshgrid_cache_lock = threading.Lock()
         self._clip_load_lock = threading.Lock()
-        self._custom_inference_lock = (
-            threading.Lock()
-        )  # serialises lock dictionary access
-        self._runner_locks = {}
-        # FM-INIT: per-model init locks so that one model's ONNX loading does not
-        # block another model's ONNX loading (CPU-only work that can overlap).
-        # The global cuda_graph_capture_lock still serialises GPU captures.
+        self._custom_inference_lock = threading.Lock()
+        self._runner_locks: Dict[Any, threading.Lock] = {}
         self._faceparser_init_lock = threading.Lock()
         self._xseg_init_lock = threading.Lock()
         self._occluder_init_lock = threading.Lock()
@@ -50,21 +45,15 @@ class FaceMasks:
         self.clip_model_loaded = False
         self.active_models: set[str] = set()
 
-        # Custom-kernel instances for FaceParser (lazy-loaded on first use)
-        self._faceparser_torch: Optional[object] = None  # FaceParserResnet34Torch
-        self._faceparser_runner: Optional[object] = None  # _CapturedGraph or model
-
-        # Custom-kernel instances for XSeg (lazy-loaded on first use)
-        self._xseg_torch: Optional[object] = None  # XSegTorch
-        self._xseg_runner: Optional[object] = None  # _CapturedGraph or model
-
-        # Custom-kernel instances for Occluder (lazy-loaded on first use)
-        self._occluder_torch: Optional[object] = None  # OccluderTorch
-        self._occluder_runner: Optional[object] = None  # _CapturedGraph or model
-
-        # Custom-kernel instances for VggCombo (lazy-loaded on first use)
-        self._vgg_combo_torch: Optional[object] = None  # VggComboTorch
-        self._vgg_combo_runner: Optional[object] = None  # VggComboCUDAGraphRunner
+        # Custom-kernel instances (lazy-loaded on first use)
+        self._faceparser_torch: Optional[object] = None
+        self._faceparser_runner: Optional[object] = None
+        self._xseg_torch: Optional[object] = None
+        self._xseg_runner: Optional[object] = None
+        self._occluder_torch: Optional[object] = None
+        self._occluder_runner: Optional[object] = None
+        self._vgg_combo_torch: Optional[object] = None
+        self._vgg_combo_runner: Optional[object] = None
 
     def _get_runner_lock(self, runner):
         with self._custom_inference_lock:
@@ -79,7 +68,6 @@ class FaceMasks:
             for model_name in list(self.active_models):
                 self.models_processor.unload_model(model_name)
             self.active_models.clear()
-
         # Release Custom-kernel instances so they rebuild on next use.
         with self._faceparser_init_lock:
             self._faceparser_torch = None
@@ -303,10 +291,12 @@ class FaceMasks:
             runner = self._get_faceparser_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FM-LOCK-01: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         out = runner(x)
-                return out.argmax(dim=1).squeeze(0).to(torch.long)
+                        labels_512 = out.argmax(dim=1).squeeze(0).to(torch.long)
+                        if self.models_processor.device == "cuda":
+                            torch.cuda.current_stream().synchronize()
+                return labels_512
             # Custom runner unavailable — fall through to ORT
 
         # ORT path
@@ -1113,10 +1103,11 @@ class FaceMasks:
             runner = self._get_occluder_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FM-LOCK-02: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         result = runner(image)
-                output.copy_(result.squeeze())
+                        output.copy_(result.squeeze())
+                        if self.models_processor.device == "cuda":
+                            torch.cuda.current_stream().synchronize()
                 return
             # runner unavailable — fall through to ORT
 
@@ -1343,10 +1334,11 @@ class FaceMasks:
             runner = self._get_xseg_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FM-LOCK-03: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(runner):
                         result = runner(image)
-                output.copy_(result.view(256, 256))
+                        output.copy_(result.view(256, 256))
+                        if self.models_processor.device == "cuda":
+                            torch.cuda.current_stream().synchronize()
                 return
             # runner unavailable — fall through to ORT
 
@@ -1763,6 +1755,7 @@ class FaceMasks:
             self.models_processor.models[model_key] = self.models_processor.load_model(
                 model_key
             )
+            self.active_models.add(model_key)
 
         def preprocess(img):
             img = img.clone().float() / 255.0
@@ -1780,12 +1773,10 @@ class FaceMasks:
             vgg_runner = self._get_vgg_combo_runner()
             if vgg_runner is not None:
                 with torch.no_grad():
-                    # FM-LOCK-04: CUDA graphrunners with static buffers are not thread-safe.
                     with self._get_runner_lock(vgg_runner):
                         swapped_feat = vgg_runner(swapped)
                         original_feat = vgg_runner(original)
             else:
-                # Custom runner unavailable — fall through to ORT
                 shape = feature_shapes[feature_layer]
                 outpred = torch.empty(shape, dtype=torch.float32, device=swapped.device)
                 outpred2 = torch.empty_like(outpred)

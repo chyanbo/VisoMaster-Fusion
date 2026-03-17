@@ -81,10 +81,18 @@ class _RMSNormMax(nn.Module):
         self.max_val = nn.Parameter(torch.zeros(1, ch, 1, 1))
         # eps set by weight loader from the ONNX Abs_* initialiser (per-block scalar)
         self.eps: float = 1.0
+        # Set to True by _CapturedGraph during CUDA graph capture to force the
+        # PyTorch fallback path (Triton kernels may cause silent capture failures).
+        self._triton_disabled: bool = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        # Triton fused path: fp16 only (2 memory passes vs 5 PyTorch ops)
-        if x.dtype == torch.float16 and _TRITON_RMSNORMMAX is not None:
+        # Triton fused path: fp16 only (2 memory passes vs 5 PyTorch ops).
+        # Disabled during CUDA graph capture (see _CapturedGraph._triton_disabled).
+        if (
+            x.dtype == torch.float16
+            and _TRITON_RMSNORMMAX is not None
+            and not self._triton_disabled
+        ):
             return _TRITON_RMSNORMMAX(x, self.gamma, self.beta, self.max_val, self.eps)
         # PyTorch fallback (fp32 or Triton unavailable)
         # Use FP32 for accumulation to avoid overflow (x*x) if activations > 256
@@ -146,18 +154,34 @@ class _UpBlock(nn.Module):
 
     The ConvTranspose in the original ONNX has no built-in bias; instead a
     separate Add node with a [1, C, 1, 1] initialiser follows immediately.
+
+    ONNX padding contract:
+      All 6 ONNX ConvTranspose nodes use pads=[0, 0, 1, 1], which means the
+      raw (2*H+1) × (2*W+1) output is trimmed by removing the LAST row and
+      LAST column only — i.e. output = raw[:, :, :-1, :-1].
+
+      PyTorch ConvTranspose2d(padding=1, output_padding=1) uses *symmetric*
+      cropping (removes 1 from all four sides) then adds a zero row/col on
+      one side.  This produces a 1-pixel spatial shift relative to the ONNX,
+      causing misalignment between upsampled features and encoder skips —
+      resulting in "half-face" mask cut-off artefacts.
+
+      Fix: use ConvTranspose2d(padding=0) so the raw (2H+1)×(2W+1) output is
+      produced without any cropping, then explicitly slice [:-1, :-1] to
+      match the ONNX pads=[0,0,1,1] behaviour exactly.
     """
 
     def __init__(self, in_ch: int, out_ch: int) -> None:
         super().__init__()
-        self.ct = nn.ConvTranspose2d(
-            in_ch, out_ch, 3, stride=2, padding=1, output_padding=1, bias=False
-        )
+        # padding=0: produces raw (2*H+1)×(2*W+1); we slice to (2H)×(2W) below.
+        self.ct = nn.ConvTranspose2d(in_ch, out_ch, 3, stride=2, padding=0, bias=False)
         self.bias = nn.Parameter(torch.zeros(1, out_ch, 1, 1))
         self.norm = _RMSNormMax(out_ch)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.norm(self.ct(x) + self.bias)
+        # Slice :-1, :-1 replicates ONNX ConvTranspose pads=[0,0,1,1]:
+        # keep rows [0:2H] and cols [0:2W] of the raw (2H+1)×(2W+1) output.
+        return self.norm(self.ct(x)[:, :, :-1, :-1] + self.bias)
 
 
 class _DecBlock(nn.Module):
@@ -593,31 +617,107 @@ def _load_all_params(model: XSegTorch, onnx_model) -> None:
 
 
 class _CapturedGraph:
-    """Single fixed-size CUDA graph for (1, 3, 256, 256) input."""
+    """Single fixed-size CUDA graph for (1, 3, 256, 256) input.
+
+    Capture strategy
+    ----------------
+    Triton-fused _RMSNormMax kernels may allocate internal CUDA scratch buffers
+    via cudaMalloc (outside PyTorch's cudaMallocAsync pool) and are not always
+    capturable.  The Triton path is disabled on every _RMSNormMax module during
+    graph capture so that only standard PyTorch CUDA ops (always capturable) are
+    recorded.
+
+    Stream ordering
+    ---------------
+    All operations — copy_, replay, clone — run on the default CUDA stream.
+    Intra-stream ordering ensures each step completes before the next begins,
+    so no cross-stream races or explicit synchronisation events are needed.
+
+    Fallback to eager mode
+    ----------------------
+    If graph capture raises (e.g., a non-capturable op remains in the environment
+    even with Triton disabled), the runner transparently falls back to eager FP16
+    execution.  Correctness is preserved; only the kernel-launch speedup is lost.
+    """
 
     def __init__(self, model: XSegTorch, warmup: int = 3) -> None:
         device = next(model.parameters()).device
         self._inp = torch.zeros(1, 3, 256, 256, dtype=torch.float32, device=device)
+        # Always keep a strong reference to the model.  The captured CUDA graph
+        # references the model's weight tensors by their CUDA memory addresses.
+        # If the model is garbage-collected, those addresses become dangling →
+        # replay reads freed memory → NaN.  (In eager-fallback mode the reference
+        # is also needed to call model.forward() on every inference.)
+        self._model: XSegTorch = model
+        self._eager = False
 
-        with torch.no_grad():
-            for _ in range(warmup):
-                _ = model(self._inp)
+        # Disable Triton on every _RMSNormMax during BOTH warmup AND capture.
+        #
+        # Why disable during warmup?
+        #   _rmsnormmax_fwd has 6 BLOCK-size variants (32/64/128/256/512/1024).
+        #   When Triton is enabled and any variant has not yet been JIT-compiled,
+        #   NVRTC allocates large temporary GPU compilation buffers (compiler
+        #   workspace, PTX staging, cubin upload), one per variant.  On a GPU
+        #   already loaded with other Custom-provider models this triggers a
+        #   "spike to maximum VRAM" exactly at the moment the runner is first
+        #   built (i.e. at recording start, when _get_xseg_runner() is called
+        #   lazily for the first frame).
+        #   Keeping Triton disabled during warmup prevents any JIT compilation
+        #   here.  Triton compiles from cache on the first actual inference call,
+        #   where the compiled kernels are loaded cheaply from the
+        #   build_kernels.py cache without GPU compilation buffers.
+        #
+        # Why disable during capture?
+        #   Triton kernels use cudaMalloc (not cudaMallocAsync) for scratch
+        #   memory.  cudaMalloc is not capturable by CUDA graphs and would cause
+        #   the capture to fail or produce a broken graph.
+        norm_mods = [m for m in model.modules() if isinstance(m, _RMSNormMax)]
+        for nm in norm_mods:
+            nm._triton_disabled = True
+        try:
+            # Warmup with Triton disabled: settle cuDNN algorithm selection and
+            # warm up PyTorch's caching allocator without NVRTC JIT spikes.
+            with torch.no_grad():
+                for _ in range(warmup):
+                    _ = model(self._inp)
 
-        self._graph = torch.cuda.CUDAGraph()
-        self._stream = torch.cuda.Stream()
+            # Return all freed warmup tensors to CUDA before creating the graph
+            # pool.  This reduces memory fragmentation and lowers the initial
+            # reservation size of the private graph pool.
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
-        torch.cuda.synchronize()
-        with (
-            torch.no_grad(),
-            torch.cuda.graph(
-                self._graph, stream=self._stream, capture_error_mode="thread_local"
-            ),
-        ):
-            self._out = model(self._inp)
-        torch.cuda.synchronize()
+            self._graph = torch.cuda.CUDAGraph()
+            self._stream = torch.cuda.Stream()
+            with (
+                torch.no_grad(),
+                torch.cuda.graph(
+                    self._graph, stream=self._stream, capture_error_mode="relaxed"
+                ),
+            ):
+                self._out = model(self._inp)
+            torch.cuda.synchronize()
+        except Exception as exc:
+            print(
+                f"[XSegTorch] CUDA graph capture failed ({exc}). "
+                "Falling back to eager FP16 execution."
+            )
+            self._eager = True
+            with torch.no_grad():
+                self._out = model(self._inp)
+        finally:
+            for nm in norm_mods:
+                nm._triton_disabled = False
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
-        self._inp.copy_(x, non_blocking=True)
+        if self._eager:
+            with torch.no_grad():
+                return self._model(x)  # type: ignore[union-attr]
+
+        # copy_, replay(), and clone() are all on the default stream; intra-stream
+        # ordering guarantees the input is fully copied before the graph reads it,
+        # and the graph is fully finished before clone reads the output.
+        self._inp.copy_(x)
         self._graph.replay()
         return self._out.clone()
 

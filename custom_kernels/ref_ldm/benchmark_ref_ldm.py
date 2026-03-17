@@ -65,6 +65,183 @@ def _ort_session(onnx_path: str, provider: str = "CUDAExecutionProvider"):
     return ort.InferenceSession(onnx_path, sess_options=opts, providers=[provider])
 
 
+def _trt_ep_options():
+    return {
+        "trt_engine_cache_enable": True,
+        "trt_engine_cache_path": "tensorrt-engines",
+        "trt_timing_cache_enable": True,
+        "trt_timing_cache_path": "tensorrt-engines",
+        "trt_dump_ep_context_model": True,
+        "trt_ep_context_file_path": "tensorrt-engines",
+        "trt_layer_norm_fp32_fallback": True,
+        "trt_max_workspace_size": 8589934592,
+        "trt_builder_optimization_level": 5,
+    }
+
+
+def _ctx_engine_exists(ctx_path) -> bool:
+    """Return True if the engine file referenced by the ctx.onnx is present."""
+    try:
+        import onnx as _onnx
+
+        m = _onnx.load(str(ctx_path))
+        for node in m.graph.node:
+            if node.op_type == "EPContext":
+                for attr in node.attribute:
+                    if attr.name == "ep_cache_context":
+                        rel = attr.s.decode("utf-8", "replace")
+                        # engine path is relative to the ctx file's directory
+                        engine_abs = ctx_path.parent / rel
+                        return engine_abs.exists()
+    except Exception:
+        pass
+    return False
+
+
+def _patch_ctx_engine(ctx_path, new_engine_rel: str):
+    """Return a temporary ctx.onnx path with ep_cache_context replaced."""
+    import onnx as _onnx
+    import tempfile
+    import pathlib
+
+    m = _onnx.load(str(ctx_path))
+    for node in m.graph.node:
+        if node.op_type == "EPContext":
+            for attr in node.attribute:
+                if attr.name == "ep_cache_context":
+                    attr.s = new_engine_rel.encode("utf-8")
+    tmp = pathlib.Path(tempfile.mktemp(suffix=".onnx"))
+    _onnx.save(m, str(tmp))
+    return tmp
+
+
+def _ort_trt_session(onnx_path: str, ctx_name: str):
+    """Create an ORT session with TensorRT EP (same config as the application).
+
+    Load strategy (in order):
+    1. Pre-compiled _ctx.onnx  — instant if engine file is present.
+    2. Engine exists but hash mismatch — patch ctx to point to the right engine.
+    3. Rebuild from original ONNX with trt_builder_optimization_level=3 (fast).
+
+    Imports tensorrt first so nvinfer DLLs are in-process before ORT's TRT provider
+    DLL tries to resolve them (mirrors models_processor.py startup).
+    """
+    import onnxruntime as ort
+    import os as _os
+
+    # Pre-load nvinfer DLLs — identical to what models_processor.py does at startup.
+    try:
+        import tensorrt  # noqa: F401  — side-effect: loads nvinfer_10.dll
+    except Exception as _e:
+        print(f"  [WARN] Could not import tensorrt: {_e}")
+
+    if "TensorrtExecutionProvider" not in ort.get_available_providers():
+        return None, "TensorrtExecutionProvider not in ort.get_available_providers()"
+
+    ctx_path = ROOT / "tensorrt-engines" / ctx_name
+    engine_dir = ROOT / "tensorrt-engines" / "tensorrt-engines"
+    tmp_ctx = None  # track any temp file we create
+
+    if ctx_path.exists() and _ctx_engine_exists(ctx_path):
+        load_path = str(ctx_path)  # fast path: engine in place
+    else:
+        # Try to find a matching engine by probing candidate files in size order
+        # (largest engines are more likely to be a complex model like UNet).
+        candidates = sorted(
+            [f for f in engine_dir.glob("*.engine") if "main_graph" in f.name],
+            key=lambda f: f.stat().st_size,
+            reverse=True,
+        )
+        # Exclude engines already claimed by encoder/decoder ctx files
+        claimed = set()
+        for other_ctx in (ROOT / "tensorrt-engines").glob("*_ctx.onnx"):
+            if other_ctx == ctx_path:
+                continue
+            try:
+                import onnx as _o
+
+                _m = _o.load(str(other_ctx))
+                for _n in _m.graph.node:
+                    if _n.op_type == "EPContext":
+                        for _a in _n.attribute:
+                            if _a.name == "ep_cache_context":
+                                claimed.add(
+                                    _a.s.decode("utf-8", "replace").replace("\\", "/")
+                                )
+            except Exception:
+                pass
+
+        load_path = None
+        for cand in candidates:
+            rel = "tensorrt-engines/" + cand.name
+            if rel.replace("/", "\\") in claimed or rel in claimed:
+                continue  # already used by another model
+            # Patch ctx to point at this candidate and try loading below
+            if ctx_path.exists():
+                tmp_ctx = _patch_ctx_engine(ctx_path, rel.replace("/", "\\"))
+                load_path = str(tmp_ctx)
+            break
+
+        if load_path is None:
+            # No candidate found — rebuild from ONNX (optimization_level=3 for speed)
+            print(
+                f"  [INFO] No cached engine for {ctx_name}; building TRT engine "
+                f"(level=3, may take several minutes)..."
+            )
+            load_path = onnx_path
+
+    opts = _trt_ep_options()
+    if load_path == onnx_path:
+        opts = {**opts, "trt_builder_optimization_level": 3}
+
+    _prev = _os.getcwd()
+    _os.chdir(str(ROOT))
+    try:
+        so = ort.SessionOptions()
+        so.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        sess = ort.InferenceSession(
+            load_path,
+            so,
+            providers=[
+                ("TensorrtExecutionProvider", opts),
+                ("CUDAExecutionProvider", {"device_id": "0"}),
+                ("CPUExecutionProvider", {}),
+            ],
+        )
+    except Exception as _e:
+        if tmp_ctx is not None and load_path == str(tmp_ctx):
+            # Candidate engine didn't match — fall back to rebuild
+            _os.chdir(_prev)
+            tmp_ctx.unlink(missing_ok=True)
+            tmp_ctx = None
+            print("  [INFO] Candidate engine mismatch; rebuilding (level=3)...")
+            opts = {**_trt_ep_options(), "trt_builder_optimization_level": 3}
+            _os.chdir(str(ROOT))
+            try:
+                so2 = ort.SessionOptions()
+                so2.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+                sess = ort.InferenceSession(
+                    onnx_path,
+                    so2,
+                    providers=[
+                        ("TensorrtExecutionProvider", opts),
+                        ("CUDAExecutionProvider", {"device_id": "0"}),
+                        ("CPUExecutionProvider", {}),
+                    ],
+                )
+            except Exception as _e2:
+                return None, str(_e2)
+            finally:
+                _os.chdir(_prev)
+        else:
+            return None, str(_e)
+    finally:
+        _os.chdir(_prev)
+        if tmp_ctx is not None:
+            tmp_ctx.unlink(missing_ok=True)
+    return sess, None
+
+
 def _print_row(tier, label, ms_val, ref_ms):
     speedup = ref_ms / ms_val if ms_val > 0 else float("nan")
     print(f"  Tier {tier} | {label:<42} | {ms_val:8.2f} ms | {speedup:6.2f}x")
@@ -89,54 +266,14 @@ def bench_encoder():
     t0 = _bench(lambda: sess0.run([out_name], {in_name: inp_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
-    # Tier 0b — ORT TensorRT EP
+    # Tier 0b — ORT TensorRT EP (same provider config as the application)
     t0b = t0
-    try:
-        pass  # registers nvinfer DLL path on Windows
-    except Exception:
-        pass
-    import onnxruntime as _ort
-
-    if "TensorrtExecutionProvider" not in _ort.get_available_providers():
-        print(
-            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
-        )
+    sess0b, err0b = _ort_trt_session(ENC_ONNX, "ref_ldm_vae_encoder_ctx.onnx")
+    if sess0b is None:
+        print(f"  Tier 0b | ORT TensorRT EP — skipped ({err0b})")
     else:
-        ctx = ROOT / "tensorrt-engines" / "ref_ldm_vae_encoder_ctx.onnx"
-        if not ctx.exists():
-            print(
-                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
-            )
-        else:
-            import os as _os
-
-            _prev_cwd = _os.getcwd()
-            _os.chdir(str(ROOT))
-            trt_opts = {
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": "tensorrt-engines",
-                "trt_timing_cache_enable": True,
-                "trt_timing_cache_path": "tensorrt-engines",
-                "trt_dump_ep_context_model": True,
-                "trt_ep_context_file_path": "tensorrt-engines",
-                "trt_layer_norm_fp32_fallback": True,
-                "trt_max_workspace_size": 8589934592,
-                "trt_builder_optimization_level": 5,
-            }
-            so = _ort.SessionOptions()
-            so.graph_optimization_level = _ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort.InferenceSession(
-                ENC_ONNX,
-                so,
-                providers=[
-                    ("TensorrtExecutionProvider", trt_opts),
-                    ("CUDAExecutionProvider", {"device_id": "0"}),
-                    ("CPUExecutionProvider", {}),
-                ],
-            )
-            _os.chdir(_prev_cwd)
-            t0b = _bench(lambda: sess0b.run([out_name], {in_name: inp_np}))
-            _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
+        t0b = _bench(lambda: sess0b.run([out_name], {in_name: inp_np}))
+        _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
 
     # Tier 1  — PyTorch FP32
     sys.path.insert(0, str(ROOT))
@@ -179,6 +316,28 @@ def bench_encoder():
     t4 = _bench(lambda: runner_cl(inp))
     _print_row("4", "FP16 + Triton + CUDA graph + NHWC", t4, t0)
 
+    # Tier 5 — torch.compile + CUDA graph (Linux only)
+    # torch.compile + Triton causes a hard native segfault (access violation in
+    # libtriton.pyd during Inductor codegen) on Windows — cannot be caught by try/except.
+    if sys.platform == "win32":
+        print("  Tier 5 | torch.compile — skipped (not supported on Windows)")
+    else:
+        try:
+            enc_c5 = (
+                RefLDMEncoderTorch.from_onnx(ENC_ONNX, compute_dtype=torch.float16)
+                .cuda()
+                .eval()
+            )
+            enc_c5 = torch.compile(enc_c5, mode="reduce-overhead", fullgraph=False)
+            with torch.no_grad():
+                for _ in range(5):  # trigger compilation
+                    enc_c5(inp)
+            runner_c5 = build_cuda_graph_runner(enc_c5, inp_shape=(1, 3, 512, 512))
+            t5 = _bench(lambda: runner_c5(inp))
+            _print_row("5", "FP16 + Triton + CUDA graph + compile", t5, t0)
+        except Exception as e:
+            print(f"  Tier 5 | torch.compile — skipped ({type(e).__name__}: {e})")
+
     print()
     return t0, t0b
 
@@ -202,50 +361,14 @@ def bench_decoder():
     t0 = _bench(lambda: sess0.run([out_name], {in_name: lat_np}))
     _print_row("0", "ORT FP32 CUDA EP", t0, t0)
 
-    # Tier 0b — ORT TensorRT EP
+    # Tier 0b — ORT TensorRT EP (same provider config as the application)
     t0b = t0
-    import onnxruntime as _ort2
-
-    if "TensorrtExecutionProvider" not in _ort2.get_available_providers():
-        print(
-            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
-        )
+    sess0b, err0b = _ort_trt_session(DEC_ONNX, "ref_ldm_vae_decoder_ctx.onnx")
+    if sess0b is None:
+        print(f"  Tier 0b | ORT TensorRT EP — skipped ({err0b})")
     else:
-        ctx = ROOT / "tensorrt-engines" / "ref_ldm_vae_decoder_ctx.onnx"
-        if not ctx.exists():
-            print(
-                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
-            )
-        else:
-            import os as _os2
-
-            _prev_cwd = _os2.getcwd()
-            _os2.chdir(str(ROOT))
-            trt_opts = {
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": "tensorrt-engines",
-                "trt_timing_cache_enable": True,
-                "trt_timing_cache_path": "tensorrt-engines",
-                "trt_dump_ep_context_model": True,
-                "trt_ep_context_file_path": "tensorrt-engines",
-                "trt_layer_norm_fp32_fallback": True,
-                "trt_max_workspace_size": 8589934592,
-                "trt_builder_optimization_level": 5,
-            }
-            so = _ort2.SessionOptions()
-            so.graph_optimization_level = _ort2.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort2.InferenceSession(
-                DEC_ONNX,
-                so,
-                providers=[
-                    ("TensorrtExecutionProvider", trt_opts),
-                    ("CUDAExecutionProvider", {"device_id": "0"}),
-                    ("CPUExecutionProvider", {}),
-                ],
-            )
-            _os2.chdir(_prev_cwd)
-            t0b = _bench(lambda: sess0b.run([out_name], {in_name: lat_np}))
-            _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
+        t0b = _bench(lambda: sess0b.run([out_name], {in_name: lat_np}))
+        _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
 
     # Tier 1  — PyTorch FP32
     from custom_kernels.ref_ldm.ref_ldm_torch import RefLDMDecoderTorch
@@ -286,6 +409,26 @@ def bench_decoder():
     runner_cl = build_cuda_graph_runner(dec_cl, inp_shape=(1, 8, 64, 64))
     t4 = _bench(lambda: runner_cl(lat))
     _print_row("4", "FP16 + Triton + CUDA graph + NHWC", t4, t0)
+
+    # Tier 5 — torch.compile + CUDA graph (Linux only)
+    if sys.platform == "win32":
+        print("  Tier 5 | torch.compile — skipped (not supported on Windows)")
+    else:
+        try:
+            dec_c5 = (
+                RefLDMDecoderTorch.from_onnx(DEC_ONNX, compute_dtype=torch.float16)
+                .cuda()
+                .eval()
+            )
+            dec_c5 = torch.compile(dec_c5, mode="reduce-overhead", fullgraph=False)
+            with torch.no_grad():
+                for _ in range(5):
+                    dec_c5(lat)
+            runner_c5 = build_cuda_graph_runner(dec_c5, inp_shape=(1, 8, 64, 64))
+            t5 = _bench(lambda: runner_c5(lat))
+            _print_row("5", "FP16 + Triton + CUDA graph + compile", t5, t0)
+        except Exception as e:
+            print(f"  Tier 5 | torch.compile — skipped ({type(e).__name__}: {e})")
 
     print()
     return t0, t0b
@@ -374,50 +517,14 @@ def bench_unet():
     t0 = _bench(lambda: sess0.run([out_name], feeds))
     _print_row("0", "ORT FP32 CUDA EP (no K/V)", t0, t0)
 
-    # Tier 0b — ORT TensorRT EP
+    # Tier 0b — ORT TensorRT EP (same provider config as the application)
     t0b = t0
-    import onnxruntime as _ort3
-
-    if "TensorrtExecutionProvider" not in _ort3.get_available_providers():
-        print(
-            "  Tier 0b | TensorRT EP — skipped (TensorrtExecutionProvider not available)"
-        )
+    sess0b, err0b = _ort_trt_session(UNET_ONNX, "ref_ldm_unet_external_kv_ctx.onnx")
+    if sess0b is None:
+        print(f"  Tier 0b | ORT TensorRT EP — skipped ({err0b})")
     else:
-        ctx = ROOT / "tensorrt-engines" / "ref_ldm_unet_external_kv_ctx.onnx"
-        if not ctx.exists():
-            print(
-                f"  Tier 0b | TensorRT EP — skipped (no pre-built engine: {ctx.name})"
-            )
-        else:
-            import os as _os3
-
-            _prev_cwd = _os3.getcwd()
-            _os3.chdir(str(ROOT))
-            trt_opts = {
-                "trt_engine_cache_enable": True,
-                "trt_engine_cache_path": "tensorrt-engines",
-                "trt_timing_cache_enable": True,
-                "trt_timing_cache_path": "tensorrt-engines",
-                "trt_dump_ep_context_model": True,
-                "trt_ep_context_file_path": "tensorrt-engines",
-                "trt_layer_norm_fp32_fallback": True,
-                "trt_max_workspace_size": 8589934592,
-                "trt_builder_optimization_level": 5,
-            }
-            so = _ort3.SessionOptions()
-            so.graph_optimization_level = _ort3.GraphOptimizationLevel.ORT_ENABLE_ALL
-            sess0b = _ort3.InferenceSession(
-                UNET_ONNX,
-                so,
-                providers=[
-                    ("TensorrtExecutionProvider", trt_opts),
-                    ("CUDAExecutionProvider", {"device_id": "0"}),
-                    ("CPUExecutionProvider", {}),
-                ],
-            )
-            _os3.chdir(_prev_cwd)
-            t0b = _bench(lambda: sess0b.run([out_name], feeds))
-            _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
+        t0b = _bench(lambda: sess0b.run([out_name], feeds))
+        _print_row("0b", "ORT TensorRT EP FP32 (app default)", t0b, t0)
 
     # Tier 1  — PyTorch FP32
     from custom_kernels.ref_ldm.ref_ldm_torch import RefLDMUNetTorch
@@ -464,6 +571,29 @@ def bench_unet():
     )
     t4 = _bench(lambda: unet_cl_runner(x, ts, kv_map, use_exclusive=True))
     _print_row("4", "FP16 + Triton + CUDA graph + NHWC", t4, t0)
+
+    # Tier 5 — torch.compile + CUDA graph (Linux only)
+    if sys.platform == "win32":
+        print("  Tier 5 | torch.compile — skipped (not supported on Windows)")
+    else:
+        try:
+            unet_c5 = (
+                RefLDMUNetTorch.from_onnx(UNET_ONNX, compute_dtype=torch.float16)
+                .cuda()
+                .eval()
+            )
+            unet_c5 = torch.compile(unet_c5, mode="reduce-overhead", fullgraph=False)
+            unet_c5_runner = build_unet_cuda_graph_runner(
+                unet_c5,
+                x_shape=(1, 16, 64, 64),
+                ts_example=ts,
+                kv_map_template=kv_map,
+                use_exclusive=True,
+            )
+            t5 = _bench(lambda: unet_c5_runner(x, ts, kv_map, use_exclusive=True))
+            _print_row("5", "FP16 + Triton + CUDA graph + compile", t5, t0)
+        except Exception as e:
+            print(f"  Tier 5 | torch.compile — skipped ({type(e).__name__}: {e})")
 
     print()
     return t0, t0b

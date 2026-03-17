@@ -425,9 +425,7 @@ def build_cuda_graph_runner(
     torch.cuda.current_stream().wait_stream(warmup_stream)
 
     graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(
-        graph, stream=warmup_stream, capture_error_mode="thread_local"
-    ):
+    with torch.cuda.graph(graph, stream=warmup_stream, capture_error_mode="relaxed"):
         with torch.no_grad():
             static_out = model(static_in)  # (N, 98, 3)
 

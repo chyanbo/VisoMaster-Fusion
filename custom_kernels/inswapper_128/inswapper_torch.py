@@ -1200,7 +1200,7 @@ def build_cuda_graph_runner(
     torch.cuda.synchronize()
     with torch.no_grad():
         with torch.cuda.graph(
-            graph, stream=capture_stream, capture_error_mode="thread_local"
+            graph, stream=capture_stream, capture_error_mode="relaxed"
         ):
             static_out.append(model(static_target, static_source))
     torch.cuda.synchronize()

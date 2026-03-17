@@ -677,9 +677,22 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 # Triton warm-up
 # ---------------------------------------------------------------------------
 def warmup_triton():
-    """Trigger Triton JIT compilation for current GPU, populate triton_cache/."""
+    """Trigger Triton JIT compilation for current GPU, populate triton_cache/.
+
+    Runs in a subprocess to isolate native crashes (e.g. 0xC0000005 access
+    violation inside libtriton.pyd MLIR passes).  Python try/except cannot
+    catch native process crashes, so isolation is the only reliable guard.
+    """
     print("\n[build_kernels] Warming up Triton kernels for current GPU ...")
-    try:
+
+    import subprocess
+    import tempfile
+    import textwrap
+
+    worker_code = textwrap.dedent(r"""
+        import sys, os
+        sys.path.insert(0, sys.argv[1])  # project root
+
         import torch
         from custom_kernels.triton_ops import (
             TRITON_AVAILABLE,
@@ -692,11 +705,12 @@ def warmup_triton():
             triton_pixel_shift_extract,
             triton_pixel_shift_insert,
             triton_im2col_reflect,
+            _TRITON_CACHE,
         )
 
         if not TRITON_AVAILABLE:
-            print("  Triton not available — skipping warm-up.")
-            return
+            print("  Triton not available — skipping warm-up.", flush=True)
+            sys.exit(0)
 
         dev = "cuda"
         dtype = torch.float16
@@ -719,28 +733,22 @@ def warmup_triton():
         triton_fused_gfpgan_act(x, None, bias)
 
         # adain — InSwapper Adaptive Instance Normalization (B=1 and batched B>1)
-        # B=1 NCHW path (single-tile, standard mode)
         xa1 = torch.randn(1, 1024, 32, 32, dtype=dtype, device=dev)
         sa = torch.randn(1, 1024, 1, 1, dtype=dtype, device=dev)
         triton_adain(xa1, sa, sa)
-        # B=4 batched path (dim=2, 256px pixel-shift)
         xa4 = torch.randn(4, 1024, 32, 32, dtype=dtype, device=dev)
         triton_adain(xa4, sa, sa)
-        # B=9 batched path (dim=3, 384px pixel-shift)
         xa9 = torch.randn(9, 1024, 32, 32, dtype=dtype, device=dev)
         triton_adain(xa9, sa, sa)
-        # B=16 batched path (dim=4, 512px pixel-shift)
         xa16 = torch.randn(16, 1024, 32, 32, dtype=dtype, device=dev)
         triton_adain(xa16, sa, sa)
 
-        # im2col_reflect — fused reflection padding + im2col (GEMM mode style blocks)
-        # Warm up for B=1 and B=16 (the two extremes used in pixel-shift inference)
+        # im2col_reflect — fused reflection padding + im2col
         for B_im2col in [1, 4, 16]:
             x_im = torch.randn(B_im2col, 1024, 32, 32, dtype=dtype, device=dev)
             triton_im2col_reflect(x_im, k=3, pad=1)
 
-        # pixel_shift_extract / insert — InSwapper batched resolution tiles (float32)
-        # Warm up for all four resolution multipliers (dim = 1..4)
+        # pixel_shift_extract / insert — InSwapper batched resolution tiles
         for dim in [2, 3, 4]:
             H = dim * 128
             img_hwc = torch.randn(H, H, 3, dtype=torch.float32, device=dev)
@@ -748,7 +756,6 @@ def warmup_triton():
             triton_pixel_shift_insert(tiles, img_hwc, dim)
 
         # group_norm_silu — ReF-LDM VAE / UNet GroupNorm + optional SiLU
-        # Representative shapes: (1, 128, 32, 32) and (1, 256, 16, 16)
         for C, H in [(128, 32), (256, 16), (512, 8)]:
             xg = torch.randn(1, C, H, H, dtype=dtype, device=dev)
             wg = torch.randn(C, dtype=dtype, device=dev)
@@ -757,7 +764,6 @@ def warmup_triton():
             triton_group_norm_silu(xg, wg, bg, num_groups=32, fuse_silu=True)
 
         # rmsnormmax — XSeg per-channel RMS norm + affine + max-floor
-        # Warm up for all spatial sizes encountered in XSeg enc0–enc5 / dec stages
         for C, H in [(32, 256), (64, 128), (128, 64), (256, 32), (256, 16), (256, 8)]:
             xn = torch.randn(1, C, H, H, dtype=dtype, device=dev)
             gamma = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
@@ -765,12 +771,36 @@ def warmup_triton():
             maxval = torch.randn(1, C, 1, 1, dtype=dtype, device=dev)
             triton_rmsnormmax(xn, gamma, beta, maxval, eps=0.5)
 
-        from custom_kernels.triton_ops import _TRITON_CACHE
+        print("  Triton warm-up complete. Kernels cached in:", flush=True)
+        print(f"    {_TRITON_CACHE}", flush=True)
+    """).strip()
 
-        print("  Triton warm-up complete. Kernels cached in:")
-        print(f"    {_TRITON_CACHE}")
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".py", delete=False, encoding="utf-8"
+    ) as fw:
+        fw.write("# -*- coding: utf-8 -*-\n" + worker_code)
+        worker_path = fw.name
+
+    try:
+        result = subprocess.run(
+            [sys.executable, worker_path, str(ROOT)],
+            env=os.environ.copy(),
+            timeout=300,
+        )
+        if result.returncode != 0:
+            print(
+                f"  WARNING: Triton warm-up subprocess exited with code "
+                f"{result.returncode} (possible native crash in libtriton.pyd).\n"
+                "  Kernels will be JIT-compiled on first inference instead."
+            )
+        else:
+            pass  # success messages already printed by subprocess
+    except subprocess.TimeoutExpired:
+        print("  WARNING: Triton warm-up timed out — skipping.")
     except Exception as e:
-        print(f"  Triton warm-up failed: {e}")
+        print(f"  WARNING: Triton warm-up failed: {e}")
+    finally:
+        Path(worker_path).unlink(missing_ok=True)
 
 
 # ---------------------------------------------------------------------------

@@ -974,7 +974,12 @@ if TRITON_AVAILABLE:
         c = tl.program_id(0)
         base = c * HW
         sq_acc = tl.zeros([BLOCK], tl.float32)
-        for start in range(0, HW, BLOCK):
+        # Use tl.range (→ MLIR scf.for) instead of Python range().
+        # Python range() unrolls at JIT time: for HW=65536, BLOCK=1024 this
+        # generates 64 identical MLIR blocks (~640 ops) which crashes MLIR's
+        # type-registration pass (0xC0000005 in libtriton.pyd) on Windows.
+        # tl.range emits a single loop construct regardless of HW/BLOCK ratio.
+        for start in tl.range(0, HW, BLOCK):
             offs = start + tl.arange(0, BLOCK)
             mask = offs < HW
             v = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)
@@ -985,7 +990,7 @@ if TRITON_AVAILABLE:
         b = tl.load(beta_ptr + c).to(tl.float32)
         mv = tl.load(maxval_ptr + c).to(tl.float32)
 
-        for start in range(0, HW, BLOCK):
+        for start in tl.range(0, HW, BLOCK):
             offs = start + tl.arange(0, BLOCK)
             mask = offs < HW
             v = tl.load(x_ptr + base + offs, mask=mask, other=0.0).to(tl.float32)

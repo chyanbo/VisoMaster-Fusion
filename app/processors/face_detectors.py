@@ -51,7 +51,6 @@ class FaceDetectors:
         if self.current_detector_model:
             self.models_processor.unload_model(self.current_detector_model)
             self.current_detector_model = None
-
         # Release Custom-kernel instances so they rebuild on next use.
         with self._custom_init_lock:
             self._det10g_torch = None
@@ -75,6 +74,11 @@ class FaceDetectors:
         self._yolo_torch: Optional[object] = None  # YoloFace8nTorch
         self._yolo_runner: Optional[object] = None  # _CapturedGraph or YoloFace8nTorch
         self._custom_init_lock = threading.Lock()  # serialises Custom-kernel lazy inits
+        self._ort_model_lock = (
+            threading.Lock()
+        )  # serialises ONNX model switch (unload→load)
+        self._custom_inference_lock = threading.Lock()
+        self._runner_locks: Dict[int, threading.Lock] = {}
 
         # Tracking State
         self.tracker = None
@@ -83,8 +87,6 @@ class FaceDetectors:
         # BT-06/BT-07: dedicated lock for BYTETracker instance and frame_id to prevent
         # concurrent workers from corrupting Kalman filter state
         self._tracker_lock = threading.Lock()
-        self._custom_inference_lock = threading.Lock()
-        self._runner_locks: Dict[int, threading.Lock] = {}
         self.lambda_s = 0.3  # Smoothing factor for cumulative scores
 
         # This map links a detector name (from the UI) to its model file and processing function.
@@ -791,10 +793,14 @@ class FaceDetectors:
             return np.empty((0, 4)), np.empty((0, 5, 2)), np.empty((0, 5, 2))
 
         model_name = detector["model_name"]
-        if self.current_detector_model and self.current_detector_model != model_name:
-            self.models_processor.unload_model(self.current_detector_model)
-        self.current_detector_model = model_name
-
+        # FD-RACE-01: serialise model switch so concurrent workers don't interleave unload/load.
+        with self._ort_model_lock:
+            if (
+                self.current_detector_model
+                and self.current_detector_model != model_name
+            ):
+                self.models_processor.unload_model(self.current_detector_model)
+            self.current_detector_model = model_name
         ort_session = self.models_processor.load_model(model_name)
         if not ort_session:
             print(
@@ -1077,13 +1083,12 @@ class FaceDetectors:
                 runner = self._get_det10g_runner()
                 if runner is not None:
                     with torch.no_grad():
-                        # FD-LOCK-01: CUDA graphrunners with static buffers are not thread-safe.
-                        # Lock ensures only one FrameWorker thread uses the runner at a time.
                         with self._get_runner_lock(runner):
                             pt_outs = runner(aimg)
+                            if self.models_processor.device == "cuda":
+                                torch.cuda.current_stream().synchronize()
                     net_outs = [t.cpu().numpy() for t in pt_outs]
                 else:
-                    # Custom kernel unavailable — fall back to ORT
                     io_binding = ort_session.io_binding()
                     io_binding.bind_input(
                         name="input.1",
@@ -1110,7 +1115,6 @@ class FaceDetectors:
                     )
             else:
                 io_binding = ort_session.io_binding()
-
                 io_binding.bind_input(
                     name="input.1",
                     device_type=self.models_processor.device,
@@ -1131,7 +1135,6 @@ class FaceDetectors:
                     "500",
                 ]:
                     io_binding.bind_output(i, self.models_processor.device)
-
                 # Run the model with lazy build handling
                 net_outs = self._run_model_with_lazy_build_check(
                     model_name, ort_session, io_binding
@@ -1488,12 +1491,12 @@ class FaceDetectors:
                 runner = self._get_yolo_runner()
                 if runner is not None:
                     with torch.no_grad():
-                        # FD-LOCK-02: CUDA graphrunners with static buffers are not thread-safe.
-                        # Lock ensures only one FrameWorker thread uses the runner at a time.
                         with self._get_runner_lock(runner):
-                            net_outs = runner(aimg_prepared).cpu().numpy()
+                            _yolo_out = runner(aimg_prepared)
+                            if self.models_processor.device == "cuda":
+                                torch.cuda.current_stream().synchronize()
+                    net_outs = _yolo_out.cpu().numpy()
                 else:
-                    # Custom kernel unavailable — fall back to ORT
                     io_binding = ort_session.io_binding()
                     io_binding.bind_input(
                         name="images",
@@ -1518,7 +1521,6 @@ class FaceDetectors:
                     buffer_ptr=aimg_prepared.data_ptr(),  # Use data_ptr of prepared tensor
                 )
                 io_binding.bind_output("output0", self.models_processor.device)
-
                 # Run the model with lazy build handling
                 net_outs = self._run_model_with_lazy_build_check(
                     model_name, ort_session, io_binding

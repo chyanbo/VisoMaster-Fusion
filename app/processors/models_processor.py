@@ -238,11 +238,12 @@ class ModelsProcessor(QtCore.QObject):
         self.trt_build_locks: Dict[str, threading.Lock] = {}
         # A lock to protect the creation of new locks in the dictionary above.
         self.trt_build_lock_creation_lock = threading.Lock()
+
         # MP-CUDA-01: Global serialisation lock for CUDA graph capture.
-        # torch.cuda.graph() uses cudaStreamCaptureModeGlobal by default —
-        # only one capture may be in-flight on the entire GPU at any time.
-        # All _get_*_runner() lazy-builders MUST hold this lock while calling
-        # torch.cuda.graph() / build_cuda_graph_runner().
+        # Custom kernels use capture_error_mode="relaxed" so ops from other threads
+        # don't interfere, but we still serialise all captures so multiple concurrent
+        # captures don't compete for resources.  All _get_*_runner() lazy-builders
+        # MUST hold this lock while calling torch.cuda.graph() / build_cuda_graph_runner().
         self.cuda_graph_capture_lock = threading.Lock()
 
         # BUG-C01: Register Triton JIT build-dialog callbacks so that GFPGAN /
@@ -631,11 +632,6 @@ class ModelsProcessor(QtCore.QObject):
                 (p[0] if isinstance(p, tuple) else p) == "TensorrtExecutionProvider"
                 for p in self.providers
             )
-            # Under "Custom" provider the primary inference path is the PyTorch
-            # custom kernel; the ONNX session is only a fallback.  Skip the
-            # blocking TRT cache probe — the fallback can lazily use CUDA EP.
-            if self.provider_name == "Custom":
-                is_tensorrt_load = False
 
             if onnx_path.lower().endswith(".onnx"):
                 # Only run the isolated probe if TensorRT is the target provider
@@ -1078,43 +1074,19 @@ class ModelsProcessor(QtCore.QObject):
 
     def warm_up_custom_kernels(self):
         """Optional manual warm-up: pre-build CUDA graph runners for the
-        currently-active models to eliminate first-frame lag.
-
-        NOT called automatically on provider switch — Custom provider uses
-        lazy initialisation so that VRAM is only consumed by models the user
-        actually enables.  Each runner is built on first use and a build-
-        progress dialog is shown at that point (same behaviour as TensorRT
-        lazy engine builds).
-
-        This method can be called explicitly if a zero-lag first frame is
-        desired (e.g. from a "Pre-build kernels" UI button).  It is safe to
-        call on a background thread.  All builds are serialised internally by
-        cuda_graph_capture_lock, so concurrent CUDA graph capture is never
-        triggered even if this is called from a worker thread.
-
-        Only models whose ONNX files are present on disk are loaded;
-        missing models are skipped silently.
-        """
+        currently-active models to eliminate first-frame lag."""
         if self.provider_name != "Custom":
             return
 
         print("[CustomProvider] Pre-building CUDA graph runners for active models...")
-
-        # --- Face detectors ---
         self.face_detectors._get_det10g_runner()
         self.face_detectors._get_yolo_runner()
-
-        # --- Face masks ---
         self.face_masks._get_faceparser_runner()
         self.face_masks._get_xseg_runner()
         self.face_masks._get_occluder_runner()
         self.face_masks._get_vgg_combo_runner()
-
-        # --- Face swappers (ArcFace first, then InSwapper) ---
         self.face_swappers._get_w600k_runner()
         self.face_swappers._get_inswapper_runner_b1()
-
-        # --- Landmark detectors ---
         self.face_landmark_detectors._get_landmark203_runner()
         self.face_landmark_detectors._get_fan2dfan4_runner()
         self.face_landmark_detectors._get_landmark5_runner()
@@ -1123,18 +1095,15 @@ class ModelsProcessor(QtCore.QObject):
         self.face_landmark_detectors._get_peppapig98_runner()
         self.face_landmark_detectors._get_landmark478_runner()
         self.face_landmark_detectors._get_blendshapes_runner()
-
-        # --- Face restorers ---
-        # Heavy models (GPEN-1024/2048, RestoreFormer++, RefLDM) can consume
-        # 500 MB – 2 GB each.  They are intentionally excluded from this
-        # default warm-up to avoid wasting VRAM when the user has not enabled
-        # them.  They will still be lazily built (with a dialog) on first use.
         self.face_restorers._get_restoreformer_runner()
         self.face_restorers._get_ref_ldm_encoder_runner()
         self.face_restorers._get_ref_ldm_decoder_runner()
+        # UNet CUDA graph requires a kv_map_template (from a reference image) so
+        # the graph cannot be captured here.  Pre-load the model weights only so
+        # the first-frame weight-load latency is eliminated.
+        self.face_restorers._get_ref_ldm_unet_torch()
         for _gpen_size in (256, 512, 1024, 2048):
             self.face_restorers._get_gpen_runner(_gpen_size)
-
         print("[CustomProvider] Pre-build complete.")
 
     def switch_providers_priority(self, provider_name):
@@ -1152,12 +1121,11 @@ class ModelsProcessor(QtCore.QObject):
         # Release existing Custom-kernel CUDA graph runners and ORT sessions
         # whenever the provider is changed so that GPU memory from the old
         # provider is freed before new sessions / runners are allocated.
-        # Runners are lazily rebuilt on next use (or via warm_up_custom_kernels).
         self.face_detectors.unload_models()
         self.face_masks.unload_models()
         self.face_swappers.unload_models()
         self.face_landmark_detectors.unload_models()
-        self.face_restorers.unload_models()  # BUG-R03 fix: free GPEN/RestoreFormer/RefLDM runners
+        self.face_restorers.unload_models()
 
         match provider_name:
             case "TensorRT" | "TensorRT-Engine":
@@ -1180,10 +1148,12 @@ class ModelsProcessor(QtCore.QObject):
                     provider_name = "TensorRT"
 
             case "Custom":
-                # Custom provider: ONNX models use TensorRT EP when available,
-                # falling back to CUDA EP otherwise.  Models that have a dedicated
-                # custom CUDA kernel (e.g. Inswapper128) bypass ONNX Runtime
-                # entirely and run through their PyTorch implementation instead.
+                # Custom provider: primary inference uses PyTorch custom CUDA
+                # kernels (bypassing ONNX Runtime).  For any model that falls
+                # back to an ONNX session (e.g. runner build failure), TRT EP
+                # is used when available — fastest after the custom kernels.
+                # The normal TRT probe / engine-build dialog runs for these
+                # fallback sessions exactly as it does for the TensorRT provider.
                 if TENSORRT_AVAILABLE and trt is not None:
                     providers = [
                         ("TensorrtExecutionProvider", self.trt_ep_options),
@@ -1191,10 +1161,6 @@ class ModelsProcessor(QtCore.QObject):
                         ("CPUExecutionProvider"),
                     ]
                 else:
-                    print(
-                        "[INFO] Custom provider: TensorRT not available, "
-                        "using CUDA EP for ONNX models."
-                    )
                     providers = [
                         ("CUDAExecutionProvider"),
                         ("CPUExecutionProvider"),
@@ -1400,10 +1366,8 @@ class ModelsProcessor(QtCore.QObject):
     def ensure_denoiser_models_loaded(self):
         """Loads the UNet and VAE models if they are not already loaded."""
         with self.model_lock:
-            # Custom provider uses PyTorch kernel runners (loaded by
-            # warm_up_custom_provider_runners / lazy on first use).
-            # Loading the ONNX sessions too would waste ~300–500 MB of VRAM
-            # for models that are never accessed via ORT in Custom mode.
+            # Custom provider uses PyTorch kernel runners for RefLDM (loaded lazily
+            # on first use). Loading the ONNX sessions too would waste VRAM.
             if self.provider_name == "Custom":
                 return
 
@@ -2035,13 +1999,19 @@ class ModelsProcessor(QtCore.QObject):
             )
 
         with self.model_lock:
-            self.ensure_denoiser_models_loaded()
-            unet_session = self.models.get(unet_model_name)
-            vae_enc_session = self.models.get(vae_encoder_name)
-            vae_dec_session = self.models.get(vae_decoder_name)
+            if self.provider_name == "Custom":
+                # Custom provider uses PyTorch runners loaded lazily inside
+                # run_vae_encoder / run_vae_decoder / run_ref_ldm_unet.
+                # There are no ORT sessions to check — proceed directly.
+                pass
+            else:
+                self.ensure_denoiser_models_loaded()
+                unet_session = self.models.get(unet_model_name)
+                vae_enc_session = self.models.get(vae_encoder_name)
+                vae_dec_session = self.models.get(vae_decoder_name)
 
-            if not (unet_session and vae_enc_session and vae_dec_session):
-                return image_cxhxw_uint8
+                if not (unet_session and vae_enc_session and vae_dec_session):
+                    return image_cxhxw_uint8
 
         kv_tensor_map_for_this_run: Dict[str, Dict[str, torch.Tensor]] | None = None
         if reference_kv_map:
@@ -2388,22 +2358,9 @@ class ModelsProcessor(QtCore.QObject):
             image_after_postproc_float_0_1, 0.0, 1.0
         )
 
-        # --- IMPROVEMENT A: Pixel Sharpening (Unsharp Mask) ---
-        if ENABLE_PIXEL_SHARPENING:
-            # OPTIMIZED: Functional gaussian blur avoids class instantiation
-            blurred = v2.functional.gaussian_blur(
-                image_after_postproc_float_0_1.unsqueeze(0), [5, 5], [1.0, 1.0]
-            ).squeeze(0)
-            detail = image_after_postproc_float_0_1 - blurred
-            image_after_postproc_float_0_1 = (
-                image_after_postproc_float_0_1 + detail * PIXEL_SHARPEN_STRENGTH
-            )
-            image_after_postproc_float_0_1 = image_after_postproc_float_0_1.clamp(
-                0.0, 1.0
-            )
-        # --- END IMPROVEMENT A ---
-
         # --- IMPROVEMENT B: Color Matching (DFL Orig - LAB Reinhard) ---
+        # Applied before sharpening so that histogram normalisation does not
+        # undo the local-contrast enhancement added by the unsharp mask.
         if ENABLE_COLOR_MATCH:
             # DFL_Orig expects inputs in [0..255] range.
             # Ref is already uint8 [0..255] (but tensor)
@@ -2431,6 +2388,23 @@ class ModelsProcessor(QtCore.QObject):
             except Exception as e:
                 print(f"[WARN] Color matching failed: {e}")
         # --- END IMPROVEMENT B ---
+
+        # --- IMPROVEMENT A: Pixel Sharpening (Unsharp Mask) ---
+        # Applied after colour matching so the histogram normalisation does not
+        # cancel out the local edge-contrast boost from the unsharp mask.
+        if ENABLE_PIXEL_SHARPENING:
+            # OPTIMIZED: Functional gaussian blur avoids class instantiation
+            blurred = v2.functional.gaussian_blur(
+                image_after_postproc_float_0_1.unsqueeze(0), [5, 5], [1.0, 1.0]
+            ).squeeze(0)
+            detail = image_after_postproc_float_0_1 - blurred
+            image_after_postproc_float_0_1 = (
+                image_after_postproc_float_0_1 + detail * PIXEL_SHARPEN_STRENGTH
+            )
+            image_after_postproc_float_0_1 = image_after_postproc_float_0_1.clamp(
+                0.0, 1.0
+            )
+        # --- END IMPROVEMENT A ---
 
         final_image_uint8 = (image_after_postproc_float_0_1 * 255.0).byte()
 

@@ -314,7 +314,7 @@ class _CapturedGraph:
         with (
             torch.no_grad(),
             torch.cuda.graph(
-                self._graph, stream=self._stream, capture_error_mode="thread_local"
+                self._graph, stream=self._stream, capture_error_mode="relaxed"
             ),
         ):
             self._out = model(self._inp)

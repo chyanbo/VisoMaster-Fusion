@@ -31,9 +31,13 @@ class Equirectangular:
         if img_tensor_cxhxw_rgb_uint8.ndim != 3:
             raise ValueError("Input tensor must be 3-dimensional (C, H, W).")
 
-        self._img_tensor_cxhxw_rgb_float = img_tensor_cxhxw_rgb_uint8.float() / 255.0 # Normalize to [0,1]
+        # VR-MEM-01: store uint8 (1/4 the size of float32) and convert on-the-fly in
+        # GetPerspective.  With 6-8 FrameWorkers, storing a full-frame float32 tensor
+        # persistently per worker consumed 216 MiB × N workers, causing CUDA OOM when
+        # combined with CUDA-graph private pools (Custom provider).
+        self._img_tensor_cxhxw_rgb_uint8 = img_tensor_cxhxw_rgb_uint8
         self.device = img_tensor_cxhxw_rgb_uint8.device
-        self._channels, self._height, self._width = self._img_tensor_cxhxw_rgb_float.shape
+        self._channels, self._height, self._width = self._img_tensor_cxhxw_rgb_uint8.shape
 
     def GetPerspective(self, FOV: float, THETA: float, PHI: float, height: int, width: int) -> torch.Tensor:
         #
@@ -123,11 +127,19 @@ class Equirectangular:
         grid_y = (lat_px / (equ_h - 1)) * 2.0 - 1.0
         grid = torch.stack((grid_x, grid_y), dim=2).unsqueeze(0) # 1, H_out, W_out, 2
 
+        # VR-MEM-01: convert uint8→float32 here (not persistent) so it is freed immediately
+        # after grid_sample.  The old code stored this tensor as a class attribute, which
+        # kept 216 MiB per FrameWorker alive permanently; removing that is the main fix.
+        # Using float32 (not float16) ensures compatibility with all ORT providers
+        # (CUDA, TensorRT, CPU) and avoids grid_sample dtype constraints.
+        img_float = self._img_tensor_cxhxw_rgb_uint8.float() * (1.0 / 255.0)
+
         # Sample from the equirectangular image.
         # padding_mode='border' replicates edge pixels for any residual out-of-bound coords
         # after the fmod/clamp above, avoiding the black-pixel artefacts that 'zeros' caused.
-        persp_float = F.grid_sample(self._img_tensor_cxhxw_rgb_float.unsqueeze(0), grid,
+        persp_float = F.grid_sample(img_float.unsqueeze(0), grid,
                                     mode='bilinear', padding_mode='border', align_corners=True)
+        del img_float
 
         # Use round_() before byte() for nearest-integer rounding (matches P2E convention).
         # Plain .byte() truncates toward zero, causing a systematic -0.5 LSB bias on

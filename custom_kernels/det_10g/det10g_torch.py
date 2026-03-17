@@ -426,12 +426,12 @@ class _CapturedGraph:
 
         self._inp = static_inp
         self._graph = torch.cuda.CUDAGraph()
-        stream = torch.cuda.Stream()
+        self._stream = torch.cuda.Stream()
         torch.cuda.synchronize()
         with (
             torch.no_grad(),
             torch.cuda.graph(
-                self._graph, stream=stream, capture_error_mode="thread_local"
+                self._graph, stream=self._stream, capture_error_mode="relaxed"
             ),
         ):
             self._outs = model(self._inp)

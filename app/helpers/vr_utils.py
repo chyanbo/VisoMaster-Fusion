@@ -214,12 +214,38 @@ class PerspectiveConverter:
         # sqrt(sum) (old approach) underestimates for sparse/irregular masks because it
         # conflates pixel count with geometric extent.  Using nonzero() indices of the
         # 2D mask gives the actual pixel span in the equirectangular image.
-        _mask_2d = eye_specific_mask_torch_original_shape.squeeze(0)  # H, W
-        _nonzero = _mask_2d.nonzero(as_tuple=False)  # N×2
-        if _nonzero.shape[0] > 0:
-            _y_span = int(_nonzero[:, 0].max() - _nonzero[:, 0].min()) + 1
-            _x_span = int(_nonzero[:, 1].max() - _nonzero[:, 1].min()) + 1
-            _mask_region_side = max(_y_span, _x_span)
+        _mask_2d = eye_specific_mask_torch_original_shape.squeeze(0)  # H, W bool
+
+        # VR-PERF-10: avoid nonzero() on the full H×W mask — it forces a CUDA stream
+        # sync to determine the variable output size before allocation, causing cascading
+        # GPU pipeline stalls when 8 workers run concurrently on the default stream.
+        # With 4 faces × 8 workers = 32 such calls per frame batch, the pipeline stalls
+        # for tens of seconds waiting for each other's large GetEquirec GPU ops.
+        #
+        # Fix: project to 1D row/col indicators (cheap fixed-size ops), then use argmax
+        # to find first/last True index without variable-size allocation.  All arithmetic
+        # stays on GPU; a single .cpu() call at the end does ONE stream sync to transfer
+        # both "any mask pixels" and "span value" together.
+        _row_has = _mask_2d.any(dim=1)  # (H,) bool — no sync, fixed output size
+        _col_has = _mask_2d.any(dim=0)  # (W,) bool — no sync, fixed output size
+        _any_gpu = _row_has.any()  # 0-dim bool GPU tensor — no sync
+
+        _row_f = _row_has.float()
+        _col_f = _col_has.float()
+        _h = _row_f.shape[0]  # Python int
+        _w = _col_f.shape[0]  # Python int
+
+        # span = last_true_idx - first_true_idx + 1
+        #      = (_h - 1 - argmax(flipped)) - argmax + 1
+        #      = _h - argmax(flipped) - argmax(forward)
+        _y_span = _h - _row_f.flip(0).argmax() - _row_f.argmax()
+        _x_span = _w - _col_f.flip(0).argmax() - _col_f.argmax()
+        _mask_span_gpu = torch.maximum(_y_span, _x_span)
+
+        # Single D2H transfer — ONE stream sync for both the emptiness check and span value.
+        _res = torch.stack([_any_gpu.float(), _mask_span_gpu.float()]).cpu()
+        if bool(_res[0] > 0):
+            _mask_region_side = int(_res[1])
         else:
             _mask_region_side = 0
         # Dynamic feather: proportional to face size, clamped to [4, 20]
@@ -239,9 +265,13 @@ class PerspectiveConverter:
             erosion_kernel_size=_erosion_k,
         )
 
-        # VR-14: if the feathered mask is empty after erosion, skip blending entirely
-        if feathered_mask_torch_float_1hw.max() < 1e-4:
-            return
+        # VR-PERF-10b: removed the `feathered_mask.max() < 1e-4` guard (VR-14).
+        # That check called `.max()` on a (1, H, W) GPU tensor inside an `if`, which
+        # forced an implicit .item() → CUDA stream sync (waits for ALL workers' pending
+        # GPU ops on the default stream).  With 8 workers × 4 stitch calls per frame,
+        # 32 such syncs per frame-batch were causing cascading stalls.
+        # Safety: blending with a zero mask is a no-op — `target += (component - target) * 0`
+        # leaves the target unchanged, so removing the guard is correct.
 
         # Memory-efficient blending
         # uses in-place operations to reduce peak memory usage.

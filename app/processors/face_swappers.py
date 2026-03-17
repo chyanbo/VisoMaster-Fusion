@@ -19,16 +19,13 @@ class FaceSwappers:
         self.current_arcface_model = None
         self._session_io_name_cache: dict = {}  # FS-PERF-02: cache input/output names keyed by session id
         self._io_cache_lock = threading.Lock()
-        self._inswapper_init_lock = (
-            threading.Lock()
-        )  # serialises lazy-init + CUDA graph capture
+        self._inswapper_init_lock = threading.Lock()
         self._w600k_lock = threading.Lock()
         self._inswapper_b1_lock = threading.Lock()
-        self._inswapper_torch = (
-            None  # InSwapperTorch instance (PyTorch-native inference)
-        )
+        self._inswapper_batched_lock = threading.Lock()
+        self._inswapper_torch = None  # InSwapperTorch instance
         self._inswapper_runner_b1: Optional[object] = None  # CUDA graph runner for B=1
-        self._w600k_torch: Optional[object] = None  # IResNet50Torch (Custom provider)
+        self._w600k_torch: Optional[object] = None  # IResNet50Torch
         self._w600k_runner: Optional[object] = None  # _CapturedGraph or eager model
         self.resize_112 = v2.Resize(
             (112, 112), interpolation=v2.InterpolationMode.BILINEAR, antialias=False
@@ -58,8 +55,6 @@ class FaceSwappers:
                 self.models_processor.unload_model(model_name)
             for model_name in self.arcface_models:
                 self.models_processor.unload_model(model_name)
-        # Clear PyTorch objects under _inswapper_init_lock so that any thread
-        # currently holding the init lock finishes before we wipe the references.
         with self._inswapper_init_lock:
             self._inswapper_torch = None
             self._inswapper_runner_b1 = None
@@ -129,11 +124,7 @@ class FaceSwappers:
                 self.models_processor.hide_build_dialog.emit()
 
     def _get_w600k_runner(self):
-        """Lazy-load IResNet50Torch + CUDA graph runner for Inswapper128ArcFace.
-
-        Uses double-checked locking via _inswapper_init_lock to prevent
-        concurrent CUDA graph captures from multiple FrameWorker threads.
-        """
+        """Lazy-load IResNet50Torch + CUDA graph runner for Inswapper128ArcFace."""
         if self._w600k_runner is not None:
             return self._w600k_runner
         self.models_processor.show_build_dialog.emit(
@@ -324,14 +315,11 @@ class FaceSwappers:
             runner = self._get_w600k_runner()
             if runner is not None:
                 with torch.no_grad():
-                    # FS-LOCK-01: CUDA graphrunners with static buffers are not thread-safe.
-                    # Lock ensures only one FrameWorker thread uses the runner at a time.
-                    # BUG-C06 fix: .cpu() transfer must be inside the lock — the static output
-                    # buffer must not be read after releasing the lock (another thread could
-                    # begin a new replay immediately, overwriting the static buffer).
                     with self._w600k_lock:
                         embedding = runner(img)
-                        embedding_np = embedding.cpu().numpy().flatten()
+                        if self.models_processor.device == "cuda":
+                            torch.cuda.current_stream().synchronize()
+                    embedding_np = embedding.cpu().numpy().flatten()
                 return embedding_np, cropped_image
             # runner unavailable — fall through to ORT
 
@@ -544,14 +532,7 @@ class FaceSwappers:
         )
 
     def _get_inswapper_torch(self):
-        """Lazily load InSwapperTorch in GEMM/cuBLASLt mode (Custom provider).
-
-        Uses double-checked locking so only one thread ever builds the model,
-        and concurrent threads wait rather than starting a second build.
-        NOTE: must NOT be called while _inswapper_init_lock is already held by
-        the same thread (would deadlock); _get_inswapper_runner_b1 calls this
-        from within the lock and relies on the inner check being sufficient.
-        """
+        """Lazily load InSwapperTorch in GEMM/cuBLASLt mode (Custom provider)."""
         if self._inswapper_torch is not None:
             return self._inswapper_torch
         with self._inswapper_init_lock:
@@ -561,10 +542,8 @@ class FaceSwappers:
                 onnx_path = self.models_processor.models_path["Inswapper128"]
                 print("[InSwapperTorch] Loading model...")
                 m = InSwapperTorch(onnx_path).cuda().eval()
-                # Enable Tier-8 GEMM mode (im2col + cuBLAS + Triton fused im2col)
                 m.to_gemm_mode()
                 print("[InSwapperTorch] GEMM mode enabled.")
-                # Attempt Phase 3 cuBLASLt upgrade (fused BIAS epilogue)
                 try:
                     m.to_cublaslt_mode()
                     print("[InSwapperTorch] cuBLASLt mode enabled.")
@@ -576,13 +555,7 @@ class FaceSwappers:
         return self._inswapper_torch
 
     def _get_inswapper_runner_b1(self):
-        """Lazily build a CUDA graph runner for B=1 single-tile inference.
-
-        Uses double-checked locking.  The CUDA graph capture window uses
-        cudaStreamCaptureModeGlobal, which forbids concurrent GPU work on any
-        stream.  Holding _inswapper_init_lock for the entire capture ensures
-        no second thread enters build_cuda_graph_runner simultaneously.
-        """
+        """Lazily build a CUDA graph runner for B=1 single-tile inference."""
         if self._inswapper_runner_b1 is not None:
             return self._inswapper_runner_b1
         self.models_processor.show_build_dialog.emit(
@@ -597,8 +570,6 @@ class FaceSwappers:
                     build_cuda_graph_runner,
                 )
 
-                # _get_inswapper_torch re-checks under the same lock (already held here),
-                # so call the inner build directly to avoid re-acquiring the lock.
                 if self._inswapper_torch is None:
                     from custom_kernels.inswapper_128.inswapper_torch import (
                         InSwapperTorch,
@@ -652,18 +623,16 @@ class FaceSwappers:
 
         # ---- Custom provider: PyTorch-native inference with CUDA graph runner ----
         if self.models_processor.provider_name == "Custom":
-            # Side-effect: extracts emap for calc_inswapper_latent (handled by _ensure_emap)
-            # Only load if we haven't already extracted emap.
             if not self._ensure_emap():
                 self._load_swapper_model(model_name)
 
             runner = self._get_inswapper_runner_b1()
             with torch.no_grad():
-                # FS-LOCK-02: CUDA graphrunners with static buffers are not thread-safe.
-                # Lock ensures only one FrameWorker thread uses the runner at a time.
                 with self._inswapper_b1_lock:
                     result = runner(image, embedding)  # [1, 3, 128, 128] float32
-            output.copy_(result)
+                    output.copy_(result)
+                    if self.models_processor.device == "cuda":
+                        torch.cuda.current_stream().synchronize()
             return
 
         # ---- All other providers: ORT-based inference ----
@@ -718,31 +687,13 @@ class FaceSwappers:
     def run_inswapper_batched(
         self, images: torch.Tensor, embedding: torch.Tensor, output: torch.Tensor
     ) -> None:
-        """Batched Custom-provider InSwapper inference for pixel-shift resolution mode.
-
-        Runs a single forward pass over all dim×dim tiles simultaneously, reducing
-        model launches from dim*dim sequential calls to 1 batched call.
-
-        Only supported for the Custom provider; callers must check
-        ``models_processor.provider_name == "Custom"`` before calling.
-
-        Args:
-            images:    Float32 CUDA tensor [B, 3, 128, 128] — all pixel-shift tiles
-                       stacked along the batch dimension.
-            embedding: Float32 CUDA tensor [1, 512] — shared ArcFace latent; the
-                       same source is used for all B tiles (broadcast internally).
-            output:    Pre-allocated float32 CUDA tensor [B, 3, 128, 128] — result
-                       is written here via copy_ so the caller keeps its pointer.
-        """
+        """Batched Custom-provider InSwapper inference for pixel-shift resolution mode."""
         model_name = "Inswapper128"
-        # Side-effect: extracts emap for calc_inswapper_latent (handled by _ensure_emap)
         if not self._ensure_emap():
             self._load_swapper_model(model_name)
 
         torch_model = self._get_inswapper_torch()
         with torch.no_grad():
-            # Batched Custom inference is now thread-safe due to per-call workspace
-            # allocation in the cuBLASLt Phase 3 extension.
             result = torch_model(images, embedding)  # [B, 3, 128, 128] float32
         output.copy_(result)
 

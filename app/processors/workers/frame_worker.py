@@ -197,6 +197,9 @@ class FrameWorker(threading.Thread):
 
         # Dirty-check cache for set_scaling_transforms (FW-PERF-07)
         self._last_scaling_control: dict | None = None
+        # Separate dirty-check for VR path — keys differ from standard path
+        # so they must not share the same variable or they constantly invalidate each other.
+        self._last_vr_scaling_control: dict | None = None
 
         # Q-QUAL-01: EMA-smoothed keypoints to reduce detection-interval flicker
         self._smoothed_kps: dict[int, np.ndarray] = {}
@@ -211,9 +214,9 @@ class FrameWorker(threading.Thread):
         self._mouth_action_score: float = 0.0
 
         # Precalculater bboxes and kps from the video_processor in chronological order
-        self.precomputed_bboxes = None
-        self.precomputed_kpss_5 = None
-        self.precomputed_kpss = None
+        self.precomputed_bboxes: Optional[list] = None
+        self.precomputed_kpss_5: Optional[list] = None
+        self.precomputed_kpss: Optional[list] = None
 
         # --- OPTIMIZATION: Cached Convolution Kernels (VRAM) ---
         # Pre-allocating mathematical filters prevents massive CPU-to-GPU
@@ -1027,6 +1030,7 @@ class FrameWorker(threading.Thread):
         eq_h: int,
         eq_w: int,
         crop_size: int,
+        stop_event: threading.Event | None = None,
     ) -> list:
         """Detect faces in a grid of undistorted perspective crops.
 
@@ -1074,6 +1078,8 @@ class FrameWorker(threading.Thread):
         found: list = []
 
         for theta, phi in TILE_GRID:
+            if stop_event is not None and stop_event.is_set():
+                break
             tile_crop = equirect_converter.get_perspective_crop(
                 tile_fov, theta, phi, crop_size, crop_size
             )
@@ -1149,15 +1155,9 @@ class FrameWorker(threading.Thread):
             )
             self._vr_frame_size = _cur_frame_size
         else:
-            # Reuse the cached converter but refresh the image tensor for this frame
-            _new_tensor = (
-                torch.from_numpy(img_numpy_rgb_uint8)
-                .permute(2, 0, 1)
-                .to(self.models_processor.device)
-            )
-            self._vr_converter.equirect_tensor_cxhxw_rgb_uint8 = _new_tensor
-            self._vr_converter.e2p_instance._img_tensor_cxhxw_rgb_float = (
-                _new_tensor.float() / 255.0
+            # VR-MEM-01: update in-place to avoid new GPU allocation per frame.
+            self._vr_converter.equirect_tensor_cxhxw_rgb_uint8.copy_(
+                torch.from_numpy(img_numpy_rgb_uint8).permute(2, 0, 1)
             )
         equirect_converter = self._vr_converter
         assert equirect_converter is not None, (
@@ -1192,9 +1192,9 @@ class FrameWorker(threading.Thread):
         _vr_scaling_keys["VR180CropResolutionSelection"] = (
             self.VR_PERSPECTIVE_RENDER_SIZE
         )
-        if self._last_scaling_control != _vr_scaling_keys:
+        if self._last_vr_scaling_control != _vr_scaling_keys:
             self.set_scaling_transforms(control)
-            self._last_scaling_control = _vr_scaling_keys
+            self._last_vr_scaling_control = _vr_scaling_keys
 
         # Detection interval / previous-detections setup (mirrors standard-mode logic).
         _vr_detection_interval = int(control.get("FaceDetectionIntervalSlider", 1))
@@ -1323,13 +1323,22 @@ class FrameWorker(threading.Thread):
             _vr_detection_interval <= 1
             or self.frame_number % _vr_detection_interval == 0
         )
-        if control.get("VR180TileDetectionToggle", True) and _is_detection_keyframe:
+        # Custom provider serializes all CUDA graph runs through per-runner locks.
+        # 24 tiles × serial execution = unacceptable latency for VR recording.
+        # Skip tile detection for Custom provider entirely.
+        _skip_tile_det = self.models_processor.provider_name == "Custom"
+        if (
+            control.get("VR180TileDetectionToggle", True)
+            and _is_detection_keyframe
+            and not _skip_tile_det
+        ):
             _tile_bboxes = self._detect_faces_vr_tiled(
                 equirect_converter,
                 control,
                 _eq_h,
                 _eq_w,
                 self.VR_PERSPECTIVE_RENDER_SIZE,
+                stop_event=stop_event,
             )
             if _tile_bboxes:
                 _tile_arr = np.array(_tile_bboxes, dtype=np.float32)
@@ -1953,7 +1962,7 @@ class FrameWorker(threading.Thread):
             img = self._resize_cache[_up_key](img)
             scale_applied = True
             # Upscale Feeder KPS if necessary
-            if getattr(self, "precomputed_bboxes", None) is not None:
+            if self.precomputed_bboxes is not None:
                 ratio_w = new_w / img_w
                 ratio_h = new_h / img_h
 
@@ -1964,7 +1973,7 @@ class FrameWorker(threading.Thread):
                     b[1] *= ratio_h
                     b[3] *= ratio_h
 
-                if getattr(self, "precomputed_kpss_5", None) is not None:
+                if self.precomputed_kpss_5 is not None:
                     self.precomputed_kpss_5 = [
                         k.copy() for k in self.precomputed_kpss_5
                     ]
@@ -1972,7 +1981,7 @@ class FrameWorker(threading.Thread):
                         k[:, 0] *= ratio_w
                         k[:, 1] *= ratio_h
 
-                if getattr(self, "precomputed_kpss", None) is not None:
+                if self.precomputed_kpss is not None:
                     self.precomputed_kpss = [
                         k.copy() if k is not None else None
                         for k in self.precomputed_kpss
@@ -1995,10 +2004,7 @@ class FrameWorker(threading.Thread):
         # The workers are now "Stateless Render Engines". They no longer track time or state.
         # They consume perfectly sequenced and EMA-smoothed detections from the Feeder thread.
 
-        if (
-            getattr(self, "precomputed_bboxes", None) is not None
-            and getattr(self, "precomputed_kpss_5", None) is not None
-        ):
+        if self.precomputed_bboxes is not None and self.precomputed_kpss_5 is not None:
             # 1. Primary Path (Video/Webcam): Use the sequentially precomputed detections
             bboxes = self.precomputed_bboxes
             kpss_5 = self.precomputed_kpss_5
@@ -2044,7 +2050,7 @@ class FrameWorker(threading.Thread):
             for i in range(len(kpss_5)):
                 if not self._is_kps_valid(kpss_5[i], img_h_for_kps, img_w_for_kps):
                     continue
-                _bbox_i = bboxes[i]  # type: ignore[index]
+                _bbox_i = bboxes[i]
                 if (
                     min(_bbox_i[2] - _bbox_i[0], _bbox_i[3] - _bbox_i[1])
                     < self._MIN_FACE_PIXELS
@@ -2063,7 +2069,7 @@ class FrameWorker(threading.Thread):
                         "kps_5": kpss_5[i],
                         "kps_all": kps_all_i,
                         "embedding": face_emb,
-                        "bbox": bboxes[i],  # type: ignore[index]
+                        "bbox": bboxes[i],
                         "original_face": None,
                         "swap_mask": None,
                         "matched_target": None,  # FW-BUG-09: cache slot
@@ -3074,9 +3080,7 @@ class FrameWorker(threading.Thread):
         use_mode_2 = parameters.get("StrengthMode2EnableToggle", False)
 
         if swapper_model == "Inswapper128":
-            # Batched pixel-shift path: for Custom provider with dim>1, stack all
-            # dim×dim independent tiles into a single [B,3,128,128] batch and run
-            # one forward pass instead of dim*dim sequential calls.
+            # Batched path: for Custom provider with dim>1, run all tiles in one forward pass
             _use_batched = self.models_processor.provider_name == "Custom" and dim > 1
 
             for k in range(itex):
@@ -3086,7 +3090,6 @@ class FrameWorker(threading.Thread):
 
                 if _use_batched:
                     # ------ BATCHED PATH (Custom provider, dim > 1) ------
-                    # Stack all tiles into [B, 3, 128, 128] with one GPU kernel.
                     tiles_list = []
                     tile_coords = []
                     for j in range(dim):
@@ -3107,8 +3110,8 @@ class FrameWorker(threading.Thread):
                     if self.models_processor.device == "cuda":
                         torch.cuda.current_stream().synchronize()
 
-                    # Fallback: replace any near-zero output tile with the input tile
-                    tile_sums = batch_output.abs().sum(dim=(1, 2, 3))  # [B]
+                    # Replace any near-zero output tile with the input tile
+                    tile_sums = batch_output.abs().sum(dim=(1, 2, 3))
                     zero_mask = tile_sums < 1.0
                     if zero_mask.any():
                         batch_output[zero_mask] = batch_input[zero_mask]
@@ -4988,10 +4991,6 @@ class FrameWorker(threading.Thread):
                 slot_id=2,
             )
 
-        # Third denoiser pass - After restorers
-        if control.get("DenoiserAfterRestorersToggle", False):
-            swap = self._apply_denoiser_pass(swap, control, "After", kv_map)
-
         # --- MOUTH ENHANCEMENT & ALIGNMENT (POST-RESTORER) ---
         if parameters.get("MouthParserStretchAfterToggle", False):
             mouth_overlay_pkg = None
@@ -5071,6 +5070,12 @@ class FrameWorker(threading.Thread):
                     mask_autocolor,
                     parameters["EndingColorBlendAmountSlider"],
                 )
+
+        # Third denoiser pass - After all restorations, colour corrections and
+        # ending colour transfer.  Placed last so no subsequent colour operation
+        # can undo the denoiser's normalisation and cause a visible colour shift.
+        if control.get("DenoiserAfterRestorersToggle", False):
+            swap = self._apply_denoiser_pass(swap, control, "After", kv_map)
 
         # Final blending
         if (

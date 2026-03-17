@@ -529,7 +529,7 @@ class FaceLandmark478CUDAGraphRunner:
         torch.cuda.synchronize()
         with torch.no_grad():
             with torch.cuda.graph(
-                self._graph, stream=self._stream, capture_error_mode="thread_local"
+                self._graph, stream=self._stream, capture_error_mode="relaxed"
             ):
                 self._out = model(self._x_buf)  # (lmk, vis, score)
         torch.cuda.synchronize()

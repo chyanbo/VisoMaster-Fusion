@@ -55,14 +55,16 @@ def test_independent_instances_share_defaults_safely(defaults):
     assert pd2_fresh["alpha"] == defaults["alpha"]
 
 
-# PD-06: .get(key, fallback) — UserDict.get() checks self.data directly, not __getitem__
-# Keys not present in self.data return the fallback, even if a ParametersDict default exists.
-# Use direct key access (pd[key]) to trigger the ParametersDict default mechanism.
+# PD-06: .get(key, fallback) — UserDict.get() (via MutableMapping) calls __getitem__,
+# so if a key is absent from self.data but present in _default_parameters the
+# _default_parameters value is returned — the explicit fallback is ignored.
+# Only keys absent from BOTH self.data and _default_parameters return the explicit fallback.
 def test_get_with_explicit_fallback(defaults):
     pd = ParametersDict({}, defaults)
-    # Key absent from data → fallback (UserDict.get does not call __getitem__)
+    # Key absent from data AND from defaults → explicit fallback returned
     assert pd.get("nonexistent", "fallback") == "fallback"
-    assert pd.get("alpha", "fallback") == "fallback"  # not in data → fallback
+    # Key absent from data BUT present in defaults → __getitem__ returns the default value
+    assert pd.get("alpha", "fallback") == defaults["alpha"]
 
 
 def test_getitem_returns_default_not_get(defaults):

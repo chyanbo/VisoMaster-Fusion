@@ -525,7 +525,7 @@ class Res50CUDAGraphRunner:
         with (
             torch.no_grad(),
             torch.cuda.graph(
-                self._graph, stream=self._stream, capture_error_mode="thread_local"
+                self._graph, stream=self._stream, capture_error_mode="relaxed"
             ),
         ):
             self._out_conf, self._out_ldmk = model(self._inp)

@@ -974,7 +974,7 @@ class CUDAGraphRunner:
             with torch.cuda.graph(
                 self._graph,
                 stream=self._capture_stream,
-                capture_error_mode="thread_local",
+                capture_error_mode="relaxed",
             ):
                 self._static_out = self._module(self._static_in)
         torch.cuda.synchronize(device)

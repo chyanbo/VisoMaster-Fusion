@@ -485,7 +485,7 @@ class _CapturedGraph:
         torch.cuda.synchronize()
         self._graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(
-            self._graph, stream=self._stream, capture_error_mode="thread_local"
+            self._graph, stream=self._stream, capture_error_mode="relaxed"
         ):
             self._out = model(self._inp)  # (1, 20, 8400) float32
         torch.cuda.synchronize()

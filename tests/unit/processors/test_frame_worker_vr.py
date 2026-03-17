@@ -153,6 +153,7 @@ def _make_worker(main_window):
         worker._vr_p2e_converter = None  # Improvement K: cached PerspectiveConverter
         worker._vr_p2e_frame_size = None
         worker._last_scaling_control = None
+        worker._last_vr_scaling_control = None
         worker._resize_cache = {}
         worker._gabor_kernels_cache = OrderedDict()
         # Q-QUAL-01 / Q-QUAL-03: EMA state dicts
