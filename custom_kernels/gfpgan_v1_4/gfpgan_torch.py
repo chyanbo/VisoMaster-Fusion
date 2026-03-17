@@ -271,6 +271,34 @@ def _load_onnx(path: str) -> dict:
         if len(torgb_bias_keys) >= 9:
             w["_torgb_bias_final_rgb"] = w[torgb_bias_keys[8]]
 
+    # StyleGAN constant input: shape [1, 512, 4, 4].
+    # The initializer name varies across ONNX export versions:
+    #   - Constant-folded Tile output: '/stylegan_decoderdotconstant_input/Tile_output_0'
+    #   - Plain parameter export:      'stylegan_decoder.constant_input.input'
+    # Detect by trying known names first, then fall back to unique-shape search.
+    _SG_CONST_KNOWN = (
+        "/stylegan_decoderdotconstant_input/Tile_output_0",
+        "stylegan_decoder.constant_input.input",
+        "/stylegan_decoder/constant_input/Tile_output_0",
+    )
+    sg_const_src = next((k for k in _SG_CONST_KNOWN if k in w), None)
+    if sg_const_src is None:
+        # Shape-based fallback: the constant input is the only [1, 512, 4, 4] initializer
+        sg_const_src = next(
+            (k for k, v in w.items() if getattr(v, "shape", None) == (1, 512, 4, 4)),
+            None,
+        )
+    if sg_const_src is not None:
+        w["_sg_const"] = w[sg_const_src]
+    else:
+        print(
+            "[GFPGANTorch] WARNING: Could not locate StyleGAN constant input "
+            "in ONNX model. Available shape-(1,512,4,4) keys: "
+            + str(
+                [k for k, v in w.items() if getattr(v, "shape", None) == (1, 512, 4, 4)]
+            )
+        )
+
     return w
 
 
@@ -407,7 +435,7 @@ class GFPGANTorch(torch.nn.Module):
                         rb(f"{short}_{ls}_{p}", h16(f"{branch}.{li}.{p}"))
 
         # ── StyleGAN constant input [1, 512, 4, 4] ────────────────────────
-        rb("sg_const", h16("/stylegan_decoderdotconstant_input/Tile_output_0"))
+        rb("sg_const", h16("_sg_const"))
 
         # ── style_conv1 (prefix "init_sc" avoids collision with sc1 in the loop) ──
         pf = "stylegan_decoderdotstyle_conv1dot"

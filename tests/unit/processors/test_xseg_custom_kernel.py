@@ -28,7 +28,8 @@ if str(_ROOT) not in sys.path:
 # Stub only missing heavy deps that custom_kernels modules try to import.
 # Do NOT stub onnx/onnxruntime — they are installed and needed for accuracy tests.
 # ---------------------------------------------------------------------------
-for _m in []:  # nothing to stub for xseg_torch itself
+_stub_list: list[str] = []
+for _m in _stub_list:  # nothing to stub for xseg_torch itself
     if _m not in sys.modules:
         sys.modules[_m] = MagicMock()
 
@@ -41,12 +42,14 @@ _have_onnx = False
 _have_ort = False
 try:
     import onnx as _onnx_pkg  # noqa: F401
+
     _have_onnx = hasattr(_onnx_pkg, "__version__")
 except Exception:
     pass
 
 try:
     import onnxruntime as _ort_pkg  # noqa: F401
+
     _have_ort = hasattr(_ort_pkg, "__version__")
 except Exception:
     pass
@@ -57,11 +60,13 @@ _have_model_file = _ONNX_PATH.exists()
 # Architecture tests (no model file needed)
 # ---------------------------------------------------------------------------
 
+
 class TestXSegTorchArchitecture:
     """Structural tests that do not require the ONNX model file."""
 
     def _make_model(self):
         from custom_kernels.xseg.xseg_torch import XSegTorch
+
         m = XSegTorch()
         m.eval()
         return m
@@ -86,21 +91,33 @@ class TestXSegTorchArchitecture:
 
     def test_conv_module_count(self):
         """Exactly 43 Conv/ConvTranspose modules must be present."""
-        from custom_kernels.xseg.xseg_torch import XSegTorch, _conv_modules_in_forward_order
+        from custom_kernels.xseg.xseg_torch import (
+            XSegTorch,
+            _conv_modules_in_forward_order,
+        )
+
         m = XSegTorch()
         mods = _conv_modules_in_forward_order(m)
         assert len(mods) == 43, f"Expected 43 conv modules, got {len(mods)}"
 
     def test_norm_module_count(self):
         """Exactly 36 _RMSNormMax modules must be present."""
-        from custom_kernels.xseg.xseg_torch import XSegTorch, _rms_norm_mods_in_forward_order
+        from custom_kernels.xseg.xseg_torch import (
+            XSegTorch,
+            _rms_norm_mods_in_forward_order,
+        )
+
         m = XSegTorch()
         mods = _rms_norm_mods_in_forward_order(m)
         assert len(mods) == 36, f"Expected 36 norm modules, got {len(mods)}"
 
     def test_ct_bias_count(self):
         """Exactly 6 ConvTranspose additive bias parameters."""
-        from custom_kernels.xseg.xseg_torch import XSegTorch, _ct_bias_params_in_forward_order
+        from custom_kernels.xseg.xseg_torch import (
+            XSegTorch,
+            _ct_bias_params_in_forward_order,
+        )
+
         m = XSegTorch()
         biases = _ct_bias_params_in_forward_order(m)
         assert len(biases) == 6, f"Expected 6 CT biases, got {len(biases)}"
@@ -108,6 +125,7 @@ class TestXSegTorchArchitecture:
     def test_all_encoder_skip_shapes(self):
         """Encoder skip features must have the expected spatial sizes."""
         from custom_kernels.xseg.xseg_torch import XSegTorch
+
         m = XSegTorch()
         m.eval()
         x = torch.randn(1, 3, 256, 256)
@@ -121,16 +139,19 @@ class TestXSegTorchArchitecture:
 
         assert s0.shape == (1, 32, 256, 256), f"s0 {s0.shape}"
         assert s1.shape == (1, 64, 128, 128), f"s1 {s1.shape}"
-        assert s2.shape == (1, 128, 64, 64),  f"s2 {s2.shape}"
-        assert s3.shape == (1, 256, 32, 32),  f"s3 {s3.shape}"
-        assert s4.shape == (1, 256, 16, 16),  f"s4 {s4.shape}"
-        assert s5.shape == (1, 256, 8, 8),    f"s5 {s5.shape}"
-        assert x5.shape == (1, 256, 4, 4),    f"bottleneck {x5.shape}"
+        assert s2.shape == (1, 128, 64, 64), f"s2 {s2.shape}"
+        assert s3.shape == (1, 256, 32, 32), f"s3 {s3.shape}"
+        assert s4.shape == (1, 256, 16, 16), f"s4 {s4.shape}"
+        assert s5.shape == (1, 256, 8, 8), f"s5 {s5.shape}"
+        assert x5.shape == (1, 256, 4, 4), f"bottleneck {x5.shape}"
 
-    @pytest.mark.skipif(not torch.cuda.is_available(), reason="fp16 Triton path requires CUDA")
+    @pytest.mark.skipif(
+        not torch.cuda.is_available(), reason="fp16 Triton path requires CUDA"
+    )
     def test_fp16_forward(self):
         """Model in fp16 compute mode produces fp32 output (always-float32 contract)."""
         from custom_kernels.xseg.xseg_torch import XSegTorch
+
         m = XSegTorch()
         m._compute_dtype = torch.float16
         m = m.half().cuda()
@@ -144,6 +165,7 @@ class TestXSegTorchArchitecture:
     def test_rms_norm_max_pytorch_fallback(self):
         """_RMSNormMax PyTorch path: output shape and dtype preserved."""
         from custom_kernels.xseg.xseg_torch import _RMSNormMax
+
         norm = _RMSNormMax(32)
         norm.eps = 1e-5
         x = torch.randn(1, 32, 64, 64)
@@ -171,9 +193,7 @@ class TestXSegTorchArchitecture:
 
         # Manual computation
         x_f32 = x.float()
-        rms = torch.sqrt(
-            torch.mean(x_f32 * x_f32, dim=[2, 3], keepdim=True) + norm.eps
-        )
+        rms = torch.sqrt(torch.mean(x_f32 * x_f32, dim=[2, 3], keepdim=True) + norm.eps)
         y_ref = (x_f32 / rms) * norm.gamma.float() + norm.beta.float()
         y_ref = torch.maximum(y_ref, norm.max_val.float())
 
@@ -184,6 +204,7 @@ class TestXSegTorchArchitecture:
     def test_decoder_up_block_output_size(self):
         """_UpBlock doubles spatial dimensions (ConvTranspose 3x3 stride-2)."""
         from custom_kernels.xseg.xseg_torch import _UpBlock
+
         up = _UpBlock(256, 128)
         up.eval()
         x = torch.randn(1, 256, 4, 4)
@@ -196,7 +217,10 @@ class TestXSegTorchArchitecture:
 # Numerical accuracy vs ORT (requires model file + onnx + onnxruntime)
 # ---------------------------------------------------------------------------
 
-@pytest.mark.skipif(not _have_model_file, reason="XSeg_model.onnx not found in model_assets/")
+
+@pytest.mark.skipif(
+    not _have_model_file, reason="XSeg_model.onnx not found in model_assets/"
+)
 @pytest.mark.skipif(not _have_onnx, reason="onnx package not available")
 @pytest.mark.skipif(not _have_ort, reason="onnxruntime not available")
 class TestXSegTorchVsORT:
@@ -205,14 +229,14 @@ class TestXSegTorchVsORT:
     @pytest.fixture(scope="class")
     def ort_session(self):
         import onnxruntime as ort
-        sess = ort.InferenceSession(
-            str(_ONNX_PATH), providers=["CPUExecutionProvider"]
-        )
+
+        sess = ort.InferenceSession(str(_ONNX_PATH), providers=["CPUExecutionProvider"])
         return sess
 
     @pytest.fixture(scope="class")
     def torch_model(self):
         from custom_kernels.xseg.xseg_torch import XSegTorch
+
         model = XSegTorch.from_onnx(str(_ONNX_PATH), compute_dtype=torch.float32)
         model.eval()
         return model
@@ -267,8 +291,11 @@ class TestXSegTorchVsORT:
 # CUDA graph correctness (requires CUDA + model file + onnx)
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
-@pytest.mark.skipif(not _have_model_file, reason="XSeg_model.onnx not found in model_assets/")
+@pytest.mark.skipif(
+    not _have_model_file, reason="XSeg_model.onnx not found in model_assets/"
+)
 @pytest.mark.skipif(not _have_onnx, reason="onnx package not available")
 class TestXSegCudaGraph:
     """CUDA-graph runner must produce input-dependent, consistent outputs.
@@ -281,6 +308,7 @@ class TestXSegCudaGraph:
     @pytest.fixture(scope="class")
     def cuda_runner(self):
         from custom_kernels.xseg.xseg_torch import XSegTorch, build_cuda_graph_runner
+
         model = (
             XSegTorch.from_onnx(str(_ONNX_PATH), compute_dtype=torch.float16)
             .to("cuda")
@@ -334,6 +362,7 @@ class TestXSegCudaGraph:
     def test_cuda_graph_matches_eager_fp32(self, cuda_runner):
         """CUDA graph (fp16) output must be close to eager fp32 model."""
         from custom_kernels.xseg.xseg_torch import XSegTorch
+
         model_fp32 = (
             XSegTorch.from_onnx(str(_ONNX_PATH), compute_dtype=torch.float32)
             .to("cuda")
