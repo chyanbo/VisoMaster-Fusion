@@ -5,7 +5,11 @@ MISC-* tests for pure utility functions in app.helpers.miscellaneous
 import numpy as np
 import pytest
 from app.helpers.miscellaneous import (
+    count_issue_scan_frames,
+    ParametersDict,
+    find_best_target_match,
     is_image_file,
+    is_detected_face_eligible_for_matching,
     is_video_file,
     get_file_type,
     get_scaling_transforms,
@@ -169,6 +173,85 @@ def test_video_extensions_are_lowercase_dotted():
 
 def test_no_overlap_between_image_and_video_extensions():
     assert set(image_extensions).isdisjoint(set(video_extensions))
+
+
+# ---------------------------------------------------------------------------
+# MISC-05/06 - shared scan/render matching helpers
+# ---------------------------------------------------------------------------
+
+
+def test_is_detected_face_eligible_for_matching_rejects_small_bbox():
+    kps = np.array(
+        [[10.0, 10.0], [20.0, 10.0], [15.0, 15.0], [11.0, 20.0], [19.0, 20.0]],
+        dtype=np.float32,
+    )
+    tiny_bbox = np.array([0.0, 0.0, 18.0, 30.0], dtype=np.float32)
+    assert is_detected_face_eligible_for_matching(kps, tiny_bbox, 20) is False
+
+
+def test_is_detected_face_eligible_for_matching_accepts_valid_face():
+    kps = np.array(
+        [[10.0, 10.0], [20.0, 10.0], [15.0, 15.0], [11.0, 20.0], [19.0, 20.0]],
+        dtype=np.float32,
+    )
+    bbox = np.array([0.0, 0.0, 30.0, 30.0], dtype=np.float32)
+    assert is_detected_face_eligible_for_matching(kps, bbox, 20) is True
+
+
+class _DummyTargetFace:
+    def __init__(self, face_id: int, embedding_store: dict[str, np.ndarray]):
+        self.face_id = face_id
+        self._embedding_store = embedding_store
+
+    def get_embedding(self, recognition_model: str) -> np.ndarray | None:
+        return self._embedding_store.get(recognition_model)
+
+
+class _DummyModelsProcessor:
+    @staticmethod
+    def findCosineDistance(
+        detected_embedding: np.ndarray, target_embedding: np.ndarray
+    ) -> float:
+        return float(np.dot(detected_embedding, target_embedding) * 100.0)
+
+
+def test_find_best_target_match_respects_parameters_dict_thresholds():
+    defaults = {"SimilarityThresholdSlider": 60}
+    face_params = {
+        "1": ParametersDict({"SimilarityThresholdSlider": 95}, defaults),
+        "2": ParametersDict({"SimilarityThresholdSlider": 70}, defaults),
+    }
+    targets = {
+        1: _DummyTargetFace(1, {"arcface_128": np.array([0.90], dtype=np.float32)}),
+        2: _DummyTargetFace(2, {"arcface_128": np.array([0.80], dtype=np.float32)}),
+    }
+
+    best_target, best_params, best_score = find_best_target_match(
+        np.array([1.0], dtype=np.float32),
+        _DummyModelsProcessor(),
+        targets,
+        face_params,
+        defaults,
+        "arcface_128",
+    )
+
+    assert best_target is not None
+    assert best_target.face_id == 2
+    assert best_params is not None
+    assert best_params["SimilarityThresholdSlider"] == 70
+    assert best_score == pytest.approx(80.0)
+
+
+def test_count_issue_scan_frames_excludes_dropped_frames():
+    scan_ranges = [(0, 9), (20, 24)]
+    dropped_frames = {2, 3, 22}
+    assert count_issue_scan_frames(scan_ranges, dropped_frames) == 12
+
+
+def test_count_issue_scan_frames_returns_zero_when_all_frames_dropped():
+    scan_ranges = [(10, 12)]
+    dropped_frames = {10, 11, 12}
+    assert count_issue_scan_frames(scan_ranges, dropped_frames) == 0
 
 
 # ---------------------------------------------------------------------------

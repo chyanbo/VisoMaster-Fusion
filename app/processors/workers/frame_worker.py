@@ -22,9 +22,11 @@ from app.processors.utils import faceutil
 
 from app.helpers.miscellaneous import (
     ParametersDict,
+    find_best_target_match,
     get_scaling_transforms,
     draw_bounding_boxes_on_detected_faces,
     paint_landmarks_on_image,
+    is_detected_face_eligible_for_matching,
     keypoints_adjustments,
     get_grid_for_pasting,
 )
@@ -539,46 +541,25 @@ class FrameWorker(threading.Thread):
                 taken under self.lock.  If None, falls back to reading the live dict
                 (single-frame / legacy callers).
         """
-        best_target_button = None
-        best_params_pd = None
-        highest_sim = -1.0
-
         # FW-RACE-01: use the snapshot when available; otherwise fall back to live dict.
         if target_faces_snapshot is not None:
-            faces_to_iterate = list(target_faces_snapshot.items())
+            faces_to_iterate = dict(target_faces_snapshot)
         else:
             with self.lock:
-                faces_to_iterate = list(self.main_window.target_faces.items())
+                faces_to_iterate = dict(self.main_window.target_faces)
 
         # FW-RACE-05: snapshot default_parameters under lock once
         with self.lock:
             default_params_dict = dict(self.main_window.default_parameters.data)
 
-        for target_id, target_button_widget in faces_to_iterate:
-            face_specific_params_dict: dict = cast(
-                dict, self.parameters.get(target_id, {})
-            )
-
-            current_params_pd = ParametersDict(
-                dict(face_specific_params_dict), cast(dict, default_params_dict)
-            )
-            target_embedding_np = target_button_widget.get_embedding(
-                control_global["RecognitionModelSelection"]
-            )
-            if target_embedding_np is None:
-                continue
-            sim = self.models_processor.findCosineDistance(
-                detected_embedding_np, target_embedding_np
-            )
-
-            if (
-                sim >= current_params_pd["SimilarityThresholdSlider"]
-                and sim > highest_sim
-            ):
-                highest_sim = sim
-                best_target_button = target_button_widget
-                best_params_pd = current_params_pd
-        return best_target_button, best_params_pd, highest_sim
+        return find_best_target_match(
+            detected_embedding_np,
+            self.models_processor,
+            faces_to_iterate,
+            self.parameters,
+            cast(dict, default_params_dict),
+            str(control_global["RecognitionModelSelection"]),
+        )
 
     def _process_single_vr_perspective_crop_multi(
         self,
@@ -2038,9 +2019,6 @@ class FrameWorker(threading.Thread):
                 bypass_bytetrack=True,  # Bypassing ByteTrack to avoid corrupting the global Kalman filter state
             )
 
-        img_h_for_kps = img.shape[-2]
-        img_w_for_kps = img.shape[-1]
-
         if (
             isinstance(kpss_5, np.ndarray)
             and kpss_5.shape[0] > 0
@@ -2048,12 +2026,9 @@ class FrameWorker(threading.Thread):
             and len(kpss_5) > 0
         ):
             for i in range(len(kpss_5)):
-                if not self._is_kps_valid(kpss_5[i], img_h_for_kps, img_w_for_kps):
-                    continue
                 _bbox_i = bboxes[i]
-                if (
-                    min(_bbox_i[2] - _bbox_i[0], _bbox_i[3] - _bbox_i[1])
-                    < self._MIN_FACE_PIXELS
+                if not is_detected_face_eligible_for_matching(
+                    kpss_5[i], _bbox_i, self._MIN_FACE_PIXELS
                 ):
                     continue  # too small to produce meaningful swap
                 face_emb, _ = self.models_processor.run_recognize_direct(

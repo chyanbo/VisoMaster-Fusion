@@ -2554,7 +2554,12 @@ class VideoProcessor(QObject):
             raise RuntimeError("Could not open the selected video for scanning.")
 
         scan_ranges = scan_ranges or self._get_issue_scan_ranges()
-        total_frames = sum((end - start + 1) for start, end in scan_ranges)
+        dropped_frames_snapshot = {
+            int(frame) for frame in getattr(self.main_window, "dropped_frames", set())
+        }
+        total_frames = misc_helpers.count_issue_scan_frames(
+            scan_ranges, dropped_frames_snapshot
+        )
         target_height = (
             target_height
             if target_height is not None
@@ -2588,6 +2593,10 @@ class VideoProcessor(QObject):
                 for frame_number in range(start_frame, end_frame + 1):
                     if is_cancelled and is_cancelled():
                         return None
+                    if frame_number in dropped_frames_snapshot:
+                        self.current_frame_number = frame_number + 1
+                        misc_helpers.seek_frame(capture, self.current_frame_number)
+                        continue
                     ret, frame_bgr = misc_helpers.read_frame(
                         capture,
                         self.media_rotation,
@@ -2623,6 +2632,7 @@ class VideoProcessor(QObject):
                         and isinstance(kpss_5, numpy.ndarray)
                         and kpss_5.shape[0] > 0
                     ):
+                        max_faces = min(bboxes.shape[0], kpss_5.shape[0])
                         frame_tensor = (
                             torch.from_numpy(frame_rgb.astype("uint8"))
                             .to(self.main_window.models_processor.device)
@@ -2636,7 +2646,15 @@ class VideoProcessor(QObject):
                         similarity_type = local_control.get(
                             "SimilarityTypeSelection", "Opal"
                         )
-                        for face_kps in kpss_5:
+                        for face_index in range(max_faces):
+                            face_kps = kpss_5[face_index]
+                            face_bbox = bboxes[face_index]
+                            if not misc_helpers.is_detected_face_eligible_for_matching(
+                                face_kps,
+                                face_bbox,
+                                FrameWorker._MIN_FACE_PIXELS,
+                            ):
+                                continue
                             face_emb, _ = (
                                 self.main_window.models_processor.run_recognize_direct(
                                     frame_tensor,
@@ -2659,38 +2677,16 @@ class VideoProcessor(QObject):
                     default_params = dict(self.main_window.default_parameters.data)
 
                     for detected_embedding in detected_embeddings:
-                        best_face_id = None
-                        best_score = -1.0
-                        for face_id, target_face in target_faces_snapshot.items():
-                            face_id_str = str(face_id)
-                            face_params_raw = local_params.get(face_id_str)
-                            face_params_mapping = misc_helpers.copy_mapping_data(
-                                face_params_raw
-                            )
-                            face_params_pd = misc_helpers.ParametersDict(
-                                face_params_mapping, default_params
-                            )
-                            target_embedding = target_face.get_embedding(
-                                recognition_model
-                            )
-                            if not (
-                                isinstance(target_embedding, numpy.ndarray)
-                                and target_embedding.size > 0
-                            ):
-                                continue
-                            score = (
-                                self.main_window.models_processor.findCosineDistance(
-                                    detected_embedding, target_embedding
-                                )
-                            )
-                            if (
-                                score >= face_params_pd["SimilarityThresholdSlider"]
-                                and score > best_score
-                            ):
-                                best_score = score
-                                best_face_id = face_id_str
-                        if best_face_id is not None:
-                            matched_face_ids.add(best_face_id)
+                        best_target, _, _ = misc_helpers.find_best_target_match(
+                            detected_embedding,
+                            self.main_window.models_processor,
+                            target_faces_snapshot,
+                            local_params,
+                            default_params,
+                            recognition_model,
+                        )
+                        if best_target is not None:
+                            matched_face_ids.add(str(best_target.face_id))
 
                     for face_id in issue_frames_by_face:
                         if face_id not in matched_face_ids:
