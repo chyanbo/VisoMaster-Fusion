@@ -2,6 +2,7 @@ import os
 import shutil
 import cv2
 import time
+from bisect import bisect_left, bisect_right
 from collections import UserDict, OrderedDict
 import hashlib
 import numpy as np
@@ -9,7 +10,7 @@ from functools import wraps
 from datetime import datetime
 from pathlib import Path
 from torchvision.transforms import v2
-from typing import Dict, Mapping, Tuple, Optional, Any
+from typing import Dict, Mapping, Tuple, Optional, Any, Collection, Sequence
 import threading
 import subprocess
 import json
@@ -241,6 +242,101 @@ class ParametersDict(UserDict):
         except KeyError:
             self.__setitem__(key, self._default_parameters[key])
             return self._default_parameters[key]
+
+
+def copy_mapping_data(value: object) -> dict[str, Any]:
+    """Return a plain dict copy when *value* is any mapping-like object.
+
+    This preserves `ParametersDict` and other `Mapping` subclasses while keeping
+    non-mapping inputs on a safe empty-dict fallback.
+    """
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {}
+
+
+def is_detected_face_eligible_for_matching(
+    kps: np.ndarray | None,
+    bbox: np.ndarray | None,
+    min_face_pixels: int,
+) -> bool:
+    """Return True when a detected face is valid enough for matching.
+
+    This mirrors the standard frame-worker gate used before recognition and
+    matching: keypoints must exist and be finite, and the shortest bbox side
+    must meet the minimum face-size threshold.
+    """
+    if kps is None or kps.size == 0:
+        return False
+    if np.any(np.isnan(kps)) or np.any(np.isinf(kps)):
+        return False
+    if bbox is None or bbox.size < 4:
+        return False
+
+    shortest_side = min(float(bbox[2] - bbox[0]), float(bbox[3] - bbox[1]))
+    return shortest_side >= float(min_face_pixels)
+
+
+def find_best_target_match(
+    detected_embedding: np.ndarray,
+    models_processor: Any,
+    target_faces: Mapping[object, Any],
+    face_parameters: Mapping[str, object],
+    default_params: Mapping[str, Any],
+    recognition_model: str,
+) -> tuple[Any | None, ParametersDict | None, float]:
+    """Return the best matching target face for a detected embedding.
+
+    The caller supplies the current face-parameter mapping and default params so
+    this helper can apply the same per-face threshold logic everywhere it is
+    used, including playback/render and issue scans.
+    """
+    best_target = None
+    best_params_pd = None
+    highest_sim = -1.0
+    default_params_dict = dict(default_params)
+
+    for target_id, target_face in target_faces.items():
+        face_id_str = str(getattr(target_face, "face_id", target_id))
+        face_specific_params = copy_mapping_data(face_parameters.get(face_id_str))
+        current_params_pd = ParametersDict(face_specific_params, default_params_dict)
+        target_embedding = target_face.get_embedding(recognition_model)
+        if not isinstance(target_embedding, np.ndarray) or target_embedding.size == 0:
+            continue
+
+        sim = models_processor.findCosineDistance(detected_embedding, target_embedding)
+        if sim >= current_params_pd["SimilarityThresholdSlider"] and sim > highest_sim:
+            highest_sim = sim
+            best_target = target_face
+            best_params_pd = current_params_pd
+
+    return best_target, best_params_pd, highest_sim
+
+
+def count_issue_scan_frames(
+    scan_ranges: Sequence[tuple[int, int]],
+    dropped_frames: Collection[int],
+) -> int:
+    """Count scan frames after excluding dropped render frames.
+
+    This keeps issue-scan progress and summary stats aligned with the frames that
+    render/output will actually keep.
+    """
+    normalized_dropped = sorted({int(frame) for frame in dropped_frames})
+    total_frames = 0
+
+    for start_frame, end_frame in scan_ranges:
+        normalized_start = int(start_frame)
+        normalized_end = int(end_frame)
+        if normalized_end < normalized_start:
+            continue
+
+        dropped_in_range = bisect_right(
+            normalized_dropped, normalized_end
+        ) - bisect_left(normalized_dropped, normalized_start)
+        total_frames += (normalized_end - normalized_start + 1) - dropped_in_range
+
+    return total_frames
 
 
 # --- Function Definitions ---
