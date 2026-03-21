@@ -11,7 +11,7 @@ import torch.nn.functional as F
 # Stores CPU tensors; callers move to device.  Thread-safe: _PERSP_GRID_CACHE_LOCK guards
 # all read-modify-write sequences so concurrent pool workers cannot race on eviction.
 _PERSP_GRID_CACHE: OrderedDict = OrderedDict()
-_PERSP_GRID_CACHE_MAX = 64
+_PERSP_GRID_CACHE_MAX = 16
 _PERSP_GRID_CACHE_LOCK = threading.Lock()
 
 
@@ -89,11 +89,15 @@ class Equirectangular:
             persp_y_coords = torch.linspace(-h_len, h_len, height, device=self.device, dtype=torch.float32)
             persp_yy, persp_xx = torch.meshgrid(persp_y_coords, persp_x_coords, indexing='ij')
 
+            # .cpu() transfers happen BEFORE acquiring the lock to avoid holding the lock
+            # during GPU→CPU copies, which would serialize all 8 pool workers.
+            _persp_xx_cpu = persp_xx.cpu()
+            _persp_yy_cpu = persp_yy.cpu()
             with _PERSP_GRID_CACHE_LOCK:
                 if cache_key not in _PERSP_GRID_CACHE:
                     if len(_PERSP_GRID_CACHE) >= _PERSP_GRID_CACHE_MAX:
                         _PERSP_GRID_CACHE.popitem(last=False)
-                    _PERSP_GRID_CACHE[cache_key] = (persp_xx.cpu(), persp_yy.cpu())
+                    _PERSP_GRID_CACHE[cache_key] = (_persp_xx_cpu, _persp_yy_cpu)
 
         # Points in 3D space on the perspective image plane (camera looking along X-axis)
         x_3d = torch.ones_like(persp_xx)

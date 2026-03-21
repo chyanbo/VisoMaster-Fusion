@@ -51,26 +51,26 @@ def run_worker(spec_path: str):
 
     import torch
     import torch.nn as nn
-    
+
     compile_mode = spec.get("compile_mode", "default")
-    
+
     try:
         import torch._inductor.config as ind_cfg
         ind_cfg.triton.descriptive_names = False
         ind_cfg.triton.use_block_ptr = False
         ind_cfg.triton.enable_eviction_policy = False
-        
+
         # Consistent with compile_utils.py setup_compile_env()
         if compile_mode == "reduce-overhead":
             ind_cfg.triton.cudagraphs = True
         else:
             ind_cfg.triton.cudagraphs = False
-            
+
         ind_cfg.triton.cudagraph_trees = False
-        
+
         # MANDATORY FOR WINDOWS: Avoid OverflowError: Python int too large to convert to C long
         ind_cfg.use_static_cuda_launcher = False
-        
+
         ind_cfg.fx_graph_cache = True
         ind_cfg.compile_threads = 1
     except Exception:
@@ -83,7 +83,7 @@ def run_worker(spec_path: str):
     module = importlib.import_module(spec["model_module"])
     ModelClass = getattr(module, spec["model_class"])
     model = ModelClass.from_onnx(spec["onnx_path"])
-    
+
     device = spec.get("device", "cuda")
     model = model.to(device).eval()
 

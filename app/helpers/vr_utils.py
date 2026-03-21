@@ -17,11 +17,14 @@ from app.processors.external.Perspec2Equirec_vr import Perspective as P2E_Perspe
 # both pool workers (recording) and single-frame workers (scrubbing) benefit.
 # Cache hit skips _apply_feathering (max_pool2d + GaussianBlur on the full H×W equirect).
 # Key: (theta, phi, fov, is_left_eye, orig_height, orig_width) — purely geometric.
-# VRAM cost: (1, H, W) float32 ≈ 8 MB at 1080p, 33 MB at 4K.  Max 16 entries.
+# CPU RAM cost: (1, H, W) float32 ≈ 8 MB at 1080p, 30 MB at 4K.  Max 8 entries.
+# Kept at 8 (not 16) to limit CPU RAM pressure: 8×30 MB = 240 MB vs 16×30 MB = 480 MB at 4K.
 # Thread-safe: _FEATHERED_MASK_CACHE_LOCK guards all read-modify-write sequences so
 # concurrent pool workers cannot race on eviction (KeyError on move_to_end).
+# NOTE: .cpu() transfer happens OUTSIDE the lock to avoid holding the lock during the
+# slow GPU→CPU copy (~30 MB per entry) which would block all 8 pool workers.
 _FEATHERED_MASK_CACHE: OrderedDict = OrderedDict()
-_FEATHERED_MASK_CACHE_MAX = 16
+_FEATHERED_MASK_CACHE_MAX = 8
 _FEATHERED_MASK_CACHE_LOCK = threading.Lock()
 
 
@@ -259,13 +262,14 @@ class PerspectiveConverter:
             )
 
             # Store result on CPU — avoids holding large float masks in GPU memory permanently.
+            # .cpu() transfer happens BEFORE acquiring the lock to avoid holding the lock
+            # during the ~30 MB GPU→CPU copy, which would serialize all 8 pool workers.
+            _fmask_cpu = feathered_mask_torch_float_1hw.cpu()
             with _FEATHERED_MASK_CACHE_LOCK:
                 if _fmask_key not in _FEATHERED_MASK_CACHE:
                     if len(_FEATHERED_MASK_CACHE) >= _FEATHERED_MASK_CACHE_MAX:
                         _FEATHERED_MASK_CACHE.popitem(last=False)
-                    _FEATHERED_MASK_CACHE[_fmask_key] = (
-                        feathered_mask_torch_float_1hw.cpu()
-                    )
+                    _FEATHERED_MASK_CACHE[_fmask_key] = _fmask_cpu
 
             del eye_region_mask, eye_specific_mask_torch_original_shape
 

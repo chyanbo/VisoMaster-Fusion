@@ -105,20 +105,20 @@ def setup_compile_env(cache_dir: Optional[str] = None, compile_mode: str = "defa
     try:
         import torch._inductor.config as _ind_cfg
         _ind_cfg.triton.use_block_ptr = False
-        
+
         # Stability logic: reduce-overhead REQUIRES cudagraphs.
         if compile_mode == "reduce-overhead":
             _ind_cfg.triton.cudagraphs = True
         else:
             _ind_cfg.triton.cudagraphs = False
-            
+
         _ind_cfg.triton.cudagraph_trees = False
         _ind_cfg.triton.descriptive_names = False
         _ind_cfg.triton.enable_eviction_policy = False
-        
+
         # MANDATORY FOR WINDOWS: Avoid OverflowError: Python int too large to convert to C long
         _ind_cfg.use_static_cuda_launcher = False
-        
+
         _ind_cfg.fx_graph_cache = True
         _ind_cfg.compile_threads = 1
     except Exception: pass
@@ -187,12 +187,12 @@ def _ensure_compile_cache_subprocess(model: nn.Module, example_inp: torch.Tensor
     success = False
     try:
         if _show_fn is not None: _show_fn("Compiling Custom Kernels", f"First-time torch.compile for {model_class}...")
-        
+
         import subprocess
         worker_script = os.path.join(os.path.dirname(__file__), "compile_worker.py")
         cmd = [sys.executable, worker_script, spec_path]
         print(f"[compile_utils] Spawning worker: {' '.join(cmd)}")
-        
+
         env = os.environ.copy()
         env["PYTHONUTF8"] = "1"
         env["TORCHINDUCTOR_USE_STATIC_CUDA_LAUNCHER"] = "0"
@@ -200,7 +200,7 @@ def _ensure_compile_cache_subprocess(model: nn.Module, example_inp: torch.Tensor
         # cache from Python startup — before Triton initialises and locks the path.
         if "TRITON_CACHE_DIR" in os.environ:
             env["TRITON_CACHE_DIR"] = os.environ["TRITON_CACHE_DIR"]
-        
+
         process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace", env=env)
         while process.poll() is None:
             line = process.stdout.readline()
@@ -247,7 +247,7 @@ def apply_torch_compile(model: nn.Module, example_inp: torch.Tensor, warmup: int
 
     # Fast FX cache hit
     compiled = torch.compile(model, mode=compile_mode, fullgraph=False, dynamic=False)
-    
+
     if not _subprocess_mode:
         if _need_sentinel:
             try:

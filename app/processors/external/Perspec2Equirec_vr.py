@@ -11,12 +11,15 @@ from collections import OrderedDict
 # (theta, phi, fov, crop_h, crop_w, eq_h, eq_w) always produces the same tensors.
 # Cache hit skips the expensive H×W matrix-multiply, projection, and mask creation,
 # leaving only the image-dependent F.grid_sample call (unavoidable per frame).
-# VRAM cost: grid=(1,H,W,2) float32 + mask=(1,H,W) bool ≈ 17 MB at 1080p, 66 MB at 4K.
-# 8 entries covers all faces in a typical VR recording session with stable positions.
+# CPU RAM cost: grid=(1,H,W,2) float32 + mask=(1,H,W) bool ≈ 17 MB at 1080p, 64 MB at 4K.
+# 4 entries covers 2 faces × 2 eyes in a typical VR recording session with stable positions.
+# Kept at 4 (not 8) to limit CPU RAM pressure: 4×64 MB = 256 MB vs 8×64 MB = 512 MB at 4K.
 # Thread-safe: _P2E_GRID_MASK_CACHE_LOCK guards all read-modify-write sequences so
 # concurrent pool workers cannot race on eviction (KeyError on dict access).
+# NOTE: .cpu() transfers happen OUTSIDE the lock to avoid holding the lock during slow
+# GPU→CPU copies (64 MB per entry) which would block all 8 pool workers sequentially.
 _P2E_GRID_MASK_CACHE: OrderedDict = OrderedDict()
-_P2E_GRID_MASK_CACHE_MAX = 8
+_P2E_GRID_MASK_CACHE_MAX = 4
 _P2E_GRID_MASK_CACHE_LOCK = threading.Lock()
 
 
@@ -24,7 +27,9 @@ _P2E_GRID_MASK_CACHE_LOCK = threading.Lock()
 # It is decorated with @lru_cache to ensure it only runs once for a given
 # height and width, caching the result for all subsequent calls.
 # Always stored on CPU — callers move to device as needed, keeping GPU memory free.
-@lru_cache(maxsize=None)
+# maxsize=4: caps the cache at 4 unique resolutions (~88 MB each at 4K) to prevent
+# unbounded CPU RAM growth when multiple video resolutions are processed in a session.
+@lru_cache(maxsize=4)
 def _get_equirect_xyz_grid_cached(height: int, width: int) -> torch.Tensor:
     """
     Generates and caches a grid of 3D Cartesian unit vectors corresponding to
@@ -174,12 +179,16 @@ class Perspective:
             mask_out = mask.unsqueeze(0)  # 1, H, W
 
             # Store result on CPU — avoids holding large float grids in GPU memory permanently.
-            # (~72 MiB grid + ~9 MiB mask per entry at 4K; 8 entries = ~648 MiB saved on GPU)
+            # (~56 MiB grid + ~7 MiB mask per entry at 4K; 4 entries = ~252 MiB saved on GPU)
+            # .cpu() transfers happen BEFORE acquiring the lock so the lock is not held during
+            # the slow GPU→CPU copy (would block all 8 pool workers sequentially).
+            _grid_cpu = grid.cpu()
+            _mask_out_cpu = mask_out.cpu()
             with _P2E_GRID_MASK_CACHE_LOCK:
                 if _cache_key not in _P2E_GRID_MASK_CACHE:
                     if len(_P2E_GRID_MASK_CACHE) >= _P2E_GRID_MASK_CACHE_MAX:
                         _P2E_GRID_MASK_CACHE.popitem(last=False)
-                    _P2E_GRID_MASK_CACHE[_cache_key] = (grid.cpu(), mask_out.cpu())
+                    _P2E_GRID_MASK_CACHE[_cache_key] = (_grid_cpu, _mask_out_cpu)
 
         # Image-dependent sampling — always executed (image changes every frame)
         equirect_component_float = F.grid_sample(self._img_tensor_cxhxw_rgb_float.unsqueeze(0), grid,
