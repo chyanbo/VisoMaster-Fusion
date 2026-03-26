@@ -30,10 +30,11 @@ def test_mark_skipped_frame_tracks_reason_counts():
     assert dummy.read_error_skip_count == 1
 
 
-def test_extract_audio_segments_reencodes_to_containerized_aac_when_validation_fails(
+def test_extract_audio_segments_always_normalizes_to_containerized_aac(
     tmp_path, monkeypatch
 ):
     calls: list[list[str]] = []
+    validation_results = iter([False, True])
 
     def fake_run(args, **kwargs):
         calls.append(list(args))
@@ -42,7 +43,7 @@ def test_extract_audio_segments_reencodes_to_containerized_aac_when_validation_f
     dummy = SimpleNamespace(
         fps=30.0,
         media_path=str(tmp_path / "input.mkv"),
-        _validate_audio_file=lambda _: False,
+        _validate_audio_file=lambda _: next(validation_results),
     )
 
     monkeypatch.setattr("subprocess.run", fake_run)
@@ -59,7 +60,8 @@ def test_extract_audio_segments_reencodes_to_containerized_aac_when_validation_f
     retry_call = calls[1]
 
     assert first_call[-1].endswith(".m4a")
-    assert first_call[first_call.index("-c:a") + 1] == "copy"
+    assert first_call[first_call.index("-c:a") + 1] == "aac"
+    assert first_call[first_call.index("-af") + 1] == "aresample=async=1:first_pts=0"
     assert first_call[first_call.index("-map") + 1] == "0:a:0?"
 
     assert retry_call[-1].endswith(".m4a")

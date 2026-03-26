@@ -2783,17 +2783,17 @@ class VideoProcessor(QObject):
             audio_file = os.path.join(temp_audio_dir, f"audio_segment_{idx:04d}.m4a")
             audio_files.append(audio_file)
 
-            # Try a fast "copy" extraction first to avoid decoding corrupted
-            # packets.  If the input stream itself is damaged this will still
-            # produce a file and skip decoding, hopefully avoiding the error
-            # message the user observed.  We always run validation afterwards
-            # and fall back to re-encoding if needed.
+            # Always normalize skipped-frame rebuild audio to AAC-in-M4A.
+            # This keeps the concat/remux path codec-agnostic for any source
+            # audio format that FFmpeg can decode from the input media.
             media_path: str = self.media_path  # type: ignore[assignment]
             args: list[str] = [
                 "ffmpeg",
                 "-hide_banner",
                 "-loglevel",
                 "warning",
+                "-err_detect",
+                "ignore_err",
                 "-i",
                 media_path,
                 "-ss",
@@ -2803,10 +2803,12 @@ class VideoProcessor(QObject):
                 "-vn",
                 "-map",
                 "0:a:0?",
-                "-avoid_negative_ts",
-                "make_zero",
+                "-af",
+                "aresample=async=1:first_pts=0",
                 "-c:a",
-                "copy",
+                "aac",
+                "-b:a",
+                "192k",
                 "-y",
                 audio_file,
             ]
@@ -2815,33 +2817,14 @@ class VideoProcessor(QObject):
                 print(
                     f"[INFO] Extracting audio segment {idx + 1}/{len(segments)}: {start_time:.3f}s → {end_time:.3f}s"
                 )
-                result = subprocess.run(
-                    args, check=True, capture_output=True, text=True
-                )
+                subprocess.run(args, check=True, capture_output=True, text=True)
 
-                # Check for audio decoding errors in stderr (copy mode usually avoids decoding,
-                # but some containers still report warnings)
-                stderr_output = result.stderr
-                needs_rerun = False
-                if (
-                    "Error submitting packet to decoder" in stderr_output
-                    or "Invalid data found" in stderr_output
-                ):
-                    print(f"[WARN] Audio decoding errors detected in segment {idx + 1}")
-                    print(
-                        f"[WARN] FFmpeg stderr: {stderr_output[:500]}..."
-                    )  # First 500 chars
-                    needs_rerun = True
-
-                # Validate output; if it's not valid, we'll resort to re-encode
+                # Validate output; if it's not valid, retry once with the same
+                # normalized extraction settings to rule out a transient failure.
                 if not self._validate_audio_file(audio_file):
                     print(
-                        f"[WARN] Validation failed for copied segment {idx + 1}, will retry with re-encoding"
+                        f"[WARN] Validation failed for segment {idx + 1}, retrying extraction once"
                     )
-                    needs_rerun = True
-
-                if needs_rerun:
-                    # re-extract by decoding and re-encoding, ignoring errors
                     re_args: list[str] = [
                         "ffmpeg",
                         "-hide_banner",
@@ -2868,9 +2851,6 @@ class VideoProcessor(QObject):
                         audio_file,
                     ]
                     try:
-                        print(
-                            f"[INFO]   Re-extracting segment {idx + 1} with re-encode"
-                        )
                         subprocess.run(
                             re_args, check=True, capture_output=True, text=True
                         )
@@ -2885,8 +2865,18 @@ class VideoProcessor(QObject):
                             except OSError:
                                 pass
                         return False, []
-                else:
-                    print(f"[INFO]   ✓ Segment {idx + 1} extracted successfully")
+                    if not self._validate_audio_file(audio_file):
+                        print(
+                            f"[ERROR] Retried segment {idx + 1} is still invalid after validation"
+                        )
+                        for audio in audio_files:
+                            try:
+                                os.remove(audio)
+                            except OSError:
+                                pass
+                        return False, []
+
+                print(f"[INFO] Segment {idx + 1} extracted successfully")
             except subprocess.CalledProcessError as e:
                 print(f"[ERROR] Failed to extract audio segment {idx + 1}: {e}")
                 print(f"[ERROR] FFmpeg stderr: {e.stderr}")
