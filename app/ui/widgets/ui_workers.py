@@ -181,7 +181,19 @@ class IssueScanWorker(qtc.QThread):
         self._base_params = {
             face_id: params.copy() for face_id, params in main_window.parameters.items()
         }
-        self._target_faces_snapshot = dict(main_window.target_faces)
+        self._control_defaults_snapshot = {
+            widget_name: widget.default_value
+            for widget_name, widget in main_window.parameter_widgets.items()
+            if widget_name in main_window.control
+        }
+        self._target_faces_snapshot = (
+            main_window.video_processor.prepare_issue_scan_target_faces_snapshot(
+                self._scan_ranges,
+                self._base_control,
+                self._base_params,
+                self._control_defaults_snapshot,
+            )
+        )
         self._reset_frame_number = int(main_window.videoSeekSlider.value())
 
     def cancel(self):
@@ -206,6 +218,7 @@ class IssueScanWorker(qtc.QThread):
                 base_control=self._base_control,
                 base_params=self._base_params,
                 target_faces_snapshot=self._target_faces_snapshot,
+                control_defaults_snapshot=self._control_defaults_snapshot,
                 reset_frame_number=self._reset_frame_number,
             )
             if result is None:

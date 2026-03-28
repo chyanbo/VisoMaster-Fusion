@@ -38,6 +38,9 @@ from app.helpers.typing_helper import (
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
+IssueScanTargetEmbeddings = dict[str, dict[str, numpy.ndarray]]
+IssueScanTargetSnapshot = dict[str, dict[str, Any]]
+
 TAIL_TOLERANCE = 30  # BUG-07: 10 was too tight — codec trailing B-frames can cause read
 # failures in the last ~10 frames on H.264/H.265 content, dropping valid end frames.
 MAX_CONSECUTIVE_ERRORS = (
@@ -2560,6 +2563,7 @@ class VideoProcessor(QObject):
         base_control: ControlTypes,
         base_params: FacesParametersTypes,
         target_faces_snapshot: Optional[dict] = None,
+        control_defaults_snapshot: Optional[ControlTypes] = None,
     ) -> tuple[ControlTypes, FacesParametersTypes]:
         """Resolve the effective control/parameter state for a scan frame.
 
@@ -2580,9 +2584,16 @@ class VideoProcessor(QObject):
             FacesParametersTypes, copy.deepcopy(marker_data.get("parameters", {}))
         )
         local_control: ControlTypes = cast(ControlTypes, {})
-        for widget_name, widget in self.main_window.parameter_widgets.items():
-            if widget_name in self.main_window.control:
-                local_control[widget_name] = widget.default_value
+        local_control.update(
+            cast(
+                ControlTypes,
+                copy.deepcopy(
+                    control_defaults_snapshot
+                    if control_defaults_snapshot is not None
+                    else {}
+                ),
+            )
+        )
 
         control_data = marker_data.get("control")
         if isinstance(control_data, dict):
@@ -2590,7 +2601,12 @@ class VideoProcessor(QObject):
 
         # Mirror the playback helper behavior by ensuring every current target
         # face has a parameter dict, falling back to defaults when missing.
-        for face_id in (target_faces_snapshot or self.main_window.target_faces).keys():
+        active_target_faces = (
+            target_faces_snapshot
+            if target_faces_snapshot is not None
+            else self.main_window.target_faces
+        )
+        for face_id in active_target_faces.keys():
             face_id_str = str(face_id)
             if face_id_str not in local_params:
                 local_params[face_id_str] = cast(
@@ -2606,6 +2622,7 @@ class VideoProcessor(QObject):
         base_control: ControlTypes,
         base_params: FacesParametersTypes,
         target_faces_snapshot: dict,
+        control_defaults_snapshot: Optional[ControlTypes] = None,
     ) -> list[tuple[int, int, ControlTypes, FacesParametersTypes]]:
         """Group scan ranges into marker-stable segments."""
         marker_positions = sorted(
@@ -2626,6 +2643,7 @@ class VideoProcessor(QObject):
                 base_control,
                 base_params,
                 target_faces_snapshot,
+                control_defaults_snapshot,
             )
 
             for next_marker_frame in range_markers + [end_frame + 1]:
@@ -2641,33 +2659,46 @@ class VideoProcessor(QObject):
                         base_control,
                         base_params,
                         target_faces_snapshot,
+                        control_defaults_snapshot,
                     )
 
         return segments
+
+    def _reset_issue_scan_sequential_state(self) -> None:
+        """Clear scan-local sequential detection state at tracking boundaries."""
+        self.last_detected_faces = []
+        self._smoothed_kps = {}
+        self._smoothed_dense_kps = {}
 
     def _prepare_issue_scan_match_context(
         self,
         local_control: ControlTypes,
         local_params: FacesParametersTypes,
-        target_faces_snapshot: dict,
+        target_faces_snapshot: IssueScanTargetSnapshot,
     ) -> dict[str, Any]:
         """Precompute target embeddings and thresholds for a stable scan segment."""
         recognition_model = str(
             local_control.get("RecognitionModelSelection", "arcface_128")
         )
-        similarity_type = local_control.get("SimilarityTypeSelection", "Opal")
+        similarity_type = str(local_control.get("SimilarityTypeSelection", "Opal"))
         default_params = dict(self.main_window.default_parameters.data)
-        prepared_targets: list[tuple[Any, float, numpy.ndarray]] = []
+        prepared_targets: list[tuple[str, float, numpy.ndarray]] = []
 
-        for target_id, target_face in target_faces_snapshot.items():
-            face_id_str = str(getattr(target_face, "face_id", target_id))
+        for target_id, target_face_snapshot in target_faces_snapshot.items():
+            face_id_str = str(target_face_snapshot.get("face_id", target_id))
             face_specific_params = misc_helpers.copy_mapping_data(
                 local_params.get(face_id_str)
             )
             params_pd = misc_helpers.ParametersDict(
                 face_specific_params, default_params
             )
-            target_embedding = target_face.get_embedding(recognition_model)
+            target_embeddings = cast(
+                IssueScanTargetEmbeddings,
+                target_face_snapshot.get("embeddings_by_model", {}),
+            )
+            target_embedding = target_embeddings.get(recognition_model, {}).get(
+                similarity_type
+            )
             if (
                 not isinstance(target_embedding, numpy.ndarray)
                 or target_embedding.size == 0
@@ -2675,7 +2706,7 @@ class VideoProcessor(QObject):
                 continue
             prepared_targets.append(
                 (
-                    target_face,
+                    face_id_str,
                     float(params_pd["SimilarityThresholdSlider"]),
                     target_embedding,
                 )
@@ -2690,21 +2721,107 @@ class VideoProcessor(QObject):
     def _find_best_target_match_for_scan(
         self,
         detected_embedding: numpy.ndarray,
-        prepared_targets: list[tuple[Any, float, numpy.ndarray]],
-    ) -> Any | None:
+        prepared_targets: list[tuple[str, float, numpy.ndarray]],
+    ) -> str | None:
         """Return the best target face using a precomputed scan match context."""
         best_target = None
         highest_sim = -1.0
 
-        for target_face, threshold, target_embedding in prepared_targets:
+        for target_face_id, threshold, target_embedding in prepared_targets:
             sim = self.main_window.models_processor.findCosineDistance(
                 detected_embedding, target_embedding
             )
             if sim >= threshold and sim > highest_sim:
                 highest_sim = sim
-                best_target = target_face
+                best_target = target_face_id
 
         return best_target
+
+    def _build_issue_scan_target_embedding(
+        self,
+        target_face: Any,
+        recognition_model: str,
+        similarity_type: str,
+    ) -> numpy.ndarray:
+        cropped_face = getattr(target_face, "cropped_face", None)
+        if not isinstance(cropped_face, numpy.ndarray) or cropped_face.size == 0:
+            return numpy.array([])
+        image = numpy.ascontiguousarray(cropped_face)
+        image_uint8 = (
+            image if image.dtype == numpy.uint8 else image.astype("uint8", copy=False)
+        )
+        image_tensor = (
+            torch.from_numpy(image_uint8)
+            .to(self.main_window.models_processor.device, non_blocking=True)
+            .permute(2, 0, 1)
+        )
+        height, width = image_uint8.shape[:2]
+        full_face_kps = numpy.array(
+            [
+                [0.3 * width, 0.35 * height],
+                [0.7 * width, 0.35 * height],
+                [0.5 * width, 0.55 * height],
+                [0.35 * width, 0.75 * height],
+                [0.65 * width, 0.75 * height],
+            ],
+            dtype=numpy.float32,
+        )
+        face_emb, _ = self.main_window.models_processor.run_recognize_direct(
+            image_tensor,
+            full_face_kps,
+            similarity_type,
+            recognition_model,
+        )
+        return face_emb if isinstance(face_emb, numpy.ndarray) else numpy.array([])
+
+    def prepare_issue_scan_target_faces_snapshot(
+        self,
+        scan_ranges: list[tuple[int, int]],
+        base_control: ControlTypes,
+        base_params: FacesParametersTypes,
+        control_defaults_snapshot: Optional[ControlTypes] = None,
+    ) -> IssueScanTargetSnapshot:
+        """Build a worker-safe target-face snapshot for issue scans."""
+        live_target_faces = dict(self.main_window.target_faces)
+        if not live_target_faces:
+            return {}
+
+        scan_segments = self._build_issue_scan_state_segments(
+            scan_ranges,
+            base_control,
+            base_params,
+            live_target_faces,
+            control_defaults_snapshot,
+        )
+        required_embedding_modes = {
+            (
+                str(local_control.get("RecognitionModelSelection", "arcface_128")),
+                str(local_control.get("SimilarityTypeSelection", "Opal")),
+            )
+            for _start_frame, _end_frame, local_control, _local_params in scan_segments
+        }
+        if not required_embedding_modes:
+            required_embedding_modes = {("arcface_128", "Opal")}
+
+        target_faces_snapshot: IssueScanTargetSnapshot = {}
+        for target_id, target_face in live_target_faces.items():
+            embeddings_by_model: IssueScanTargetEmbeddings = {}
+            for recognition_model, similarity_type in required_embedding_modes:
+                model_embeddings = embeddings_by_model.setdefault(recognition_model, {})
+                model_embeddings[similarity_type] = (
+                    self._build_issue_scan_target_embedding(
+                        target_face,
+                        recognition_model,
+                        similarity_type,
+                    )
+                )
+
+            target_faces_snapshot[str(target_id)] = {
+                "face_id": str(getattr(target_face, "face_id", target_id)),
+                "embeddings_by_model": embeddings_by_model,
+            }
+
+        return target_faces_snapshot
 
     def scan_issue_frames(
         self,
@@ -2714,7 +2831,8 @@ class VideoProcessor(QObject):
         target_height: Optional[int] = None,
         base_control: Optional[dict] = None,
         base_params: Optional[dict] = None,
-        target_faces_snapshot: Optional[dict] = None,
+        target_faces_snapshot: Optional[IssueScanTargetSnapshot] = None,
+        control_defaults_snapshot: Optional[dict] = None,
         reset_frame_number: Optional[int] = None,
     ) -> Optional[dict]:
         """Run a full-frame detection scan and return issue-frame results."""
@@ -2735,39 +2853,69 @@ class VideoProcessor(QObject):
             else self._get_target_input_height()
         )
         base_control = cast(
-            ControlTypes, copy.deepcopy(base_control or self.main_window.control)
+            ControlTypes,
+            copy.deepcopy(
+                base_control if base_control is not None else self.main_window.control
+            ),
         )
         base_params = cast(
             FacesParametersTypes,
-            copy.deepcopy(base_params or self.main_window.parameters),
+            copy.deepcopy(
+                base_params if base_params is not None else self.main_window.parameters
+            ),
         )
-        target_faces_snapshot = dict(
-            target_faces_snapshot or self.main_window.target_faces
-        )
+        if target_faces_snapshot is None:
+            target_faces_snapshot = self.prepare_issue_scan_target_faces_snapshot(
+                scan_ranges,
+                base_control,
+                base_params,
+                cast(Optional[ControlTypes], control_defaults_snapshot),
+            )
+        else:
+            target_faces_snapshot = cast(
+                IssueScanTargetSnapshot,
+                dict(target_faces_snapshot),
+            )
         previous_last_detected_faces = copy.deepcopy(self.last_detected_faces)
         previous_smoothed_kps = copy.deepcopy(self._smoothed_kps)
         previous_smoothed_dense_kps = copy.deepcopy(self._smoothed_dense_kps)
         total_frames_scanned = 0
+        tracking_enabled = False
         issue_frames_by_face: dict[str, set[int]] = {
             str(face_id): set() for face_id in target_faces_snapshot.keys()
         }
 
         try:
-            self.last_detected_faces = []
-            self._smoothed_kps = {}
-            self._smoothed_dense_kps = {}
+            self._reset_issue_scan_sequential_state()
             scan_segments = self._build_issue_scan_state_segments(
                 scan_ranges,
                 base_control,
                 base_params,
                 target_faces_snapshot,
+                cast(Optional[ControlTypes], control_defaults_snapshot),
             )
+            tracking_enabled = any(
+                bool(local_control.get("FaceTrackingEnableToggle", False))
+                for _start_frame, _end_frame, local_control, _local_params in scan_segments
+            )
+            if tracking_enabled:
+                self.main_window.models_processor.face_detectors.reset_tracker()
+            previous_segment_tracking_enabled: Optional[bool] = None
 
             def emit_progress(frame_number: int) -> None:
                 if progress_callback:
                     progress_callback(total_frames_scanned, total_frames, frame_number)
 
             for start_frame, end_frame, local_control, local_params in scan_segments:
+                current_segment_tracking_enabled = bool(
+                    local_control.get("FaceTrackingEnableToggle", False)
+                )
+                if (
+                    current_segment_tracking_enabled
+                    and previous_segment_tracking_enabled is False
+                ):
+                    self.main_window.models_processor.face_detectors.reset_tracker()
+                    self._reset_issue_scan_sequential_state()
                 match_context = self._prepare_issue_scan_match_context(
                     local_control, local_params, target_faces_snapshot
                 )
@@ -2860,11 +3008,11 @@ class VideoProcessor(QObject):
                     matched_face_ids: set[str] = set()
                     prepared_targets = match_context["prepared_targets"]
                     for detected_embedding in detected_embeddings:
-                        best_target = self._find_best_target_match_for_scan(
+                        best_target_face_id = self._find_best_target_match_for_scan(
                             detected_embedding, prepared_targets
                         )
-                        if best_target is not None:
-                            matched_face_ids.add(str(best_target.face_id))
+                        if best_target_face_id is not None:
+                            matched_face_ids.add(best_target_face_id)
 
                     for face_id in issue_frames_by_face:
                         if face_id not in matched_face_ids:
@@ -2872,6 +3020,7 @@ class VideoProcessor(QObject):
                     total_frames_scanned += 1
                     emit_progress(frame_number)
                     frame_number += 1
+                previous_segment_tracking_enabled = current_segment_tracking_enabled
 
             faces_with_issues = sum(
                 1 for frames in issue_frames_by_face.values() if frames
@@ -2888,6 +3037,8 @@ class VideoProcessor(QObject):
             self.last_detected_faces = previous_last_detected_faces
             self._smoothed_kps = previous_smoothed_kps
             self._smoothed_dense_kps = previous_smoothed_dense_kps
+            if tracking_enabled:
+                self.main_window.models_processor.face_detectors.reset_tracker()
             self.current_frame_number = (
                 reset_frame_number
                 if reset_frame_number is not None
