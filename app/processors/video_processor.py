@@ -2458,7 +2458,7 @@ class VideoProcessor(QObject):
     def _get_issue_scan_ranges(self) -> List[Tuple[int, int]]:
         """Return the frame ranges that a scan should inspect."""
         max_frame = int(self.max_frame_number)
-        complete_segments: List[Tuple[int, int]] = []
+        scan_ranges: List[Tuple[int, int]] = []
         open_start_frame: Optional[int] = None
 
         for start_frame, end_frame in self.main_window.job_marker_pairs:
@@ -2471,14 +2471,13 @@ class VideoProcessor(QObject):
 
             normalized_end = int(end_frame)
             if normalized_end >= normalized_start:
-                complete_segments.append((normalized_start, normalized_end))
+                scan_ranges.append((normalized_start, normalized_end))
 
-        scan_ranges = sorted(complete_segments)
         if open_start_frame is not None and open_start_frame <= max_frame:
             scan_ranges.append((open_start_frame, max_frame))
 
         if scan_ranges:
-            return scan_ranges
+            return misc_helpers.normalize_issue_scan_ranges(scan_ranges)
 
         return [(0, max_frame)]
 
@@ -2487,28 +2486,54 @@ class VideoProcessor(QObject):
     ) -> str:
         """Return a short human-readable description of the current scan scope."""
         scan_ranges = scan_ranges or self._get_issue_scan_ranges()
+        max_frame = int(self.max_frame_number)
+        if not getattr(self.main_window, "job_marker_pairs", []):
+            return "Scanning full clip"
+        if scan_ranges == [(0, max_frame)]:
+            return "Scanning full clip"
 
-        complete_segments = 0
-        open_start_frame: Optional[int] = None
-        for start_frame, end_frame in self.main_window.job_marker_pairs:
-            if start_frame is None:
-                continue
-            if end_frame is None:
-                open_start_frame = int(start_frame)
-            elif int(end_frame) >= int(start_frame):
-                complete_segments += 1
+        open_start_frames = [
+            int(start_frame)
+            for start_frame, end_frame in self.main_window.job_marker_pairs
+            if start_frame is not None and end_frame is None
+        ]
+        has_open_start = bool(open_start_frames)
+        open_start_frame = min(open_start_frames) if open_start_frames else None
 
-        if complete_segments and open_start_frame is not None:
-            range_label = "range" if complete_segments == 1 else "ranges"
+        if len(scan_ranges) == 1:
+            start_frame, end_frame = scan_ranges[0]
+            if (
+                has_open_start
+                and end_frame == max_frame
+                and open_start_frame is not None
+            ):
+                if start_frame < open_start_frame:
+                    return f"Scanning 1 marked range and record start frame {open_start_frame} to end"
+                if open_start_frame > 0:
+                    return f"Scanning from record start frame {open_start_frame}"
+            return "Scanning 1 marked range"
+
+        effective_complete_segments = len(scan_ranges)
+        effective_open_start_frame: Optional[int] = None
+        if (
+            has_open_start
+            and scan_ranges[-1][1] == max_frame
+            and open_start_frame is not None
+        ):
+            effective_open_start_frame = open_start_frame
+            effective_complete_segments -= 1
+
+        if effective_complete_segments and effective_open_start_frame is not None:
+            range_label = "range" if effective_complete_segments == 1 else "ranges"
             return (
-                f"Scanning {complete_segments} marked {range_label} "
-                f"and record start frame {open_start_frame} to end"
+                f"Scanning {effective_complete_segments} marked {range_label} "
+                f"and record start frame {effective_open_start_frame} to end"
             )
-        if complete_segments:
-            range_label = "range" if complete_segments == 1 else "ranges"
-            return f"Scanning {complete_segments} marked {range_label}"
-        if open_start_frame is not None:
-            return f"Scanning from record start frame {open_start_frame}"
+        if effective_complete_segments:
+            range_label = "range" if effective_complete_segments == 1 else "ranges"
+            return f"Scanning {effective_complete_segments} marked {range_label}"
+        if effective_open_start_frame is not None:
+            return f"Scanning from record start frame {effective_open_start_frame}"
         return "Scanning full clip"
 
     @staticmethod
@@ -2611,6 +2636,7 @@ class VideoProcessor(QObject):
         )
         previous_last_detected_faces = copy.deepcopy(self.last_detected_faces)
         previous_smoothed_kps = copy.deepcopy(self._smoothed_kps)
+        previous_smoothed_dense_kps = copy.deepcopy(self._smoothed_dense_kps)
         total_frames_scanned = 0
         issue_frames_by_face: dict[str, set[int]] = {
             str(face_id): set() for face_id in target_faces_snapshot.keys()
@@ -2619,6 +2645,7 @@ class VideoProcessor(QObject):
         try:
             self.last_detected_faces = []
             self._smoothed_kps = {}
+            self._smoothed_dense_kps = {}
 
             for start_frame, end_frame in scan_ranges:
                 misc_helpers.seek_frame(capture, start_frame)
@@ -2745,6 +2772,7 @@ class VideoProcessor(QObject):
         finally:
             self.last_detected_faces = previous_last_detected_faces
             self._smoothed_kps = previous_smoothed_kps
+            self._smoothed_dense_kps = previous_smoothed_dense_kps
             self.current_frame_number = (
                 reset_frame_number
                 if reset_frame_number is not None

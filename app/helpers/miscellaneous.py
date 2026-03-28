@@ -322,10 +322,11 @@ def count_issue_scan_frames(
     This keeps issue-scan progress and summary stats aligned with the frames that
     render/output will actually keep.
     """
+    normalized_ranges = normalize_issue_scan_ranges(scan_ranges)
     normalized_dropped = sorted({int(frame) for frame in dropped_frames})
     total_frames = 0
 
-    for start_frame, end_frame in scan_ranges:
+    for start_frame, end_frame in normalized_ranges:
         normalized_start = int(start_frame)
         normalized_end = int(end_frame)
         if normalized_end < normalized_start:
@@ -337,6 +338,35 @@ def count_issue_scan_frames(
         total_frames += (normalized_end - normalized_start + 1) - dropped_in_range
 
     return total_frames
+
+
+def normalize_issue_scan_ranges(
+    scan_ranges: Sequence[tuple[int, int]],
+) -> list[tuple[int, int]]:
+    """Return chronologically sorted, overlap-merged scan ranges."""
+    normalized: list[tuple[int, int]] = []
+
+    for start_frame, end_frame in scan_ranges:
+        normalized_start = int(start_frame)
+        normalized_end = int(end_frame)
+        if normalized_end < normalized_start:
+            continue
+        normalized.append((normalized_start, normalized_end))
+
+    if not normalized:
+        return []
+
+    normalized.sort()
+    merged_ranges: list[tuple[int, int]] = [normalized[0]]
+
+    for start_frame, end_frame in normalized[1:]:
+        previous_start, previous_end = merged_ranges[-1]
+        if start_frame <= previous_end:
+            merged_ranges[-1] = (previous_start, max(previous_end, end_frame))
+        else:
+            merged_ranges.append((start_frame, end_frame))
+
+    return merged_ranges
 
 
 # --- Function Definitions ---
