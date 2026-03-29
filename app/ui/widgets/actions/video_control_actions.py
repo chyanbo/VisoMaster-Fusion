@@ -604,10 +604,10 @@ def add_scan_review_controls(main_window: "MainWindow"):
         "Flags likely issue frames for the selected target face.\n"
         "Single-frame preview may differ from playback on borderline frames."
     )
-    run_scan_button.setFlat(True)
     run_scan_button.setSizePolicy(
         QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
     )
+    run_scan_button.setFlat(True)
     run_scan_button.clicked.connect(lambda: toggle_issue_scan(main_window))
     main_window.runScanButton = run_scan_button
 
@@ -1052,9 +1052,6 @@ def _handle_issue_scan_progress(
     run_button = getattr(main_window, "runScanButton", None)
     if run_button is not None:
         run_button.setText(f"Abort Scan ({processed}/{max(total, 1)})")
-        run_button.setToolTip(
-            f"{scope_text}\n{processed}/{total} processed | FPS: {scan_fps:.1f}\nAbort the active issue scan."
-        )
     QtCore.QCoreApplication.processEvents()
 
 

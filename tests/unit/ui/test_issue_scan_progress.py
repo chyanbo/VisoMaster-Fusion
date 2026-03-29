@@ -327,6 +327,9 @@ def test_issue_scan_worker_passes_plain_target_face_snapshot_without_widget_meth
 
 def test_handle_issue_scan_progress_moves_slider_and_updates_abort_button(monkeypatch):
     main_window = _make_scan_main_window()
+    main_window.runScanButton.tooltip = (
+        "Scanning 2 marked ranges\nAbort the active issue scan."
+    )
     monkeypatch.setattr(
         "app.ui.widgets.actions.video_control_actions.QtCore.QCoreApplication.processEvents",
         lambda: None,
@@ -344,7 +347,9 @@ def test_handle_issue_scan_progress_moves_slider_and_updates_abort_button(monkey
     assert main_window.videoSeekSlider.value() == 345
     assert main_window.videoSeekSlider.block_calls == [True, False]
     assert main_window.runScanButton.text == "Abort Scan (12/40)"
-    assert "FPS: 7.2" in main_window.runScanButton.tooltip
+    assert main_window.runScanButton.tooltip == (
+        "Scanning 2 marked ranges\nAbort the active issue scan."
+    )
 
 
 def test_handle_issue_scan_issue_found_merges_and_refreshes_selected_face(monkeypatch):
@@ -401,6 +406,8 @@ def test_run_issue_scan_disables_controls_like_recording_when_keep_controls_off(
     assert main_window.scan_issue_worker is fake_worker
     assert main_window.runScanButton.enabled is True
     assert main_window.runScanButton.text == "Abort Scan"
+    assert "processed" not in main_window.runScanButton.tooltip
+    assert "FPS" not in main_window.runScanButton.tooltip
     assert main_window.issue_frames_by_face == {}
     assert main_window.buttonMediaPlay.enabled is False
     assert main_window.buttonMediaRecord.enabled is False
@@ -441,6 +448,8 @@ def test_run_issue_scan_respects_keep_controls_toggle(monkeypatch):
     assert disabled_calls == []
     assert main_window.runScanButton.enabled is True
     assert main_window.runScanButton.text == "Abort Scan"
+    assert "processed" not in main_window.runScanButton.tooltip
+    assert "FPS" not in main_window.runScanButton.tooltip
     assert main_window.issue_frames_by_face == {}
     assert main_window.prevIssueButton.enabled is False
     assert main_window.nextIssueButton.enabled is False
