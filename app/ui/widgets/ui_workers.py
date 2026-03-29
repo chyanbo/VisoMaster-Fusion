@@ -164,7 +164,8 @@ class TargetMediaLoaderWorker(qtc.QThread):
 
 class IssueScanWorker(qtc.QThread):
     progress = qtc.Signal(int, int, int, float)
-    completed = qtc.Signal(object, int, int, str, float)
+    completed = qtc.Signal(object, int, int, str, float, bool)
+    issue_found = qtc.Signal(str, int)
     cancelled = qtc.Signal()
     failed = qtc.Signal(str)
 
@@ -210,8 +211,12 @@ class IssueScanWorker(qtc.QThread):
                 scan_fps = (processed / elapsed) if elapsed > 0 else 0.0
                 self.progress.emit(processed, total, frame_number, scan_fps)
 
+            def issue_found_callback(face_id: str, frame_number: int) -> None:
+                self.issue_found.emit(str(face_id), int(frame_number))
+
             result = self.main_window.video_processor.scan_issue_frames(
                 progress_callback=progress_with_fps,
+                issue_found_callback=issue_found_callback,
                 is_cancelled=self._cancel_event.is_set,
                 scan_ranges=self._scan_ranges,
                 target_height=self._target_height,
@@ -231,6 +236,7 @@ class IssueScanWorker(qtc.QThread):
                 result["faces_with_issues"],
                 self._scan_scope_text,
                 elapsed_seconds,
+                bool(result.get("cancelled", False)),
             )
         except Exception as exc:
             self.failed.emit(str(exc))

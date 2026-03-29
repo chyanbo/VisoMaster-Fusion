@@ -2806,7 +2806,7 @@ class VideoProcessor(QObject):
         target_faces_snapshot: IssueScanTargetSnapshot = {}
         for target_id, target_face in live_target_faces.items():
             embeddings_by_model: IssueScanTargetEmbeddings = {}
-            for recognition_model, similarity_type in required_embedding_modes:
+            for recognition_model, similarity_type in sorted(required_embedding_modes):
                 model_embeddings = embeddings_by_model.setdefault(recognition_model, {})
                 model_embeddings[similarity_type] = (
                     self._build_issue_scan_target_embedding(
@@ -2826,6 +2826,7 @@ class VideoProcessor(QObject):
     def scan_issue_frames(
         self,
         progress_callback=None,
+        issue_found_callback=None,
         is_cancelled=None,
         scan_ranges: Optional[List[Tuple[int, int]]] = None,
         target_height: Optional[int] = None,
@@ -2906,6 +2907,30 @@ class VideoProcessor(QObject):
                 if progress_callback:
                     progress_callback(total_frames_scanned, total_frames, frame_number)
 
+            def emit_issue(face_id: str, frame_number: int) -> None:
+                normalized_face_id = str(face_id)
+                face_frames = issue_frames_by_face.setdefault(normalized_face_id, set())
+                normalized_frame = int(frame_number)
+                if normalized_frame in face_frames:
+                    return
+                face_frames.add(normalized_frame)
+                if issue_found_callback:
+                    issue_found_callback(normalized_face_id, normalized_frame)
+
+            def build_result(cancelled: bool) -> dict[str, Any]:
+                faces_with_issues = sum(
+                    1 for frames in issue_frames_by_face.values() if frames
+                )
+                return {
+                    "issue_frames_by_face": {
+                        face_id: sorted(frames)
+                        for face_id, frames in issue_frames_by_face.items()
+                    },
+                    "frames_scanned": total_frames_scanned,
+                    "faces_with_issues": faces_with_issues,
+                    "cancelled": cancelled,
+                }
+
             for start_frame, end_frame, local_control, local_params in scan_segments:
                 current_segment_tracking_enabled = bool(
                     local_control.get("FaceTrackingEnableToggle", False)
@@ -2925,7 +2950,7 @@ class VideoProcessor(QObject):
 
                 while frame_number <= end_frame:
                     if is_cancelled and is_cancelled():
-                        return None
+                        return build_result(True)
                     if frame_number in dropped_frames_snapshot:
                         next_frame = frame_number + 1
                         while (
@@ -2945,7 +2970,7 @@ class VideoProcessor(QObject):
                     )
                     if not ret or not isinstance(frame_bgr, numpy.ndarray):
                         for face_id in issue_frames_by_face:
-                            issue_frames_by_face[face_id].add(frame_number)
+                            emit_issue(face_id, frame_number)
                         self.current_frame_number = frame_number + 1
                         misc_helpers.seek_frame(capture, self.current_frame_number)
                         total_frames_scanned += 1
@@ -3016,23 +3041,13 @@ class VideoProcessor(QObject):
 
                     for face_id in issue_frames_by_face:
                         if face_id not in matched_face_ids:
-                            issue_frames_by_face[face_id].add(frame_number)
+                            emit_issue(face_id, frame_number)
                     total_frames_scanned += 1
                     emit_progress(frame_number)
                     frame_number += 1
                 previous_segment_tracking_enabled = current_segment_tracking_enabled
 
-            faces_with_issues = sum(
-                1 for frames in issue_frames_by_face.values() if frames
-            )
-            return {
-                "issue_frames_by_face": {
-                    face_id: sorted(frames)
-                    for face_id, frames in issue_frames_by_face.items()
-                },
-                "frames_scanned": total_frames_scanned,
-                "faces_with_issues": faces_with_issues,
-            }
+            return build_result(False)
         finally:
             self.last_detected_faces = previous_last_detected_faces
             self._smoothed_kps = previous_smoothed_kps
