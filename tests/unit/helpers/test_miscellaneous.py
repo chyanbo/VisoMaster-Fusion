@@ -14,6 +14,7 @@ from app.helpers.miscellaneous import (
     get_file_type,
     get_scaling_transforms,
     image_extensions,
+    normalize_issue_scan_ranges,
     video_extensions,
     _transform_cache,
 )
@@ -252,6 +253,22 @@ def test_count_issue_scan_frames_returns_zero_when_all_frames_dropped():
     scan_ranges = [(10, 12)]
     dropped_frames = {10, 11, 12}
     assert count_issue_scan_frames(scan_ranges, dropped_frames) == 0
+
+
+def test_normalize_issue_scan_ranges_sorts_open_ended_style_ranges():
+    scan_ranges = [(20, 30), (5, 50)]
+    assert normalize_issue_scan_ranges(scan_ranges) == [(5, 50)]
+
+
+def test_normalize_issue_scan_ranges_merges_overlaps():
+    scan_ranges = [(20, 25), (10, 15), (12, 18), (24, 30), (40, 45)]
+    assert normalize_issue_scan_ranges(scan_ranges) == [(10, 18), (20, 30), (40, 45)]
+
+
+def test_count_issue_scan_frames_does_not_double_count_overlaps():
+    scan_ranges = [(10, 20), (15, 25)]
+    dropped_frames = {12, 18, 22}
+    assert count_issue_scan_frames(scan_ranges, dropped_frames) == 13
 
 
 # ---------------------------------------------------------------------------

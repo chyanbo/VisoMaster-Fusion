@@ -604,11 +604,11 @@ def add_scan_review_controls(main_window: "MainWindow"):
         "Flags likely issue frames for the selected target face.\n"
         "Single-frame preview may differ from playback on borderline frames."
     )
-    run_scan_button.setFlat(True)
     run_scan_button.setSizePolicy(
         QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed
     )
-    run_scan_button.clicked.connect(lambda: run_issue_scan(main_window))
+    run_scan_button.setFlat(True)
+    run_scan_button.clicked.connect(lambda: toggle_issue_scan(main_window))
     main_window.runScanButton = run_scan_button
 
     button_specs = [
@@ -794,6 +794,20 @@ def set_issue_frames_for_face(main_window: "MainWindow", face_id, frames):
         refresh_issue_frames_for_selected_face(main_window)
 
 
+def add_issue_frame_for_face(main_window: "MainWindow", face_id, frame_number: int):
+    """Merge a single issue frame into the stored per-face mapping."""
+    if face_id is None:
+        return
+    normalized_face_id = str(face_id)
+    face_frames = main_window.issue_frames_by_face.setdefault(normalized_face_id, set())
+    normalized_frame = int(frame_number)
+    if normalized_frame in face_frames:
+        return
+    face_frames.add(normalized_frame)
+    if normalized_face_id == str(getattr(main_window, "selected_target_face_id", None)):
+        refresh_issue_frames_for_selected_face(main_window)
+
+
 def set_issue_frames_by_face(main_window: "MainWindow", frames_by_face):
     """Replaces all stored issue results and refreshes visible markers for the selected face."""
     normalized_mapping: dict[str, set[int]] = {}
@@ -889,18 +903,162 @@ def move_slider_to_previous_issue(main_window: "MainWindow"):
     _move_slider_to_nearest_issue(main_window, "previous")
 
 
+def _set_slider_frame_without_side_effects(
+    main_window: "MainWindow", frame_number: int
+) -> None:
+    slider = main_window.videoSeekSlider
+    slider.blockSignals(True)
+    slider.setValue(int(frame_number))
+    slider.blockSignals(False)
+    slider.update()
+
+
+def _get_issue_scan_ui_state(main_window: "MainWindow") -> dict:
+    state = getattr(main_window, "scan_issue_ui_state", None)
+    if state is None:
+        state = {}
+        main_window.scan_issue_ui_state = state
+    return state
+
+
+def _restore_issue_scan_display(main_window: "MainWindow") -> None:
+    video_processor = getattr(main_window, "video_processor", None)
+    process_current_frame = getattr(video_processor, "process_current_frame", None)
+    if callable(process_current_frame):
+        process_current_frame()
+
+
+def _set_issue_scan_tool_button_state(
+    main_window: "MainWindow", scan_active: bool
+) -> None:
+    run_button = getattr(main_window, "runScanButton", None)
+    if run_button is not None:
+        run_button.setEnabled(
+            True if scan_active else bool(getattr(main_window, "target_faces", {}))
+        )
+
+    for button_name in (
+        "prevIssueButton",
+        "nextIssueButton",
+        "dropFrameButton",
+        "dropAllIssueFramesButton",
+        "clearScanResultsButton",
+        "clearDroppedFramesButton",
+    ):
+        button = getattr(main_window, button_name, None)
+        if button is not None:
+            button.setEnabled(not scan_active)
+
+
+def _start_issue_scan_ui(main_window: "MainWindow", worker, scope_text: str) -> None:
+    state = _get_issue_scan_ui_state(main_window)
+    state.clear()
+    state.update(
+        {
+            "active": True,
+            "start_frame": int(main_window.videoSeekSlider.value()),
+            "scope_text": scope_text,
+            "keep_controls": bool(main_window.control.get("KeepControlsToggle", False)),
+        }
+    )
+
+    if not state["keep_controls"]:
+        layout_actions.disable_all_parameters_and_control_widget(main_window)
+
+    _set_issue_scan_tool_button_state(main_window, True)
+
+    run_button = getattr(main_window, "runScanButton", None)
+    if run_button is not None:
+        run_button.setText("Abort Scan")
+        run_button.setToolTip(
+            f"{scope_text}\nAbort the active issue scan and keep the issue frames found so far."
+        )
+
+    play_button = getattr(main_window, "buttonMediaPlay", None)
+    if play_button is not None:
+        play_button.setEnabled(False)
+
+    record_button = getattr(main_window, "buttonMediaRecord", None)
+    if record_button is not None:
+        record_button.setEnabled(False)
+
+    toggle_button = getattr(main_window, "scanToolsToggleButton", None)
+    if toggle_button is not None:
+        toggle_button.setEnabled(False)
+
+    QtCore.QCoreApplication.processEvents()
+
+
+def _restore_issue_scan_ui(main_window: "MainWindow") -> None:
+    state = _get_issue_scan_ui_state(main_window)
+    if not state.get("active"):
+        return
+
+    if not state.get("keep_controls", False):
+        layout_actions.enable_all_parameters_and_control_widget(main_window)
+
+    start_frame = int(state.get("start_frame", main_window.videoSeekSlider.value()))
+    _set_slider_frame_without_side_effects(main_window, start_frame)
+    main_window.video_processor.current_frame_number = start_frame
+
+    run_button = getattr(main_window, "runScanButton", None)
+    if run_button is not None:
+        run_button.setText("Scan for Issues")
+        run_button.setToolTip(
+            "Scans the current render range using your current settings.\n"
+            "If record markers exist, only those ranges are scanned.\n"
+            "Saved settings markers are applied during the scan.\n"
+            "Flags likely issue frames for the selected target face.\n"
+            "Single-frame preview may differ from playback on borderline frames."
+        )
+
+    play_button = getattr(main_window, "buttonMediaPlay", None)
+    if play_button is not None:
+        play_button.setEnabled(True)
+
+    record_button = getattr(main_window, "buttonMediaRecord", None)
+    if record_button is not None:
+        record_button.setEnabled(True)
+
+    toggle_button = getattr(main_window, "scanToolsToggleButton", None)
+    if toggle_button is not None:
+        toggle_button.setEnabled(True)
+
+    state.clear()
+    _set_issue_scan_tool_button_state(main_window, False)
+    update_scan_review_button_states(main_window)
+    update_drop_frame_button_label(main_window)
+    _restore_issue_scan_display(main_window)
+    QtCore.QCoreApplication.processEvents()
+
+
+def toggle_issue_scan(main_window: "MainWindow") -> None:
+    worker = getattr(main_window, "scan_issue_worker", None)
+    if worker is not None:
+        worker.cancel()
+        return
+    run_issue_scan(main_window)
+
+
 def _handle_issue_scan_progress(
     main_window: "MainWindow",
     scope_text: str,
     processed: int,
     total: int,
     frame_number: int,
+    scan_fps: float,
 ):
-    dialog = main_window.scan_progress_dialog
-    dialog.setMaximum(max(total, 1))
-    dialog.setValue(min(processed, max(total, 1)))
-    dialog.setLabelText(f"{scope_text}\nScanning frame {frame_number} of {total}...")
+    _set_slider_frame_without_side_effects(main_window, frame_number)
+    run_button = getattr(main_window, "runScanButton", None)
+    if run_button is not None:
+        run_button.setText(f"Abort Scan ({processed}/{max(total, 1)})")
     QtCore.QCoreApplication.processEvents()
+
+
+def _handle_issue_scan_issue_found(
+    main_window: "MainWindow", face_id: str, frame_number: int
+) -> None:
+    add_issue_frame_for_face(main_window, face_id, frame_number)
 
 
 def _cleanup_issue_scan_worker(main_window: "MainWindow"):
@@ -910,15 +1068,6 @@ def _cleanup_issue_scan_worker(main_window: "MainWindow"):
         main_window.scan_issue_worker = None
 
 
-def _finish_issue_scan_dialog(main_window: "MainWindow"):
-    dialog = main_window.scan_progress_dialog
-    try:
-        dialog.canceled.disconnect()
-    except RuntimeError:
-        pass
-    dialog.close()
-
-
 def _handle_issue_scan_completed(
     main_window: "MainWindow",
     issue_frames_by_face: dict,
@@ -926,18 +1075,26 @@ def _handle_issue_scan_completed(
     faces_with_issues: int,
     scope_text: str,
     elapsed_seconds: float,
+    cancelled: bool = False,
 ):
     set_issue_frames_by_face(main_window, issue_frames_by_face)
-    _finish_issue_scan_dialog(main_window)
+    _restore_issue_scan_ui(main_window)
     _cleanup_issue_scan_worker(main_window)
     total_issue_frames = sum(
         len(set(frames)) for frames in issue_frames_by_face.values()
     )
     scan_fps = (frames_scanned / elapsed_seconds) if elapsed_seconds > 0 else 0.0
     print(
-        f"[INFO] Scan: Scope: {scope_text.removeprefix('Scanning ')} | Frames: {frames_scanned} | Time: {elapsed_seconds:.1f}s | FPS: {scan_fps:.1f} | Issues: {total_issue_frames} | Faces with issues: {faces_with_issues}"
+        f"[INFO] Scan: Scope: {scope_text.removeprefix('Scanning ')} | Frames: {frames_scanned} | Time: {elapsed_seconds:.1f}s | FPS: {scan_fps:.1f} | Issues: {total_issue_frames} | Faces with issues: {faces_with_issues} | Cancelled: {cancelled}"
     )
-    if total_issue_frames:
+    if cancelled:
+        common_widget_actions.create_and_show_toast_message(
+            main_window,
+            "Scan Aborted",
+            f"Stopped after {frames_scanned} scanned frames. Kept {total_issue_frames} issue frames found so far.",
+            style_type="warning",
+        )
+    elif total_issue_frames:
         common_widget_actions.create_and_show_toast_message(
             main_window,
             "Scan Complete",
@@ -952,24 +1109,24 @@ def _handle_issue_scan_completed(
 
 
 def _handle_issue_scan_cancelled(main_window: "MainWindow"):
-    _finish_issue_scan_dialog(main_window)
+    _restore_issue_scan_ui(main_window)
     _cleanup_issue_scan_worker(main_window)
     common_widget_actions.create_and_show_toast_message(
         main_window,
         "Scan Cancelled",
-        "Issue scan aborted. Previous scan results were kept.",
+        "Issue scan aborted before finalizing. Kept any issue frames found so far.",
         style_type="warning",
     )
 
 
 def _handle_issue_scan_failed(main_window: "MainWindow", error_message: str):
-    _finish_issue_scan_dialog(main_window)
+    _restore_issue_scan_ui(main_window)
     _cleanup_issue_scan_worker(main_window)
     common_widget_actions.create_and_show_messagebox(
         main_window,
         "Scan Failed",
         error_message,
-        main_window.scan_progress_dialog,
+        main_window.runScanButton,
     )
 
 
@@ -1009,13 +1166,20 @@ def run_issue_scan(main_window: "MainWindow"):
     worker = ui_workers.IssueScanWorker(main_window)
     main_window.scan_issue_worker = worker
     scope_text = worker._scan_scope_text
+    set_issue_frames_by_face(main_window, {})
+    _start_issue_scan_ui(main_window, worker, scope_text)
     worker.progress.connect(
-        lambda processed, total, frame_number: _handle_issue_scan_progress(
-            main_window, scope_text, processed, total, frame_number
+        lambda processed, total, frame_number, scan_fps: _handle_issue_scan_progress(
+            main_window, scope_text, processed, total, frame_number, scan_fps
+        )
+    )
+    worker.issue_found.connect(
+        lambda face_id, frame_number: _handle_issue_scan_issue_found(
+            main_window, face_id, frame_number
         )
     )
     worker.completed.connect(
-        lambda issue_frames_by_face, frames_scanned, faces_with_issues, completed_scope_text, elapsed_seconds: (
+        lambda issue_frames_by_face, frames_scanned, faces_with_issues, completed_scope_text, elapsed_seconds, cancelled: (
             _handle_issue_scan_completed(
                 main_window,
                 issue_frames_by_face,
@@ -1023,6 +1187,7 @@ def run_issue_scan(main_window: "MainWindow"):
                 faces_with_issues,
                 completed_scope_text,
                 elapsed_seconds,
+                cancelled,
             )
         )
     )
@@ -1030,19 +1195,6 @@ def run_issue_scan(main_window: "MainWindow"):
     worker.failed.connect(
         lambda error_message: _handle_issue_scan_failed(main_window, error_message)
     )
-
-    dialog = main_window.scan_progress_dialog
-    try:
-        dialog.canceled.disconnect()
-    except RuntimeError:
-        pass
-    dialog.setWindowTitle("Scan")
-    dialog.setLabelText(f"{scope_text}\nPreparing scan...")
-    dialog.setRange(0, 1)
-    dialog.setValue(0)
-    dialog.setMinimumWidth(420)
-    dialog.canceled.connect(worker.cancel)
-    dialog.show()
     worker.start()
 
 
