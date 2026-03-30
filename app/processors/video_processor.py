@@ -143,7 +143,6 @@ class VideoProcessor(QObject):
         )
         self.triggered_by_job_manager: bool = False  # For multi-segment job integration
         self.active_output_folder: str = ""
-        self.last_output_folder: str = ""
 
         # --- Subprocesses ---
         self.virtcam: pyvirtualcam.Camera | None = None
@@ -4493,7 +4492,6 @@ class VideoProcessor(QObject):
             )
 
         output_dir = os.path.dirname(final_file_path)
-        self.last_output_folder = output_dir
 
         # Check if output_dir is not an empty string before creating it
         if output_dir and not os.path.exists(output_dir):
@@ -4661,7 +4659,7 @@ class VideoProcessor(QObject):
             if self.main_window.control["OpenOutputToggle"]:
                 try:
                     list_view_actions.open_output_media_folder(
-                        self.main_window, self.last_output_folder
+                        self.main_window, output_dir
                     )
                 except Exception:
                     pass

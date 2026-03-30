@@ -2065,7 +2065,6 @@ def save_current_frame_to_file(main_window: "MainWindow"):
                 "Image Saved",
                 f"Saved Current Image to file: {save_filename}",
             )
-            main_window.video_processor.last_output_folder = output_folder
 
     else:
         common_widget_actions.create_and_show_messagebox(
@@ -2390,7 +2389,6 @@ def process_batch_images(main_window: "MainWindow", process_all_faces: bool):
                         else:
                             pil_image.save(save_filename, "PNG")
                         processed_count += 1
-                        main_window.video_processor.last_output_folder = output_folder
                     else:
                         raise Exception("Could not generate output filename.")
 
