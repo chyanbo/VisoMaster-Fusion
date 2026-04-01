@@ -69,6 +69,7 @@ class FrameWorker(threading.Thread):
 
     # Q-IMP-04: minimum face bounding-box side length (pixels) to process
     _MIN_FACE_PIXELS: int = 20
+    preview_generation: int
 
     def __init__(
         self,
@@ -154,6 +155,7 @@ class FrameWorker(threading.Thread):
             frame_number  # Will be -1 in pool mode until a task is dequeued
         )
         self.is_single_frame = is_single_frame
+        self.preview_generation = 0
 
         # Determine mode & Thread Name
         self.is_pool_worker = (frame_queue is not None) and (worker_id != -1)
@@ -448,7 +450,10 @@ class FrameWorker(threading.Thread):
                 )
             else:  # Single frame processing (image or paused video)
                 self.video_processor.single_frame_processed_signal.emit(
-                    self.frame_number, self.frame
+                    getattr(self, "preview_generation", 0),
+                    self.frame_number,
+                    self.frame,
+                    None,
                 )
 
         except Exception as e:
