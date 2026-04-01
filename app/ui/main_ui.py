@@ -145,6 +145,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.parameters_list = {}
         self.control: ControlTypes = {}
         self.parameter_widgets: ParametersWidgetTypes = {}
+        self.parameter_section_states: dict[str, bool] = {}
+        self.parameter_sections: dict[str, widget_components.CollapsibleSection] = {}
 
         # UNet related
         self.previous_kv_file_selection = ""
@@ -385,18 +387,21 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             LAYOUT_DATA=COMMON_LAYOUT_DATA,
             layoutWidget=self.commonWidgetsLayout,
             data_type="parameter",
+            section_namespace="common",
         )
         layout_actions.add_widgets_to_tab_layout(
             self,
             LAYOUT_DATA=DENOISER_LAYOUT_DATA,
             layoutWidget=self.denoiserWidgetsLayout,
             data_type="control",
+            section_namespace="denoiser",
         )
         layout_actions.add_widgets_to_tab_layout(
             self,
             LAYOUT_DATA=SWAPPER_LAYOUT_DATA,
             layoutWidget=self.swapWidgetsLayout,
             data_type="parameter",
+            section_namespace="swapper",
         )
         self._connect_mask_show_selection_sync()
         layout_actions.add_widgets_to_tab_layout(
@@ -404,12 +409,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             LAYOUT_DATA=SETTINGS_LAYOUT_DATA,
             layoutWidget=self.settingsWidgetsLayout,
             data_type="control",
+            section_namespace="settings",
         )
         layout_actions.add_widgets_to_tab_layout(
             self,
             LAYOUT_DATA=FACE_EDITOR_LAYOUT_DATA,
             layoutWidget=self.faceEditorWidgetsLayout,
             data_type="parameter",
+            section_namespace="face_editor",
         )
 
         # Set up output folder select button (It is inside the settings tab Widget)
@@ -872,6 +879,33 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             # Re-populate and set current selection for dynamic widgets like DenoiserUNetModelSelection
             self._populate_denoiser_unet_models()
             self._populate_reference_kv_tensors()
+
+    def register_parameter_section(
+        self,
+        section_id: str,
+        section_widget: widget_components.CollapsibleSection,
+    ):
+        self.parameter_sections[section_id] = section_widget
+        expanded = self.parameter_section_states.get(section_id, True)
+        self.parameter_section_states[section_id] = expanded
+        section_widget.set_expanded(expanded, animate=False, update_state=False)
+
+    def apply_parameter_section_states(
+        self, section_states: dict[str, bool] | None = None
+    ):
+        if section_states is None:
+            for section_id, section_widget in self.parameter_sections.items():
+                self.parameter_section_states[section_id] = True
+                section_widget.set_expanded(True, animate=False, update_state=False)
+            return
+
+        for section_id, expanded in section_states.items():
+            self.parameter_section_states[section_id] = bool(expanded)
+
+        for section_id, section_widget in self.parameter_sections.items():
+            expanded = bool(section_states.get(section_id, True))
+            self.parameter_section_states[section_id] = expanded
+            section_widget.set_expanded(expanded, animate=False, update_state=False)
 
     @QtCore.Slot(bool)
     def _on_faces_panel_toggled(self, checked: bool):

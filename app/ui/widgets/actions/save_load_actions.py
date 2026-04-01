@@ -751,6 +751,12 @@ def load_saved_workspace(
                 video_control_actions.set_scan_tools_expanded(
                     main_window, window_state.get("scan_tools_expanded", False)
                 )
+            parameter_section_states = None
+            if "parameter_section_states" in window_state:
+                parameter_section_states = window_state["parameter_section_states"]
+            elif "parameter_section_states" in data:
+                parameter_section_states = data["parameter_section_states"]
+            main_window.apply_parameter_section_states(parameter_section_states)
             filter_actions.filter_target_videos(main_window)
             list_view_actions.load_target_webcams(main_window)
 
@@ -833,6 +839,10 @@ def save_current_workspace(
         "filterVideosCheckBox": main_window.filterVideosCheckBox.isChecked(),
         "filterWebcamsCheckBox": main_window.filterWebcamsCheckBox.isChecked(),
         "scan_tools_expanded": getattr(main_window, "scan_tools_expanded", False),
+        "parameter_section_states": {
+            section_id: bool(expanded)
+            for section_id, expanded in main_window.parameter_section_states.items()
+        },
         "dock_state": dock_state_data,
     }
 

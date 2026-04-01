@@ -558,6 +558,10 @@ def _load_job_markers(main_window: "MainWindow", data: dict):
         video_control_actions.set_scan_tools_expanded(
             main_window, data.get("scan_tools_expanded", False)
         )
+    parameter_section_states = (
+        data["parameter_section_states"] if "parameter_section_states" in data else None
+    )
+    main_window.apply_parameter_section_states(parameter_section_states)
 
 
 def _begin_batch_refresh_suppression(main_window: "MainWindow") -> bool:
@@ -1170,6 +1174,10 @@ def _serialize_job_data(main_window: "MainWindow") -> dict:
         },
         "dropped_frames": sorted(main_window.dropped_frames),
         "scan_tools_expanded": getattr(main_window, "scan_tools_expanded", False),
+        "parameter_section_states": {
+            section_id: bool(expanded)
+            for section_id, expanded in main_window.parameter_section_states.items()
+        },
         "job_marker_pairs": copy.deepcopy(main_window.job_marker_pairs),
         "selected_media_id": selected_media_id,
         "swap_faces_enabled": main_window.swapfacesButton.isChecked(),

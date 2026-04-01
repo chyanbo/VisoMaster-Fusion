@@ -1,5 +1,6 @@
 from typing import TYPE_CHECKING, cast, Union, List, Callable
 from functools import partial
+import re
 
 from PySide6 import QtWidgets, QtCore, QtGui
 
@@ -21,12 +22,18 @@ def add_widgets_to_tab_layout(
     LAYOUT_DATA: LayoutDictTypes,
     layoutWidget: QtWidgets.QVBoxLayout,
     data_type="parameter",
+    section_namespace: str = "default",
 ):
     layout = QtWidgets.QVBoxLayout()
     layout.setContentsMargins(0, 0, 10, 0)
     scroll_area = QtWidgets.QScrollArea()
     scroll_area.setWidgetResizable(True)
+    scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
     scroll_content = QtWidgets.QWidget()
+    scroll_content.setSizePolicy(
+        QtWidgets.QSizePolicy.Policy.Expanding,
+        QtWidgets.QSizePolicy.Policy.Preferred,
+    )
     scroll_content.setLayout(layout)
     scroll_area.setWidget(scroll_content)
     scroll_area.setFrameShape(QtWidgets.QFrame.NoFrame)
@@ -41,10 +48,21 @@ def add_widgets_to_tab_layout(
         category_layout.addRow(horizontal_layout)
         return horizontal_layout
 
+    def build_section_id(category_name: str) -> str:
+        normalized_name = re.sub(r"[^a-z0-9]+", "_", category_name.lower()).strip("_")
+        return f"{section_namespace}:{normalized_name}"
+
     for category, widgets in LAYOUT_DATA.items():
-        group_box = widget_components.FormGroupBox(main_window, title=category)
+        section_id = build_section_id(category)
+        group_box = widget_components.CollapsibleSection(
+            main_window,
+            title=category,
+            section_id=section_id,
+            expanded=main_window.parameter_section_states.get(section_id, True),
+        )
         category_layout = QtWidgets.QFormLayout()
-        group_box.setLayout(category_layout)
+        group_box.content_widget.setLayout(category_layout)
+        main_window.register_parameter_section(section_id, group_box)
 
         for widget_name, widget_data in widgets.items():
             spacing_level = cast(int, widget_data["level"])
@@ -516,6 +534,8 @@ def add_widgets_to_tab_layout(
         category_layout.setHorizontalSpacing(2)
         layout.addWidget(group_box)
 
+    layout.addStretch(1)
+
     layoutWidget.addWidget(scroll_area)
 
     # Default show/hide widgets
@@ -786,6 +806,12 @@ def set_all_parameters_and_control_widgets_enabled(
     ):
         if hasattr(main_window, attr_name):
             getattr(main_window, attr_name).setDisabled(disabled)
+
+    # Compare/mask toolbar toggles
+    if hasattr(main_window, "faceCompareToggleButton"):
+        main_window.faceCompareToggleButton.setDisabled(disabled)
+    if hasattr(main_window, "faceMaskToggleButton"):
+        main_window.faceMaskToggleButton.setDisabled(disabled)
 
     # List items
     for _, embed_button in main_window.merged_embeddings.items():
