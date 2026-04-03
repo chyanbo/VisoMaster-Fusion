@@ -777,7 +777,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             case QtCore.Qt.Key_Escape:
                 if getattr(self, "is_theatre_mode", False):
                     video_control_actions.toggle_theatre_mode(self)
-                elif self.isFullScreen() or getattr(self, "is_full_screen", False):
+                elif self.isFullScreen():
                     video_control_actions.view_fullscreen(self)
             case QtCore.Qt.Key_F11:
                 video_control_actions.view_fullscreen(self)
