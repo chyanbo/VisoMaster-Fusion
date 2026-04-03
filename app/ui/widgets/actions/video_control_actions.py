@@ -1312,17 +1312,40 @@ def delete_all_markers(main_window: "MainWindow"):
 
 
 def view_fullscreen(main_window: "MainWindow"):
-    """Toggle fullscreen or update the remembered fullscreen base while theatre mode is active."""
-    if getattr(main_window, "is_theatre_mode", False):
-        main_window._was_custom_fullscreen = not bool(
-            getattr(main_window, "_was_custom_fullscreen", False)
-        )
-    elif main_window.isFullScreen():
-        main_window.showNormal()  # Exit full-screen mode
-    else:
-        main_window.showFullScreen()  # Enter full-screen mode
+    """Toggle fullscreen, briefly exiting/re-entering theatre mode when needed."""
+
+    def _apply_fullscreen_toggle():
+        if main_window.isFullScreen():
+            main_window.showNormal()  # Exit full-screen mode
+            main_window.is_full_screen = False
+        else:
+            main_window.showFullScreen()  # Enter full-screen mode
+            main_window.is_full_screen = True
 
     sync_actions = getattr(main_window, "_sync_viewer_menu_actions", None)
+
+    if getattr(main_window, "_fullscreen_theatre_transition_in_progress", False):
+        return
+
+    if getattr(main_window, "is_theatre_mode", False):
+        main_window._fullscreen_theatre_transition_in_progress = True
+        toggle_theatre_mode(main_window)
+        _apply_fullscreen_toggle()
+
+        def _reenter_theatre():
+            try:
+                if not getattr(main_window, "is_theatre_mode", False):
+                    toggle_theatre_mode(main_window)
+            finally:
+                main_window._fullscreen_theatre_transition_in_progress = False
+                if callable(sync_actions):
+                    sync_actions()
+
+        QtCore.QTimer.singleShot(0, _reenter_theatre)
+        return
+
+    _apply_fullscreen_toggle()
+
     if callable(sync_actions):
         sync_actions()
 
@@ -2751,6 +2774,7 @@ def toggle_theatre_mode(main_window: "MainWindow"):
     Role: Activates Theatre Mode by safely detaching UI elements and preventing layout crushing.
     Impact: Solves the "squashed text" bug and preserves exact QDockWidget sizes using saveState/restoreState.
     """
+
     is_theatre = getattr(main_window, "is_theatre_mode", False)
     if not is_theatre:
         # --- ENTER THEATRE MODE ---
@@ -2759,9 +2783,7 @@ def toggle_theatre_mode(main_window: "MainWindow"):
         # 0. Save the exact state of all docks and toolbars (sizes, proportions, splitters)
         main_window._saved_window_state = main_window.saveState()
         main_window._was_maximized = main_window.isMaximized()
-        main_window._was_custom_fullscreen = getattr(
-            main_window, "is_full_screen", False
-        )
+        main_window._was_custom_fullscreen = main_window.isFullScreen()
         if main_window.isMaximized() or main_window.isFullScreen():
             main_window._was_normal_geometry = main_window.normalGeometry()
         else:
@@ -2841,8 +2863,14 @@ def toggle_theatre_mode(main_window: "MainWindow"):
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
-        # 6. Switch to Fullscreen
-        main_window.showFullScreen()
+        # 6. Preserve the base window mode; only remain fullscreen if already fullscreen.
+        if main_window._was_custom_fullscreen:
+            main_window.setWindowState(QtCore.Qt.WindowState.WindowFullScreen)
+            main_window.showFullScreen()
+            QtWidgets.QApplication.processEvents()
+            main_window.is_full_screen = True
+        else:
+            main_window.is_full_screen = False
 
         # 7. Activate Hover Timer for media controls overlay
         if not hasattr(main_window, "theatre_hover_timer"):
@@ -2936,13 +2964,19 @@ def toggle_theatre_mode(main_window: "MainWindow"):
         # Exit Fullscreen mode
         was_custom_fullscreen = getattr(main_window, "_was_custom_fullscreen", False)
         was_maximized = getattr(main_window, "_was_maximized", False)
+        saved_normal_geometry = getattr(main_window, "_was_normal_geometry", None)
 
         if was_custom_fullscreen:
             main_window.showFullScreen()
+            main_window.is_full_screen = True
         elif was_maximized:
             main_window.showMaximized()
+            main_window.is_full_screen = False
         else:
             main_window.showNormal()
+            if saved_normal_geometry is not None:
+                main_window.setGeometry(saved_normal_geometry)
+            main_window.is_full_screen = False
 
         # Restores the exact layout state of docks (fixes the Input Faces / Target Video sizing)
         if hasattr(main_window, "_saved_window_state"):
