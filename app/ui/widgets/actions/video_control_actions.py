@@ -1312,15 +1312,19 @@ def delete_all_markers(main_window: "MainWindow"):
 
 
 def view_fullscreen(main_window: "MainWindow"):
-    """Toggles the main window between full-screen and normal mode, hiding/showing the menu bar."""
-    if main_window.is_full_screen:
+    """Toggle fullscreen or update the remembered fullscreen base while theatre mode is active."""
+    if getattr(main_window, "is_theatre_mode", False):
+        main_window._was_custom_fullscreen = not bool(
+            getattr(main_window, "_was_custom_fullscreen", False)
+        )
+    elif main_window.isFullScreen():
         main_window.showNormal()  # Exit full-screen mode
-        main_window.menuBar().show()
     else:
         main_window.showFullScreen()  # Enter full-screen mode
-        main_window.menuBar().hide()
 
-    main_window.is_full_screen = not main_window.is_full_screen
+    sync_actions = getattr(main_window, "_sync_viewer_menu_actions", None)
+    if callable(sync_actions):
+        sync_actions()
 
 
 def fit_view_to_current_image(main_window: "MainWindow"):
@@ -1641,6 +1645,7 @@ def record_video(main_window: "MainWindow", checked: bool):
             print(
                 "[INFO] Record button pressed: Starting default recording (full video or from slider)."
             )
+            _disable_compare_preview_modes_for_recording(main_window)
             set_record_button_icon_to_stop(main_window)
             # Disable play button during recording
             main_window.buttonMediaPlay.setEnabled(False)
