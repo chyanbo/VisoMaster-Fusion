@@ -223,6 +223,7 @@ class FrameWorker(threading.Thread):
         self.precomputed_bboxes: Optional[list] = None
         self.precomputed_kpss_5: Optional[list] = None
         self.precomputed_kpss: Optional[list] = None
+        self.precomputed_kpss_203: Optional[list] = None
 
         # --- OPTIMIZATION: Cached Convolution Kernels (VRAM) ---
         # Pre-allocating mathematical filters prevents massive CPU-to-GPU
@@ -306,6 +307,7 @@ class FrameWorker(threading.Thread):
                         self.precomputed_bboxes,
                         self.precomputed_kpss_5,
                         self.precomputed_kpss,
+                        self.precomputed_kpss_203,
                     ) = task
 
                     # Store them locally in the worker
@@ -1125,12 +1127,8 @@ class FrameWorker(threading.Thread):
         - Stitching back
         """
         # FW-RACE-02: read from snapshotted feeder state instead of live Qt button
-        swap_button_is_checked_global = self.local_control_state_from_feeder.get(
-            "swap_enabled", True
-        )
-        edit_button_is_checked_global = self.local_control_state_from_feeder.get(
-            "edit_enabled", True
-        )
+        swap_button_is_checked_global = self.main_window.swapfacesButton.isChecked()
+        edit_button_is_checked_global = self.main_window.editFacesButton.isChecked()
 
         # VR-08: cache the EquirectangularConverter instance at worker level.
         # When the frame size is unchanged (common for video), reuse the cached
@@ -1922,12 +1920,8 @@ class FrameWorker(threading.Thread):
         - Overlays (BBox, Landmarks, Comparison)
         """
         # FW-RACE-02: read button state from snapshotted feeder dict, not live Qt buttons
-        swap_button_is_checked_global = self.local_control_state_from_feeder.get(
-            "swap_enabled", True
-        )
-        edit_button_is_checked_global = self.local_control_state_from_feeder.get(
-            "edit_enabled", True
-        )
+        swap_button_is_checked_global = self.main_window.swapfacesButton.isChecked()
+        edit_button_is_checked_global = self.main_window.editFacesButton.isChecked()
 
         # FW-RACE-01: snapshot target_faces under lock so the worker thread never
         # iterates the live dict while the UI thread may be modifying it.
@@ -2012,6 +2006,7 @@ class FrameWorker(threading.Thread):
             bboxes = self.precomputed_bboxes
             kpss_5 = self.precomputed_kpss_5
             kpss = self.precomputed_kpss
+            kpss_203 = self.precomputed_kpss_203
         else:
             # 2. Fallback Path (Single-Frame Mode / Static Images)
             use_landmark, landmark_mode, from_points = (
@@ -2019,10 +2014,40 @@ class FrameWorker(threading.Thread):
                 control.get("LandmarkDetectModelSelection", "203"),
                 control.get("DetectFromPointsToggle", False),
             )
-            if edit_button_is_checked_global:
-                use_landmark, landmark_mode, from_points = True, "203", True
 
-            # Run detection strictly for this single image
+            # Identify if 203 points are strictly required by an advanced feature
+            requires_203 = False
+            from collections.abc import Mapping
+
+            for face_params in self.parameters.values():
+                if isinstance(face_params, Mapping):
+                    is_face_editor_active = (
+                        edit_button_is_checked_global
+                        and face_params.get("FaceEditorEnableToggle", False)
+                    )
+                    is_expression_active = face_params.get(
+                        "FaceExpressionEnableBothToggle", False
+                    )
+                    is_auto_mouth_active = face_params.get(
+                        "AutoMouthExpressionEnableToggle", False
+                    )
+                    is_makeup_active = edit_button_is_checked_global and (
+                        face_params.get("FaceMakeupEnableToggle", False)
+                        or face_params.get("HairMakeupEnableToggle", False)
+                        or face_params.get("EyeBrowsMakeupEnableToggle", False)
+                        or face_params.get("LipsMakeupEnableToggle", False)
+                    )
+
+                    if (
+                        is_face_editor_active
+                        or is_expression_active
+                        or is_auto_mouth_active
+                        or is_makeup_active
+                    ):
+                        requires_203 = True
+                        break
+
+            # STEP 1: Standard detection respecting User's choice
             bboxes, kpss_5, kpss = self.models_processor.run_detect(
                 img,
                 control.get("DetectorModelSelection", "RetinaFace"),
@@ -2037,9 +2062,36 @@ class FrameWorker(threading.Thread):
                 if not control.get("AutoRotationToggle", False)
                 else [0, 90, 180, 270],
                 use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
-                previous_detections=None,  # No historical tracking for single images
-                bypass_bytetrack=True,  # Bypassing ByteTrack to avoid corrupting the global Kalman filter state
+                previous_detections=None,
+                bypass_bytetrack=True,
             )
+
+            # STEP 2: Smart Double-Scan for 203 points
+            kpss_203 = None
+            if requires_203:
+                if use_landmark and landmark_mode == "203":
+                    # OPTIMIZATION: 203 was already extracted by the user's choice. Zero CUDA cost.
+                    kpss_203 = kpss
+                else:
+                    # Extract 203 specifically for advanced features
+                    _, _, kpss_203 = self.models_processor.run_detect(
+                        img,
+                        control.get("DetectorModelSelection", "RetinaFace"),
+                        max_num=control.get("MaxFacesToDetectSlider", 1),
+                        score=control.get("DetectorScoreSlider", 50) / 100.0,
+                        input_size=(512, 512),
+                        use_landmark_detection=True,
+                        landmark_detect_mode="203",
+                        landmark_score=control.get("LandmarkDetectScoreSlider", 50)
+                        / 100.0,
+                        from_points=from_points,
+                        rotation_angles=[0]
+                        if not control.get("AutoRotationToggle", False)
+                        else [0, 90, 180, 270],
+                        use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
+                        previous_detections=None,
+                        bypass_bytetrack=True,
+                    )
 
         if (
             isinstance(kpss_5, np.ndarray)
@@ -2059,12 +2111,18 @@ class FrameWorker(threading.Thread):
                     control["SimilarityTypeSelection"],
                     control["RecognitionModelSelection"],
                 )
-                # FW-BUG-01: bounds check before indexing kpss
+
                 kps_all_i = kpss[i] if kpss is not None and i < len(kpss) else None
+                # NEW: Extract the 203 points specifically
+                kps_203_i = (
+                    kpss_203[i] if kpss_203 is not None and i < len(kpss_203) else None
+                )
+
                 det_faces_data_for_display.append(
                     {
                         "kps_5": kpss_5[i],
                         "kps_all": kps_all_i,
+                        "kps_203": kps_203_i,
                         "embedding": face_emb,
                         "bbox": bboxes[i],
                         "original_face": None,
@@ -2184,6 +2242,7 @@ class FrameWorker(threading.Thread):
                                 img,
                                 best_fface["kps_5"],
                                 best_fface["kps_all"],
+                                kps_203=best_fface.get("kps_203"),
                                 s_e=s_e,
                                 t_e=target_face.get_embedding(arcface_model),
                                 parameters=_params_for_swap_a,
@@ -2200,8 +2259,13 @@ class FrameWorker(threading.Thread):
                                     "LipsMakeupEnableToggle",
                                 )
                             ):
+                                kps_for_makeup_best = (
+                                    best_fface.get("kps_203")
+                                    if best_fface.get("kps_203") is not None
+                                    else best_fface.get("kps_5")
+                                )
                                 img = self.frame_edits.swap_edit_face_core_makeup(
-                                    img, best_fface["kps_all"], params.data, control
+                                    img, kps_for_makeup_best, params.data, control
                                 )
                         except Exception as e:
                             print(
@@ -2295,6 +2359,7 @@ class FrameWorker(threading.Thread):
                                     img,
                                     fface["kps_5"],
                                     fface["kps_all"],
+                                    kps_203=fface.get("kps_203"),
                                     s_e=s_e,
                                     t_e=best_target.get_embedding(arcface_model),
                                     parameters=_params_for_swap_b,
@@ -2312,8 +2377,13 @@ class FrameWorker(threading.Thread):
                                     "LipsMakeupEnableToggle",
                                 )
                             ):
+                                kps_for_makeup = (
+                                    fface.get("kps_203")
+                                    if fface.get("kps_203") is not None
+                                    else fface.get("kps_5")
+                                )
                                 img = self.frame_edits.swap_edit_face_core_makeup(
-                                    img, fface["kps_all"], params.data, control
+                                    img, kps_for_makeup, params.data, control
                                 )
                         except Exception as e:
                             print(
@@ -2391,7 +2461,7 @@ class FrameWorker(threading.Thread):
                 _face_id_1 = getattr(cached_tgt, "face_id", None)
                 face_specific: dict = cast(
                     dict,
-                    self.parameters.get(_face_id_1, {})  # type: ignore[arg-type]
+                    self.parameters.get(str(_face_id_1), {})  # type: ignore[arg-type]
                     if _face_id_1 is not None
                     else {},
                 )
@@ -2401,11 +2471,36 @@ class FrameWorker(threading.Thread):
                     fface_data["embedding"], control
                 )
             if matched_params:
-                use_adj = matched_params["LandmarksPositionAdjEnableToggle"]
-                keypoints = (
-                    fface_data.get("kps_5") if use_adj else fface_data.get("kps_all")
-                )
-                kcolor = (255, 0, 0) if use_adj else (0, 255, 255)
+                # Use .get() safely in case the key doesn't exist yet
+                use_adj = matched_params.get("LandmarksPositionAdjEnableToggle", False)
+
+                kps_203 = fface_data.get("kps_203")
+                kps_all = fface_data.get("kps_all")
+                kps_5 = fface_data.get("kps_5")
+
+                if use_adj:
+                    # Manual Adjustment Mode: always force 5 points
+                    keypoints = kps_5
+                    kcolor = (255, 0, 0)  # BGR: Blue
+                else:
+                    # Smart Cascade: From most detailed to least detailed
+                    if kps_all is not None and len(kps_all) > 5:
+                        keypoints = kps_all
+                        kcolor = (
+                            0,
+                            255,
+                            255,
+                        )  # BGR: Yellow (Standard dense model chosen in UI)
+                    elif kps_203 is not None and len(kps_203) == 203:
+                        keypoints = kps_203
+                        kcolor = (
+                            0,
+                            165,
+                            255,
+                        )  # BGR: Orange (Indicates advanced tools triggered the 203 points)
+                    else:
+                        keypoints = kps_5
+                        kcolor = (0, 255, 0)  # BGR: Green (Base 5 points model)
 
                 if keypoints is not None:
                     landmarks_to_draw.append({"kps": keypoints, "color": kcolor})
@@ -2433,7 +2528,7 @@ class FrameWorker(threading.Thread):
                 _face_id_2 = getattr(cached_tgt, "face_id", None)
                 face_specific: dict = cast(
                     dict,
-                    self.parameters.get(_face_id_2, {})  # type: ignore[arg-type]
+                    self.parameters.get(str(_face_id_2), {})  # type: ignore[arg-type]
                     if _face_id_2 is not None
                     else {},
                 )
@@ -3958,6 +4053,7 @@ class FrameWorker(threading.Thread):
         img: torch.Tensor,
         kps_5: np.ndarray,
         kps: np.ndarray | None = None,  # FW-ROBUST-06: changed default False -> None
+        kps_203: np.ndarray | None = None,  # NEW: Dedicated 203 points
         s_e: np.ndarray | None = None,
         t_e: np.ndarray | None = None,
         parameters: dict | None = None,
@@ -3993,8 +4089,10 @@ class FrameWorker(threading.Thread):
 
         # OPTIMIZATION: Transform full-frame smoothed keypoints to the 512x512 crop space
         kps_all_crop = None
-        if kps is not None and len(kps) == 203:
-            raw_kps_crop = tform(kps)
+        if (
+            kps_203 is not None and len(kps_203) == 203
+        ):  # Use the dedicated 203 variable
+            raw_kps_crop = tform(kps_203)
             kps_all_crop = np.array(raw_kps_crop, dtype=np.float32)
 
         # STATE TRACKER: Suit si le tenseur 'swap' a subi une modification géométrique
