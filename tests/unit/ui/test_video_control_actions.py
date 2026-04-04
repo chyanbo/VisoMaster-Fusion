@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import importlib
 import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-sys.modules.pop("app.ui.widgets.actions.video_control_actions", None)
+import pytest
 
 
 def _stub(name: str) -> MagicMock:
@@ -14,40 +15,117 @@ def _stub(name: str) -> MagicMock:
     return m
 
 
-_STUBS = [
-    "PySide6",
-    "PySide6.QtWidgets",
-    "PySide6.QtCore",
-    "PySide6.QtGui",
-    "cv2",
-    "numpy",
-    "PIL",
-    "PIL.Image",
-    "app.helpers",
-    "app.helpers.typing_helper",
-    "app.helpers.miscellaneous",
-    "app.ui.widgets.widget_components",
-    "app.ui.widgets.ui_workers",
-    "app.ui.widgets.actions.common_actions",
-    "app.ui.widgets.actions.card_actions",
-    "app.ui.widgets.actions.graphics_view_actions",
-    "app.ui.widgets.actions.layout_actions",
-]
-for _s in _STUBS:
-    if _s not in sys.modules:
-        sys.modules[_s] = _stub(_s)
+@pytest.fixture(scope="module")
+def video_actions_env():
+    stubbed_modules = {
+        "PySide6": _stub("PySide6"),
+        "PySide6.QtWidgets": _stub("PySide6.QtWidgets"),
+        "PySide6.QtCore": _stub("PySide6.QtCore"),
+        "PySide6.QtGui": _stub("PySide6.QtGui"),
+        "cv2": _stub("cv2"),
+        "numpy": _stub("numpy"),
+        "PIL": _stub("PIL"),
+        "PIL.Image": _stub("PIL.Image"),
+        "app.helpers": _stub("app.helpers"),
+        "app.helpers.typing_helper": _stub("app.helpers.typing_helper"),
+        "app.helpers.miscellaneous": _stub("app.helpers.miscellaneous"),
+        "app.ui.widgets.widget_components": _stub("app.ui.widgets.widget_components"),
+        "app.ui.widgets.ui_workers": _stub("app.ui.widgets.ui_workers"),
+        "app.ui.widgets.actions.common_actions": _stub(
+            "app.ui.widgets.actions.common_actions"
+        ),
+        "app.ui.widgets.actions.card_actions": _stub(
+            "app.ui.widgets.actions.card_actions"
+        ),
+        "app.ui.widgets.actions.graphics_view_actions": _stub(
+            "app.ui.widgets.actions.graphics_view_actions"
+        ),
+        "app.ui.widgets.actions.layout_actions": _stub(
+            "app.ui.widgets.actions.layout_actions"
+        ),
+    }
+    saved_modules = {
+        name: sys.modules.get(name)
+        for name in [
+            *stubbed_modules,
+            "app.ui.widgets.actions.video_control_actions",
+        ]
+    }
+    saved_package_attrs: dict[tuple[str, str], tuple[bool, object | None]] = {}
+
+    for module_name in [
+        *stubbed_modules,
+        "app.ui.widgets.actions.video_control_actions",
+    ]:
+        parent_name, _, attr_name = module_name.rpartition(".")
+        if not parent_name:
+            continue
+        parent_module = sys.modules.get(parent_name)
+        had_attr = parent_module is not None and hasattr(parent_module, attr_name)
+        saved_package_attrs[(parent_name, attr_name)] = (
+            had_attr,
+            getattr(parent_module, attr_name) if had_attr else None,
+        )
+
+    try:
+        for name, module in stubbed_modules.items():
+            sys.modules[name] = module
+
+        stubbed_modules["PySide6"].QtWidgets = stubbed_modules["PySide6.QtWidgets"]
+        stubbed_modules["PySide6"].QtCore = stubbed_modules["PySide6.QtCore"]
+        stubbed_modules["PySide6"].QtGui = stubbed_modules["PySide6.QtGui"]
+        stubbed_modules["PIL"].Image = stubbed_modules["PIL.Image"]
+        stubbed_modules["app.helpers"].typing_helper = stubbed_modules[
+            "app.helpers.typing_helper"
+        ]
+        stubbed_modules["app.helpers"].miscellaneous = stubbed_modules[
+            "app.helpers.miscellaneous"
+        ]
+        for module_name, module in stubbed_modules.items():
+            parent_name, _, attr_name = module_name.rpartition(".")
+            parent_module = sys.modules.get(parent_name)
+            if parent_module is not None and attr_name:
+                setattr(parent_module, attr_name, module)
+
+        sys.modules.pop("app.ui.widgets.actions.video_control_actions", None)
+
+        common_widget_actions = importlib.import_module(
+            "app.ui.widgets.actions.common_actions"
+        )
+        video_control_actions = importlib.import_module(
+            "app.ui.widgets.actions.video_control_actions"
+        )
+
+        yield SimpleNamespace(
+            module=video_control_actions,
+            common_widget_actions=common_widget_actions,
+            view_fullscreen=video_control_actions.view_fullscreen,
+            toggle_theatre_mode=video_control_actions.toggle_theatre_mode,
+            disable_compare_preview_modes_for_recording=(
+                video_control_actions._disable_compare_preview_modes_for_recording
+            ),
+        )
+    finally:
+        for name, original_module in saved_modules.items():
+            if original_module is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original_module
+
+        for (parent_name, attr_name), (
+            had_attr,
+            original_value,
+        ) in saved_package_attrs.items():
+            parent_module = sys.modules.get(parent_name)
+            if parent_module is None:
+                continue
+            if had_attr:
+                setattr(parent_module, attr_name, original_value)
+            elif hasattr(parent_module, attr_name):
+                delattr(parent_module, attr_name)
 
 
-from app.ui.widgets.actions import common_actions as common_widget_actions  # noqa: E402
-from app.ui.widgets.actions import video_control_actions  # noqa: E402
-from app.ui.widgets.actions.video_control_actions import (  # noqa: E402
-    _disable_compare_preview_modes_for_recording,
-    toggle_theatre_mode,
-    view_fullscreen,
-)
-
-
-def test_view_fullscreen_keeps_theatre_mode_active():
+def test_view_fullscreen_keeps_theatre_mode_active(video_actions_env):
     synced = []
     main_window = SimpleNamespace(
         is_theatre_mode=True,
@@ -63,7 +141,7 @@ def test_view_fullscreen_keeps_theatre_mode_active():
         _sync_viewer_menu_actions=lambda: synced.append(True),
     )
 
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     main_window.showFullScreen.assert_called_once()
     main_window.showNormal.assert_not_called()
@@ -73,7 +151,7 @@ def test_view_fullscreen_keeps_theatre_mode_active():
     assert synced == [True]
 
 
-def test_view_fullscreen_uses_real_window_transition_outside_theatre():
+def test_view_fullscreen_uses_real_window_transition_outside_theatre(video_actions_env):
     synced = []
     main_window = SimpleNamespace(
         is_theatre_mode=False,
@@ -87,7 +165,7 @@ def test_view_fullscreen_uses_real_window_transition_outside_theatre():
         _sync_viewer_menu_actions=lambda: synced.append(True),
     )
 
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     main_window.showFullScreen.assert_called_once()
     main_window.showNormal.assert_not_called()
@@ -176,12 +254,12 @@ class _StatefulFullscreenWindow:
         self._sync_calls.append(True)
 
 
-def test_view_fullscreen_restores_saved_geometry_after_round_trip():
+def test_view_fullscreen_restores_saved_geometry_after_round_trip(video_actions_env):
     geometry = _FakeGeometry()
     main_window = _StatefulFullscreenWindow(state="normal", geometry=geometry)
 
-    view_fullscreen(main_window)
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     main_window.showFullScreen.assert_called_once()
     main_window.showNormal.assert_called_once()
@@ -193,11 +271,11 @@ def test_view_fullscreen_restores_saved_geometry_after_round_trip():
     assert main_window._sync_calls == [True, True]
 
 
-def test_view_fullscreen_restores_maximized_state_after_round_trip():
+def test_view_fullscreen_restores_maximized_state_after_round_trip(video_actions_env):
     main_window = _StatefulFullscreenWindow(state="maximized")
 
-    view_fullscreen(main_window)
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     main_window.showFullScreen.assert_called_once()
     main_window.showMaximized.assert_called_once()
@@ -210,14 +288,14 @@ def test_view_fullscreen_restores_maximized_state_after_round_trip():
     assert main_window._sync_calls == [True, True]
 
 
-def test_view_fullscreen_preserves_maximized_base_state_in_theatre():
+def test_view_fullscreen_preserves_maximized_base_state_in_theatre(video_actions_env):
     main_window = _StatefulFullscreenWindow(state="maximized", is_theatre_mode=True)
     main_window._was_maximized = True
     main_window._was_custom_fullscreen = False
     main_window._was_normal_geometry = main_window.normalGeometry()
 
-    view_fullscreen(main_window)
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     assert main_window.is_theatre_mode is True
     assert main_window.isMaximized() is True
@@ -229,7 +307,7 @@ def test_view_fullscreen_preserves_maximized_base_state_in_theatre():
     assert main_window._fullscreen_restore_geometry is None
 
 
-def test_view_fullscreen_preserves_normal_geometry_in_theatre():
+def test_view_fullscreen_preserves_normal_geometry_in_theatre(video_actions_env):
     geometry = _FakeGeometry()
     main_window = _StatefulFullscreenWindow(
         state="normal",
@@ -240,8 +318,8 @@ def test_view_fullscreen_preserves_normal_geometry_in_theatre():
     main_window._was_custom_fullscreen = False
     main_window._was_normal_geometry = geometry
 
-    view_fullscreen(main_window)
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     assert main_window.is_theatre_mode is True
     assert main_window.isMaximized() is False
@@ -253,20 +331,22 @@ def test_view_fullscreen_preserves_normal_geometry_in_theatre():
     assert main_window._was_normal_geometry is geometry
 
 
-def test_view_fullscreen_keeps_theatre_layout_active_during_round_trip():
+def test_view_fullscreen_keeps_theatre_layout_active_during_round_trip(
+    video_actions_env,
+):
     main_window = _StatefulFullscreenWindow(state="normal", is_theatre_mode=True)
     base_geometry = main_window.geometry()
     main_window._was_maximized = False
     main_window._was_custom_fullscreen = False
     main_window._was_normal_geometry = base_geometry
 
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     assert main_window.is_theatre_mode is True
     assert main_window.isFullScreen() is True
     assert main_window._was_normal_geometry is base_geometry
 
-    view_fullscreen(main_window)
+    video_actions_env.view_fullscreen(main_window)
 
     assert main_window.is_theatre_mode is True
     assert main_window.isFullScreen() is False
@@ -371,34 +451,36 @@ def _make_theatre_entry_window(*, is_fullscreen: bool, is_maximized: bool = Fals
     )
 
 
-def test_toggle_theatre_mode_keeps_fullscreen_when_base_mode_is_fullscreen(monkeypatch):
+def test_toggle_theatre_mode_keeps_fullscreen_when_base_mode_is_fullscreen(
+    monkeypatch, video_actions_env
+):
     monkeypatch.setattr(
-        video_control_actions, "_set_media_controls_visible", lambda *_args: None
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
     )
-    video_control_actions.layout_actions.fit_image_to_view_onchange.reset_mock()
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
     main_window = _make_theatre_entry_window(is_fullscreen=True)
 
-    toggle_theatre_mode(main_window)
+    video_actions_env.toggle_theatre_mode(main_window)
 
     assert main_window._was_custom_fullscreen is True
     assert main_window._was_normal_geometry == "normal-geometry"
     main_window.setWindowState.assert_called_once_with(
-        video_control_actions.QtCore.Qt.WindowState.WindowFullScreen
+        video_actions_env.module.QtCore.Qt.WindowState.WindowFullScreen
     )
     main_window.showFullScreen.assert_called_once()
     assert main_window.is_full_screen is True
 
 
 def test_toggle_theatre_mode_keeps_normal_window_when_base_mode_is_windowed(
-    monkeypatch,
+    monkeypatch, video_actions_env
 ):
     monkeypatch.setattr(
-        video_control_actions, "_set_media_controls_visible", lambda *_args: None
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
     )
-    video_control_actions.layout_actions.fit_image_to_view_onchange.reset_mock()
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
     main_window = _make_theatre_entry_window(is_fullscreen=False, is_maximized=False)
 
-    toggle_theatre_mode(main_window)
+    video_actions_env.toggle_theatre_mode(main_window)
 
     assert main_window._was_custom_fullscreen is False
     main_window.setWindowState.assert_not_called()
@@ -407,15 +489,15 @@ def test_toggle_theatre_mode_keeps_normal_window_when_base_mode_is_windowed(
 
 
 def test_toggle_theatre_mode_keeps_maximized_window_when_base_mode_is_maximized(
-    monkeypatch,
+    monkeypatch, video_actions_env
 ):
     monkeypatch.setattr(
-        video_control_actions, "_set_media_controls_visible", lambda *_args: None
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
     )
-    video_control_actions.layout_actions.fit_image_to_view_onchange.reset_mock()
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
     main_window = _make_theatre_entry_window(is_fullscreen=False, is_maximized=True)
 
-    toggle_theatre_mode(main_window)
+    video_actions_env.toggle_theatre_mode(main_window)
 
     assert main_window._was_custom_fullscreen is False
     assert main_window._was_maximized is True
@@ -424,11 +506,13 @@ def test_toggle_theatre_mode_keeps_maximized_window_when_base_mode_is_maximized(
     assert main_window.is_full_screen is False
 
 
-def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(monkeypatch):
+def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(
+    monkeypatch, video_actions_env
+):
     monkeypatch.setattr(
-        video_control_actions, "_set_media_controls_visible", lambda *_args: None
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
     )
-    video_control_actions.layout_actions.fit_image_to_view_onchange.reset_mock()
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
 
     menu_bar = _FakeMenuBar()
     saved_geometry = SimpleNamespace(
@@ -471,7 +555,7 @@ def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(monkeypatch)
         setUpdatesEnabled=MagicMock(),
     )
 
-    toggle_theatre_mode(main_window)
+    video_actions_env.toggle_theatre_mode(main_window)
 
     main_window.showNormal.assert_called_once()
     main_window.showFullScreen.assert_not_called()
@@ -485,11 +569,13 @@ def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(monkeypatch)
     assert main_window.is_full_screen is False
 
 
-def test_toggle_theatre_mode_restores_maximized_state_on_exit(monkeypatch):
+def test_toggle_theatre_mode_restores_maximized_state_on_exit(
+    monkeypatch, video_actions_env
+):
     monkeypatch.setattr(
-        video_control_actions, "_set_media_controls_visible", lambda *_args: None
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
     )
-    video_control_actions.layout_actions.fit_image_to_view_onchange.reset_mock()
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
 
     menu_bar = _FakeMenuBar()
     main_window = SimpleNamespace(
@@ -526,7 +612,7 @@ def test_toggle_theatre_mode_restores_maximized_state_on_exit(monkeypatch):
         setUpdatesEnabled=MagicMock(),
     )
 
-    toggle_theatre_mode(main_window)
+    video_actions_env.toggle_theatre_mode(main_window)
 
     main_window.showFullScreen.assert_not_called()
     main_window.showMaximized.assert_called_once()
@@ -540,31 +626,35 @@ def test_toggle_theatre_mode_restores_maximized_state_on_exit(monkeypatch):
     assert main_window.is_full_screen is False
 
 
-def test_disable_compare_preview_modes_for_recording_disables_both_and_toasts():
+def test_disable_compare_preview_modes_for_recording_disables_both_and_toasts(
+    video_actions_env,
+):
     calls = []
     main_window = SimpleNamespace(
         view_face_compare_enabled=True,
         view_face_mask_enabled=True,
         _set_compare_mode=lambda mode, checked: calls.append((mode, checked)),
     )
-    common_widget_actions.create_and_show_toast_message.reset_mock()
+    video_actions_env.common_widget_actions.create_and_show_toast_message.reset_mock()
 
-    _disable_compare_preview_modes_for_recording(main_window)
+    video_actions_env.disable_compare_preview_modes_for_recording(main_window)
 
     assert calls == [("compare", False), ("mask", False)]
-    common_widget_actions.create_and_show_toast_message.assert_called_once()
+    video_actions_env.common_widget_actions.create_and_show_toast_message.assert_called_once()
 
 
-def test_disable_compare_preview_modes_for_recording_is_noop_when_already_off():
+def test_disable_compare_preview_modes_for_recording_is_noop_when_already_off(
+    video_actions_env,
+):
     calls = []
     main_window = SimpleNamespace(
         view_face_compare_enabled=False,
         view_face_mask_enabled=False,
         _set_compare_mode=lambda mode, checked: calls.append((mode, checked)),
     )
-    common_widget_actions.create_and_show_toast_message.reset_mock()
+    video_actions_env.common_widget_actions.create_and_show_toast_message.reset_mock()
 
-    _disable_compare_preview_modes_for_recording(main_window)
+    video_actions_env.disable_compare_preview_modes_for_recording(main_window)
 
     assert calls == []
-    common_widget_actions.create_and_show_toast_message.assert_not_called()
+    video_actions_env.common_widget_actions.create_and_show_toast_message.assert_not_called()
