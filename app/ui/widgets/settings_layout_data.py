@@ -451,7 +451,7 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
         "KPSSmoothingEnableToggle": {
             "level": 1,
             "label": "Enable KPS Smoothing",
-            "default": True,  # Activé par défaut pour garder la stabilité
+            "default": False,
             "help": "Enable temporal smoothing for facial keypoints (KPS) to reduce jittering and stabilize the face.",
         },
         "KPSEmaAlphaSlider": {
