@@ -1,14 +1,21 @@
 from types import SimpleNamespace
 
+from app.ui.widgets.actions import card_actions, job_manager_actions, list_view_actions
+from app.ui.widgets.actions import save_load_actions
 from app.ui.widgets.actions.video_control_actions import (
     _handle_issue_scan_cancelled,
     _handle_issue_scan_completed,
     _handle_issue_scan_failed,
     _handle_issue_scan_issue_found,
     _handle_issue_scan_progress,
+    add_video_slider_marker,
+    block_if_issue_scan_active,
+    is_issue_scan_active,
+    remove_all_markers,
     run_issue_scan,
     toggle_issue_scan,
 )
+from app.ui.widgets import widget_components
 from app.ui.widgets.ui_workers import IssueScanWorker
 
 
@@ -49,15 +56,28 @@ class _DummyButton:
     def setChecked(self, checked):
         self.checked = bool(checked)
 
+    def isEnabled(self):
+        return self.enabled
+
 
 class _DummySlider:
     def __init__(self, value=0):
         self._value = value
+        self.enabled = True
         self.block_calls = []
         self.updated = 0
 
     def value(self):
         return self._value
+
+    def setEnabled(self, value):
+        self.enabled = bool(value)
+
+    def setDisabled(self, value):
+        self.enabled = not bool(value)
+
+    def isEnabled(self):
+        return self.enabled
 
     def blockSignals(self, value):
         self.block_calls.append(bool(value))
@@ -114,16 +134,48 @@ def _make_scan_main_window(keep_controls=False):
     main_window = SimpleNamespace(
         control={"KeepControlsToggle": keep_controls},
         parameters={},
-        target_faces={"face_1": object()},
+        target_faces={"face_1": _DummyButton("Face 1")},
+        target_videos={"media_1": _DummyButton("Media 1")},
+        input_faces={"input_1": _DummyButton("Input 1")},
+        merged_embeddings={"embed_1": _DummyButton("Embedding 1")},
         parameter_widgets={},
         issue_frames_by_face={"face_1": {3, 5}, "face_2": {9}},
         issue_frames=set(),
         dropped_frames=set(),
         markers={},
+        job_marker_pairs=[],
         selected_target_face_id="face_1",
+        selected_video_button=SimpleNamespace(file_type="video"),
         scan_issue_worker=None,
         scan_issue_ui_state={},
         videoSeekSlider=slider,
+        targetVideosList=_DummyButton("Target Videos"),
+        inputFacesList=_DummyButton("Input Faces"),
+        inputEmbeddingsList=_DummyButton("Input Embeddings"),
+        jobQueueList=_DummyButton("Job Queue"),
+        buttonTargetVideosPath=_DummyButton("Target Path"),
+        buttonInputFacesPath=_DummyButton("Input Path"),
+        filterWebcamsCheckBox=_DummyButton("Filter Webcams"),
+        findTargetFacesButton=_DummyButton("Find Faces"),
+        clearTargetFacesButton=_DummyButton("Clear Faces"),
+        addMarkerButton=_DummyButton("Add Marker"),
+        removeMarkerButton=_DummyButton("Remove Marker"),
+        frameAdvanceButton=_DummyButton("Frame Advance"),
+        frameRewindButton=_DummyButton("Frame Rewind"),
+        nextMarkerButton=_DummyButton("Next Marker"),
+        previousMarkerButton=_DummyButton("Previous Marker"),
+        swapfacesButton=_DummyButton("Swap Faces"),
+        editFacesButton=_DummyButton("Edit Faces"),
+        openEmbeddingButton=_DummyButton("Open Embeddings"),
+        loadJobButton=_DummyButton("Load Job"),
+        buttonProcessAll=_DummyButton("Process All"),
+        buttonProcessSelected=_DummyButton("Process Selected"),
+        actionLoad_SavedWorkspace=_DummyButton("Load Workspace"),
+        actionOpen_Videos_Folder=_DummyButton("Open Videos Folder"),
+        actionOpen_Video_Files=_DummyButton("Open Video Files"),
+        actionLoad_Source_Image_Files=_DummyButton("Load Source Files"),
+        actionLoad_Source_Images_Folder=_DummyButton("Load Source Folder"),
+        actionLoad_Embeddings=_DummyButton("Load Embeddings"),
         videoSeekLineEdit=SimpleNamespace(
             text=lambda: "24", setText=lambda _text: None
         ),
@@ -207,6 +259,41 @@ def test_issue_scan_worker_progress_emits_live_fps(monkeypatch):
         (3, 3, 12, 2.0),
     ]
     assert completed == [({}, 3, 0, "Scanning 1 marked range", 2.0, False)]
+
+
+def test_issue_scan_worker_defers_target_snapshot_prep_until_run():
+    main_window = _make_worker_main_window()
+    prep_calls = []
+    captured = {}
+
+    def fake_prepare_issue_scan_target_faces_snapshot(*_args, **_kwargs):
+        prep_calls.append("prepared")
+        return {"face_1": {"face_id": "face_1", "embeddings_by_model": {}}}
+
+    def fake_scan_issue_frames(**kwargs):
+        captured["target_faces_snapshot"] = kwargs["target_faces_snapshot"]
+        return {
+            "issue_frames_by_face": {},
+            "frames_scanned": 1,
+            "faces_with_issues": 0,
+            "cancelled": False,
+        }
+
+    main_window.video_processor.prepare_issue_scan_target_faces_snapshot = (
+        fake_prepare_issue_scan_target_faces_snapshot
+    )
+    main_window.video_processor.scan_issue_frames = fake_scan_issue_frames
+
+    worker = IssueScanWorker(main_window)
+
+    assert prep_calls == []
+
+    worker.run()
+
+    assert prep_calls == ["prepared"]
+    assert captured["target_faces_snapshot"] == {
+        "face_1": {"face_id": "face_1", "embeddings_by_model": {}}
+    }
 
 
 def test_issue_scan_worker_passes_control_defaults_snapshot():
@@ -325,6 +412,26 @@ def test_issue_scan_worker_passes_plain_target_face_snapshot_without_widget_meth
     }
 
 
+def test_issue_scan_worker_reports_prep_failures_via_failed_signal():
+    main_window = _make_worker_main_window()
+    failures = []
+
+    def fake_prepare_issue_scan_target_faces_snapshot(*_args, **_kwargs):
+        raise RuntimeError("prep boom")
+
+    main_window.video_processor.prepare_issue_scan_target_faces_snapshot = (
+        fake_prepare_issue_scan_target_faces_snapshot
+    )
+    main_window.video_processor.scan_issue_frames = lambda **_kwargs: None
+
+    worker = IssueScanWorker(main_window)
+    worker.failed.connect(failures.append)
+
+    worker.run()
+
+    assert failures == ["prep boom"]
+
+
 def test_handle_issue_scan_progress_moves_slider_and_updates_abort_button(monkeypatch):
     main_window = _make_scan_main_window()
     main_window.runScanButton.tooltip = (
@@ -404,6 +511,10 @@ def test_run_issue_scan_disables_controls_like_recording_when_keep_controls_off(
     assert fake_worker.started is True
     assert disabled_calls == ["disabled"]
     assert main_window.scan_issue_worker is fake_worker
+    assert main_window.scan_issue_ui_state["previous_issue_frames_by_face"] == {
+        "face_1": {3, 5},
+        "face_2": {9},
+    }
     assert main_window.runScanButton.enabled is True
     assert main_window.runScanButton.text == "Abort Scan"
     assert "processed" not in main_window.runScanButton.tooltip
@@ -412,6 +523,28 @@ def test_run_issue_scan_disables_controls_like_recording_when_keep_controls_off(
     assert main_window.buttonMediaPlay.enabled is False
     assert main_window.buttonMediaRecord.enabled is False
     assert main_window.scanToolsToggleButton.enabled is False
+    assert main_window.findTargetFacesButton.enabled is False
+    assert main_window.clearTargetFacesButton.enabled is False
+    assert main_window.filterWebcamsCheckBox.enabled is False
+    assert main_window.addMarkerButton.enabled is False
+    assert main_window.removeMarkerButton.enabled is False
+    assert main_window.videoSeekSlider.enabled is False
+    assert main_window.frameAdvanceButton.enabled is False
+    assert main_window.frameRewindButton.enabled is False
+    assert main_window.nextMarkerButton.enabled is False
+    assert main_window.previousMarkerButton.enabled is False
+    assert main_window.swapfacesButton.enabled is False
+    assert main_window.editFacesButton.enabled is False
+    assert main_window.openEmbeddingButton.enabled is False
+    assert main_window.buttonTargetVideosPath.enabled is False
+    assert main_window.buttonInputFacesPath.enabled is False
+    assert main_window.targetVideosList.enabled is False
+    assert main_window.inputFacesList.enabled is False
+    assert main_window.inputEmbeddingsList.enabled is False
+    assert main_window.loadJobButton.enabled is False
+    assert main_window.buttonProcessAll.enabled is False
+    assert main_window.buttonProcessSelected.enabled is False
+    assert main_window.actionLoad_SavedWorkspace.enabled is False
     assert main_window.prevIssueButton.enabled is False
     assert main_window.nextIssueButton.enabled is False
     assert main_window.dropFrameButton.enabled is False
@@ -424,6 +557,9 @@ def test_run_issue_scan_respects_keep_controls_toggle(monkeypatch):
     main_window = _make_scan_main_window(keep_controls=True)
     fake_worker = _FakeIssueScanWorker(main_window)
     disabled_calls = []
+    main_window.frameAdvanceButton.enabled = False
+    main_window.openEmbeddingButton.enabled = False
+    main_window.filterWebcamsCheckBox.enabled = False
 
     monkeypatch.setattr(
         "app.ui.widgets.actions.video_control_actions.ui_workers.IssueScanWorker",
@@ -451,6 +587,29 @@ def test_run_issue_scan_respects_keep_controls_toggle(monkeypatch):
     assert "processed" not in main_window.runScanButton.tooltip
     assert "FPS" not in main_window.runScanButton.tooltip
     assert main_window.issue_frames_by_face == {}
+    assert main_window.findTargetFacesButton.enabled is False
+    assert main_window.clearTargetFacesButton.enabled is False
+    assert main_window.filterWebcamsCheckBox.enabled is False
+    assert main_window.addMarkerButton.enabled is False
+    assert main_window.removeMarkerButton.enabled is False
+    assert main_window.videoSeekSlider.enabled is False
+    assert main_window.frameAdvanceButton.enabled is False
+    assert main_window.frameRewindButton.enabled is False
+    assert main_window.nextMarkerButton.enabled is False
+    assert main_window.previousMarkerButton.enabled is False
+    assert main_window.swapfacesButton.enabled is False
+    assert main_window.editFacesButton.enabled is False
+    assert main_window.openEmbeddingButton.enabled is False
+    assert main_window.buttonTargetVideosPath.enabled is False
+    assert main_window.buttonInputFacesPath.enabled is False
+    assert main_window.targetVideosList.enabled is False
+    assert main_window.inputFacesList.enabled is False
+    assert main_window.inputEmbeddingsList.enabled is False
+    assert main_window.loadJobButton.enabled is False
+    assert main_window.buttonProcessAll.enabled is False
+    assert main_window.buttonProcessSelected.enabled is False
+    assert main_window.actionLoad_SavedWorkspace.enabled is False
+    assert main_window.target_faces["face_1"].enabled is True
     assert main_window.prevIssueButton.enabled is False
     assert main_window.nextIssueButton.enabled is False
     assert main_window.dropFrameButton.enabled is False
@@ -520,7 +679,35 @@ def test_issue_scan_completion_restores_slider_and_ui(monkeypatch):
         "start_frame": 24,
         "scope_text": "Scanning full clip",
         "keep_controls": False,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "has_partial_results": True,
+        "mutation_lock_enabled_states": [
+            (main_window.findTargetFacesButton, True),
+            (main_window.clearTargetFacesButton, True),
+            (main_window.filterWebcamsCheckBox, True),
+            (main_window.videoSeekSlider, True),
+            (main_window.frameAdvanceButton, False),
+            (main_window.frameRewindButton, True),
+            (main_window.nextMarkerButton, True),
+            (main_window.previousMarkerButton, False),
+            (main_window.swapfacesButton, True),
+            (main_window.editFacesButton, False),
+            (main_window.openEmbeddingButton, False),
+            (main_window.loadJobButton, True),
+        ],
     }
+    main_window.findTargetFacesButton.enabled = False
+    main_window.clearTargetFacesButton.enabled = False
+    main_window.filterWebcamsCheckBox.enabled = False
+    main_window.videoSeekSlider.enabled = False
+    main_window.frameAdvanceButton.enabled = False
+    main_window.frameRewindButton.enabled = False
+    main_window.nextMarkerButton.enabled = False
+    main_window.previousMarkerButton.enabled = False
+    main_window.swapfacesButton.enabled = False
+    main_window.editFacesButton.enabled = False
+    main_window.openEmbeddingButton.enabled = False
+    main_window.loadJobButton.enabled = False
     main_window.videoSeekSlider.setValue(90)
     main_window.video_processor.current_frame_number = 90
 
@@ -541,6 +728,18 @@ def test_issue_scan_completion_restores_slider_and_ui(monkeypatch):
     assert fake_worker.deleted is True
     assert main_window.runScanButton.text == "Scan for Issues"
     assert main_window.buttonMediaPlay.enabled is True
+    assert main_window.findTargetFacesButton.enabled is True
+    assert main_window.clearTargetFacesButton.enabled is True
+    assert main_window.filterWebcamsCheckBox.enabled is True
+    assert main_window.videoSeekSlider.enabled is True
+    assert main_window.frameAdvanceButton.enabled is False
+    assert main_window.frameRewindButton.enabled is True
+    assert main_window.nextMarkerButton.enabled is True
+    assert main_window.previousMarkerButton.enabled is False
+    assert main_window.swapfacesButton.enabled is True
+    assert main_window.editFacesButton.enabled is False
+    assert main_window.openEmbeddingButton.enabled is False
+    assert main_window.loadJobButton.enabled is True
     assert main_window.prevIssueButton.enabled is True
     assert main_window.nextIssueButton.enabled is True
     assert main_window.dropFrameButton.enabled is True
@@ -576,6 +775,8 @@ def test_issue_scan_partial_completion_keeps_partial_results(monkeypatch):
         "start_frame": 24,
         "scope_text": "Scanning full clip",
         "keep_controls": True,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "has_partial_results": True,
     }
     main_window.videoSeekSlider.setValue(91)
 
@@ -628,14 +829,29 @@ def test_issue_scan_failed_restores_ui_and_shows_message(monkeypatch):
         "start_frame": 24,
         "scope_text": "Scanning full clip",
         "keep_controls": True,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "has_partial_results": False,
+        "mutation_lock_enabled_states": [
+            (main_window.videoSeekSlider, True),
+            (main_window.frameAdvanceButton, False),
+            (main_window.filterWebcamsCheckBox, True),
+        ],
     }
     main_window.videoSeekSlider.setValue(101)
+    main_window.issue_frames_by_face = {}
+    main_window.videoSeekSlider.enabled = False
+    main_window.frameAdvanceButton.enabled = False
+    main_window.filterWebcamsCheckBox.enabled = False
 
     _handle_issue_scan_failed(main_window, "boom")
 
     assert main_window.videoSeekSlider.value() == 24
+    assert main_window.issue_frames_by_face == {"face_1": {3, 5}, "face_2": {9}}
     assert main_window.scan_issue_worker is None
     assert fake_worker.deleted is True
+    assert main_window.videoSeekSlider.enabled is True
+    assert main_window.frameAdvanceButton.enabled is False
+    assert main_window.filterWebcamsCheckBox.enabled is True
     assert main_window.prevIssueButton.enabled is True
     assert main_window.nextIssueButton.enabled is True
     assert main_window.dropFrameButton.enabled is True
@@ -673,6 +889,8 @@ def test_issue_scan_cancelled_fallback_keeps_partial_results_message(monkeypatch
         "start_frame": 24,
         "scope_text": "Scanning full clip",
         "keep_controls": True,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "has_partial_results": True,
     }
 
     _handle_issue_scan_cancelled(main_window)
@@ -682,3 +900,211 @@ def test_issue_scan_cancelled_fallback_keeps_partial_results_message(monkeypatch
     assert restore_calls == ["restored"]
     assert toast_calls[0][0][1] == "Scan Cancelled"
     assert "Kept any issue frames found so far." in toast_calls[0][0][2]
+
+
+def test_issue_scan_cancelled_completion_without_partial_results_restores_previous_findings(
+    monkeypatch,
+):
+    main_window = _make_scan_main_window()
+    fake_worker = _FakeIssueScanWorker(main_window)
+    toast_calls = []
+    restore_calls = []
+
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.common_widget_actions.create_and_show_toast_message",
+        lambda *_args, **_kwargs: toast_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.QtCore.QCoreApplication.processEvents",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions._restore_issue_scan_display",
+        lambda _main_window: restore_calls.append("restored"),
+    )
+
+    main_window.scan_issue_worker = fake_worker
+    main_window.issue_frames_by_face = {}
+    main_window.scan_issue_ui_state = {
+        "active": True,
+        "start_frame": 24,
+        "scope_text": "Scanning full clip",
+        "keep_controls": True,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "has_partial_results": False,
+    }
+
+    _handle_issue_scan_completed(
+        main_window,
+        {},
+        12,
+        0,
+        "Scanning full clip",
+        2.0,
+        True,
+    )
+
+    assert main_window.issue_frames_by_face == {"face_1": {3, 5}, "face_2": {9}}
+    assert main_window.scan_issue_worker is None
+    assert fake_worker.deleted is True
+    assert restore_calls == ["restored"]
+    assert toast_calls[0][0][1] == "Scan Aborted"
+    assert "Restored the previous 3 issue frames." in toast_calls[0][0][2]
+
+
+def test_issue_scan_cancelled_without_progress_restores_previous_findings(monkeypatch):
+    main_window = _make_scan_main_window()
+    fake_worker = _FakeIssueScanWorker(main_window)
+    toast_calls = []
+    restore_calls = []
+
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.common_widget_actions.create_and_show_toast_message",
+        lambda *_args, **_kwargs: toast_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.QtCore.QCoreApplication.processEvents",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions._restore_issue_scan_display",
+        lambda _main_window: restore_calls.append("restored"),
+    )
+
+    main_window.scan_issue_worker = fake_worker
+    main_window.issue_frames_by_face = {}
+    main_window.scan_issue_ui_state = {
+        "active": True,
+        "start_frame": 24,
+        "scope_text": "Scanning full clip",
+        "keep_controls": True,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "frames_scanned": 0,
+        "has_partial_results": False,
+        "mutation_lock_enabled_states": [
+            (main_window.nextMarkerButton, True),
+            (main_window.swapfacesButton, True),
+            (main_window.filterWebcamsCheckBox, False),
+        ],
+    }
+    main_window.nextMarkerButton.enabled = False
+    main_window.swapfacesButton.enabled = False
+    main_window.filterWebcamsCheckBox.enabled = False
+
+    _handle_issue_scan_cancelled(main_window)
+
+    assert main_window.issue_frames_by_face == {"face_1": {3, 5}, "face_2": {9}}
+    assert main_window.scan_issue_worker is None
+    assert fake_worker.deleted is True
+    assert main_window.nextMarkerButton.enabled is True
+    assert main_window.swapfacesButton.enabled is True
+    assert main_window.filterWebcamsCheckBox.enabled is False
+    assert restore_calls == ["restored"]
+    assert toast_calls[0][0][1] == "Scan Cancelled"
+    assert "Restored the previous issue findings." in toast_calls[0][0][2]
+
+
+def test_issue_scan_cancelled_after_progress_keeps_current_results(monkeypatch):
+    main_window = _make_scan_main_window()
+    fake_worker = _FakeIssueScanWorker(main_window)
+    toast_calls = []
+    restore_calls = []
+
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.common_widget_actions.create_and_show_toast_message",
+        lambda *_args, **_kwargs: toast_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.QtCore.QCoreApplication.processEvents",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions._restore_issue_scan_display",
+        lambda _main_window: restore_calls.append("restored"),
+    )
+
+    main_window.issue_frames_by_face = {}
+    main_window.scan_issue_worker = fake_worker
+    main_window.scan_issue_ui_state = {
+        "active": True,
+        "start_frame": 24,
+        "scope_text": "Scanning full clip",
+        "keep_controls": True,
+        "previous_issue_frames_by_face": {"face_1": {3, 5}, "face_2": {9}},
+        "frames_scanned": 6,
+        "has_partial_results": False,
+    }
+
+    _handle_issue_scan_cancelled(main_window)
+
+    assert main_window.issue_frames_by_face == {}
+    assert main_window.scan_issue_worker is None
+    assert fake_worker.deleted is True
+    assert restore_calls == ["restored"]
+    assert toast_calls[0][0][1] == "Scan Cancelled"
+    assert "Kept any issue frames found so far." in toast_calls[0][0][2]
+
+
+def test_issue_scan_guard_helpers_block_structural_mutations(monkeypatch):
+    main_window = _make_scan_main_window(keep_controls=True)
+    main_window.scan_issue_worker = object()
+    toast_calls = []
+
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.common_widget_actions.create_and_show_toast_message",
+        lambda *_args, **_kwargs: toast_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.card_actions.common_widget_actions.create_and_show_toast_message",
+        lambda *_args, **_kwargs: toast_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.job_manager_actions.common_widget_actions.create_and_show_toast_message",
+        lambda *_args, **_kwargs: toast_calls.append((_args, _kwargs)),
+    )
+
+    assert is_issue_scan_active(main_window) is True
+    assert block_if_issue_scan_active(main_window, "load a workspace") is True
+
+    original_target_videos = dict(main_window.target_videos)
+    original_input_faces = dict(main_window.input_faces)
+    original_embeddings = dict(main_window.merged_embeddings)
+
+    card_actions.find_target_faces(main_window)
+    list_view_actions.select_target_medias(
+        main_window, "files", files_list=["clip.mp4"]
+    )
+    save_load_actions.load_saved_workspace(main_window, "workspace.json")
+    job_manager_actions.load_job(main_window)
+    add_video_slider_marker(main_window)
+    remove_all_markers(main_window)
+
+    widget_components.TargetMediaCardButton.load_media(
+        SimpleNamespace(
+            main_window=main_window,
+            blockSignals=lambda *_args: None,
+            setChecked=lambda *_args: None,
+        )
+    )
+    widget_components.TargetFaceCardButton.remove_target_face_from_list(
+        SimpleNamespace(main_window=main_window)
+    )
+    widget_components.InputFaceCardButton.load_input_face(
+        SimpleNamespace(
+            main_window=main_window,
+            blockSignals=lambda *_args: None,
+            setChecked=lambda *_args: None,
+        )
+    )
+    widget_components.EmbeddingCardButton.load_embedding(
+        SimpleNamespace(
+            main_window=main_window,
+            blockSignals=lambda *_args: None,
+            setChecked=lambda *_args: None,
+        )
+    )
+
+    assert main_window.target_videos == original_target_videos
+    assert main_window.input_faces == original_input_faces
+    assert main_window.merged_embeddings == original_embeddings
+    assert toast_calls

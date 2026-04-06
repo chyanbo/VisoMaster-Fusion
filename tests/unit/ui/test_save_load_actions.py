@@ -11,6 +11,7 @@ All PySide6, widget, and UI imports are stubbed so this runs without Qt.
 
 from __future__ import annotations
 
+import importlib
 import sys
 import json
 import copy
@@ -51,27 +52,39 @@ _STUBS = [
     "app.ui.widgets.actions.layout_actions",
     "app.ui.widgets.actions.filter_actions",
 ]
-for _s in _STUBS:
-    if _s not in sys.modules:
-        sys.modules[_s] = _stub(_s)
 
-widget_components_stub = sys.modules["app.ui.widgets.widget_components"]
-setattr(
-    widget_components_stub,
-    "TargetMediaCardButton",
-    type("TargetMediaCardButton", (), {}),
-)
+
+def _load_save_load_actions_module():
+    for stub_name in _STUBS:
+        sys.modules[stub_name] = _stub(stub_name)
+
+    widget_components_stub = sys.modules["app.ui.widgets.widget_components"]
+    setattr(
+        widget_components_stub,
+        "TargetMediaCardButton",
+        type("TargetMediaCardButton", (), {}),
+    )
+
+    sys.modules.pop("app.ui.widgets.actions.save_load_actions", None)
+    module = importlib.import_module("app.ui.widgets.actions.save_load_actions")
+
+    # These tests validate serialization/window-state behavior, not Qt UI display.
+    module.common_widget_actions.create_and_show_toast_message = MagicMock()
+    module.common_widget_actions.create_and_show_messagebox = MagicMock()
+    return module
+
 
 # Provide the real ParametersDict through misc_helpers
 from app.helpers.miscellaneous import ParametersDict  # noqa: E402
 
 # Now import the module under test
-from app.ui.widgets.actions.save_load_actions import (  # noqa: E402
-    _apply_workspace_window_state,
-    convert_parameters_to_supported_type,
-    convert_markers_to_supported_type,
-    save_current_workspace,
+save_load_actions = _load_save_load_actions_module()
+_apply_workspace_window_state = save_load_actions._apply_workspace_window_state
+convert_parameters_to_supported_type = (
+    save_load_actions.convert_parameters_to_supported_type
 )
+convert_markers_to_supported_type = save_load_actions.convert_markers_to_supported_type
+save_current_workspace = save_load_actions.save_current_workspace
 
 
 # ---------------------------------------------------------------------------

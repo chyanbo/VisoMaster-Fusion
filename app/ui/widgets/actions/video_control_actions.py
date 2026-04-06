@@ -266,6 +266,9 @@ def add_video_slider_marker(main_window: "MainWindow"):
     Shows an error message box if either precondition is not met, or if a marker
     already exists at that position.
     """
+    if block_if_issue_scan_active(main_window, "add a marker"):
+        return
+
     if (
         not isinstance(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
@@ -306,6 +309,9 @@ def add_video_slider_marker(main_window: "MainWindow"):
 
 def show_add_marker_menu(main_window: "MainWindow"):
     """Shows a context menu for adding different types of markers."""
+    if block_if_issue_scan_active(main_window, "edit scan markers"):
+        return
+
     if (
         not isinstance(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
@@ -354,6 +360,9 @@ def show_add_marker_menu(main_window: "MainWindow"):
 
 def set_job_start_frame(main_window: "MainWindow"):
     """Adds a new job marker pair starting at the current slider position."""
+    if block_if_issue_scan_active(main_window, "add a record start marker"):
+        return
+
     current_pos = int(main_window.videoSeekSlider.value())
 
     # Basic validation: Ensure we are not adding a start if the last pair is incomplete
@@ -375,6 +384,9 @@ def set_job_start_frame(main_window: "MainWindow"):
 
 def set_job_end_frame(main_window: "MainWindow"):
     """Sets the job end frame marker for the last incomplete pair."""
+    if block_if_issue_scan_active(main_window, "add a record end marker"):
+        return
+
     current_pos = int(main_window.videoSeekSlider.value())
 
     # Validation: Check if there's an incomplete pair to add an end to
@@ -416,6 +428,9 @@ def remove_video_slider_marker(main_window: "MainWindow"):
     If the position belongs to a job marker pair, the entire pair is removed.
     If no marker exists at the position, an error message box is shown.
     """
+    if block_if_issue_scan_active(main_window, "remove a marker"):
+        return
+
     if (
         not isinstance(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
@@ -927,11 +942,141 @@ def _get_issue_scan_ui_state(main_window: "MainWindow") -> dict:
     return state
 
 
+def _copy_issue_frames_by_face(frames_by_face) -> dict[str, set[int]]:
+    """Return a detached copy of the per-face issue-frame mapping."""
+    return {
+        str(face_id): {int(frame) for frame in frames}
+        for face_id, frames in (frames_by_face or {}).items()
+    }
+
+
+def _restore_previous_issue_scan_results(main_window: "MainWindow") -> int:
+    """Restore the pre-scan findings snapshot and return its total frame count."""
+    state = _get_issue_scan_ui_state(main_window)
+    previous_results = _copy_issue_frames_by_face(
+        state.get("previous_issue_frames_by_face", {})
+    )
+    set_issue_frames_by_face(main_window, previous_results)
+    return sum(len(frames) for frames in previous_results.values())
+
+
 def _restore_issue_scan_display(main_window: "MainWindow") -> None:
     video_processor = getattr(main_window, "video_processor", None)
     process_current_frame = getattr(video_processor, "process_current_frame", None)
     if callable(process_current_frame):
         process_current_frame()
+
+
+def is_issue_scan_active(main_window: "MainWindow") -> bool:
+    return bool(
+        getattr(main_window, "scan_issue_worker", None) is not None
+        or _get_issue_scan_ui_state(main_window).get("active", False)
+    )
+
+
+def block_if_issue_scan_active(
+    main_window: "MainWindow", action_name: str, parent=None
+) -> bool:
+    if not is_issue_scan_active(main_window):
+        return False
+
+    common_widget_actions.create_and_show_toast_message(
+        main_window,
+        "Scan In Progress",
+        f"Cannot {action_name} while an issue scan is running.\nAbort the scan first, then retry the action.",
+        style_type="warning",
+    )
+    return True
+
+
+def _get_ui_object_enabled_state(widget) -> bool:
+    if widget is None:
+        return False
+    if hasattr(widget, "isEnabled") and callable(widget.isEnabled):
+        return bool(widget.isEnabled())
+    return bool(getattr(widget, "enabled", True))
+
+
+def _set_ui_object_enabled_state(widget, enabled: bool) -> None:
+    if widget is None:
+        return
+    if hasattr(widget, "setEnabled") and callable(widget.setEnabled):
+        widget.setEnabled(bool(enabled))
+        return
+    if hasattr(widget, "setDisabled") and callable(widget.setDisabled):
+        widget.setDisabled(not bool(enabled))
+        return
+    if hasattr(widget, "enabled"):
+        widget.enabled = bool(enabled)
+
+
+def _get_issue_scan_mutation_lock_targets(main_window: "MainWindow") -> list:
+    targets = []
+    for attr_name in (
+        "findTargetFacesButton",
+        "clearTargetFacesButton",
+        "buttonTargetVideosPath",
+        "buttonInputFacesPath",
+        "filterWebcamsCheckBox",
+        "openEmbeddingButton",
+        "addMarkerButton",
+        "removeMarkerButton",
+        "videoSeekSlider",
+        "frameAdvanceButton",
+        "frameRewindButton",
+        "nextMarkerButton",
+        "previousMarkerButton",
+        "swapfacesButton",
+        "editFacesButton",
+        "targetVideosList",
+        "inputFacesList",
+        "inputEmbeddingsList",
+        "jobQueueList",
+        "loadJobButton",
+        "buttonProcessAll",
+        "buttonProcessSelected",
+        "actionLoad_SavedWorkspace",
+        "actionOpen_Videos_Folder",
+        "actionOpen_Video_Files",
+        "actionLoad_Source_Image_Files",
+        "actionLoad_Source_Images_Folder",
+        "actionLoad_Embeddings",
+    ):
+        widget = getattr(main_window, attr_name, None)
+        if widget is not None:
+            targets.append(widget)
+
+    for collection_name in ("target_videos", "input_faces", "merged_embeddings"):
+        targets.extend(getattr(main_window, collection_name, {}).values())
+
+    unique_targets = []
+    seen_ids = set()
+    for target in targets:
+        if target is None:
+            continue
+        target_id = id(target)
+        if target_id in seen_ids:
+            continue
+        seen_ids.add(target_id)
+        unique_targets.append(target)
+    return unique_targets
+
+
+def _set_issue_scan_mutation_lock_state(
+    main_window: "MainWindow", scan_active: bool
+) -> None:
+    state = _get_issue_scan_ui_state(main_window)
+    if scan_active:
+        lock_targets = _get_issue_scan_mutation_lock_targets(main_window)
+        state["mutation_lock_enabled_states"] = [
+            (target, _get_ui_object_enabled_state(target)) for target in lock_targets
+        ]
+        for target in lock_targets:
+            _set_ui_object_enabled_state(target, False)
+        return
+
+    for target, was_enabled in state.pop("mutation_lock_enabled_states", []):
+        _set_ui_object_enabled_state(target, was_enabled)
 
 
 def _set_issue_scan_tool_button_state(
@@ -956,7 +1101,12 @@ def _set_issue_scan_tool_button_state(
             button.setEnabled(not scan_active)
 
 
-def _start_issue_scan_ui(main_window: "MainWindow", worker, scope_text: str) -> None:
+def _start_issue_scan_ui(
+    main_window: "MainWindow",
+    worker,
+    scope_text: str,
+    previous_issue_frames_by_face: dict[str, set[int]] | None = None,
+) -> None:
     state = _get_issue_scan_ui_state(main_window)
     state.clear()
     state.update(
@@ -965,8 +1115,16 @@ def _start_issue_scan_ui(main_window: "MainWindow", worker, scope_text: str) -> 
             "start_frame": int(main_window.videoSeekSlider.value()),
             "scope_text": scope_text,
             "keep_controls": bool(main_window.control.get("KeepControlsToggle", False)),
+            "previous_issue_frames_by_face": _copy_issue_frames_by_face(
+                previous_issue_frames_by_face
+                if previous_issue_frames_by_face is not None
+                else getattr(main_window, "issue_frames_by_face", {})
+            ),
+            "has_partial_results": False,
         }
     )
+
+    _set_issue_scan_mutation_lock_state(main_window, True)
 
     if not state["keep_controls"]:
         layout_actions.disable_all_parameters_and_control_widget(main_window)
@@ -1030,6 +1188,7 @@ def _restore_issue_scan_ui(main_window: "MainWindow") -> None:
     if toggle_button is not None:
         toggle_button.setEnabled(True)
 
+    _set_issue_scan_mutation_lock_state(main_window, False)
     state.clear()
     _set_issue_scan_tool_button_state(main_window, False)
     update_scan_review_button_states(main_window)
@@ -1064,6 +1223,7 @@ def _handle_issue_scan_progress(
 def _handle_issue_scan_issue_found(
     main_window: "MainWindow", face_id: str, frame_number: int
 ) -> None:
+    _get_issue_scan_ui_state(main_window)["has_partial_results"] = True
     add_issue_frame_for_face(main_window, face_id, frame_number)
 
 
@@ -1083,21 +1243,41 @@ def _handle_issue_scan_completed(
     elapsed_seconds: float,
     cancelled: bool = False,
 ):
-    set_issue_frames_by_face(main_window, issue_frames_by_face)
+    state = _get_issue_scan_ui_state(main_window)
+    partial_results_visible = bool(state.get("has_partial_results", False))
+    partial_results_visible = partial_results_visible or any(
+        bool(frames) for frames in issue_frames_by_face.values()
+    )
+    restored_previous_results = False
+    restored_issue_frames = 0
+
+    if cancelled and not partial_results_visible:
+        restored_previous_results = True
+        restored_issue_frames = _restore_previous_issue_scan_results(main_window)
+    else:
+        set_issue_frames_by_face(main_window, issue_frames_by_face)
+
     _restore_issue_scan_ui(main_window)
     _cleanup_issue_scan_worker(main_window)
-    total_issue_frames = sum(
-        len(set(frames)) for frames in issue_frames_by_face.values()
+    total_issue_frames = (
+        restored_issue_frames
+        if restored_previous_results
+        else sum(len(set(frames)) for frames in issue_frames_by_face.values())
     )
     scan_fps = (frames_scanned / elapsed_seconds) if elapsed_seconds > 0 else 0.0
     print(
         f"[INFO] Scan: Scope: {scope_text.removeprefix('Scanning ')} | Frames: {frames_scanned} | Time: {elapsed_seconds:.1f}s | FPS: {scan_fps:.1f} | Issues: {total_issue_frames} | Faces with issues: {faces_with_issues} | Cancelled: {cancelled}"
     )
     if cancelled:
+        cancelled_message = (
+            f"Stopped after {frames_scanned} scanned frames. Restored the previous {total_issue_frames} issue frames."
+            if restored_previous_results
+            else f"Stopped after {frames_scanned} scanned frames. Kept {total_issue_frames} issue frames found so far."
+        )
         common_widget_actions.create_and_show_toast_message(
             main_window,
             "Scan Aborted",
-            f"Stopped after {frames_scanned} scanned frames. Kept {total_issue_frames} issue frames found so far.",
+            cancelled_message,
             style_type="warning",
         )
     elif total_issue_frames:
@@ -1115,17 +1295,29 @@ def _handle_issue_scan_completed(
 
 
 def _handle_issue_scan_cancelled(main_window: "MainWindow"):
+    state = _get_issue_scan_ui_state(main_window)
+    restored_previous_results = False
+    if not state.get("has_partial_results", False):
+        _restore_previous_issue_scan_results(main_window)
+        restored_previous_results = True
     _restore_issue_scan_ui(main_window)
     _cleanup_issue_scan_worker(main_window)
     common_widget_actions.create_and_show_toast_message(
         main_window,
         "Scan Cancelled",
-        "Issue scan aborted before finalizing. Kept any issue frames found so far.",
+        (
+            "Issue scan aborted before finalizing. Restored the previous issue findings."
+            if restored_previous_results
+            else "Issue scan aborted before finalizing. Kept any issue frames found so far."
+        ),
         style_type="warning",
     )
 
 
 def _handle_issue_scan_failed(main_window: "MainWindow", error_message: str):
+    state = _get_issue_scan_ui_state(main_window)
+    if not state.get("has_partial_results", False):
+        _restore_previous_issue_scan_results(main_window)
     _restore_issue_scan_ui(main_window)
     _cleanup_issue_scan_worker(main_window)
     common_widget_actions.create_and_show_messagebox(
@@ -1172,8 +1364,11 @@ def run_issue_scan(main_window: "MainWindow"):
     worker = ui_workers.IssueScanWorker(main_window)
     main_window.scan_issue_worker = worker
     scope_text = worker._scan_scope_text
+    previous_issue_frames_by_face = _copy_issue_frames_by_face(
+        getattr(main_window, "issue_frames_by_face", {})
+    )
     set_issue_frames_by_face(main_window, {})
-    _start_issue_scan_ui(main_window, worker, scope_text)
+    _start_issue_scan_ui(main_window, worker, scope_text, previous_issue_frames_by_face)
     worker.progress.connect(
         lambda processed, total, frame_number, scan_fps: _handle_issue_scan_progress(
             main_window, scope_text, processed, total, frame_number, scan_fps
@@ -1223,6 +1418,9 @@ def remove_face_parameters_and_control_from_markers(main_window: "MainWindow", f
 
 def remove_all_markers(main_window: "MainWindow"):
     """Removes all standard, issue, and dropped-frame markers plus job pairs."""
+    if block_if_issue_scan_active(main_window, "clear markers"):
+        return
+
     standard_markers_positions = list(main_window.markers.keys())
     for marker_position in standard_markers_positions:
         remove_marker(main_window, marker_position)
