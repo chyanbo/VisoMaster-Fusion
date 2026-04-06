@@ -62,14 +62,14 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
         },
         "GlobalInputResizeToggle": {
             "level": 1,
-            "label": "Resize Input Source (Performance/Output)",
+            "label": "Resize Input Source",
             "default": False,
-            "help": "Downscales the input video/image BEFORE processing. Improves performance and sets the final output resolution to the selected size.",
+            "help": "Rescale the input video/image BEFORE processing.",
         },
         "GlobalInputResizeSizeSelection": {
             "level": 2,
             "label": "Input Resolution Target",
-            "options": ["540p", "720p", "1080p"],
+            "options": ["540p", "720p", "1080p", "1440p", "2160p"],
             "default": "720p",
             "parentToggle": "GlobalInputResizeToggle",
             "requiredToggleValue": True,

@@ -857,10 +857,10 @@ def read_frame(
     preview_target_height: Optional[int] = None,
 ) -> Tuple[bool, Optional[np.ndarray]]:
     """
-    Reads a single frame from the video capture object in a thread-safe manner
-    and applies rotation.
+    Reads a single frame from the video capture object in a thread-safe manner,
+    applies rotation, and dynamically scales the image if necessary.
 
-    The 'lock' (Point 5) is critical as 'capture_obj' is a shared resource.
+    The 'lock' is critical as 'capture_obj' is a shared resource.
     It prevents race conditions between the feeder thread and seek operations.
     """
     capture_lock = _get_capture_lock(capture_obj)
@@ -868,33 +868,47 @@ def read_frame(
     with capture_lock:
         ret, frame = capture_obj.read()
 
-    if not ret:
-        return False, None  # Return immediately if read fails
+    # Safety check: OpenCV can sometimes return ret=True but a None frame at the stream's end
+    if not ret or frame is None:
+        return False, None
 
     # 1. Apply rotation (if necessary)
     if media_rotation != 0:
         frame = _apply_frame_rotation(frame, media_rotation)
 
     # 2. Apply resizing (if necessary)
-    # This is done *after* the lock to avoid holding it during resizing.
-    if ret and preview_target_height is not None:
+    # This is done *after* the lock to avoid holding it during CPU-intensive resizing.
+    if preview_target_height is not None:
         try:
             original_height, original_width = frame.shape[:2]
             if original_height == 0:
                 return ret, frame  # Avoid division by zero
 
-            # Use the specified target height
             target_height = preview_target_height
+
+            # Optimization: Skip resize entirely if target matches original resolution
+            if target_height == original_height:
+                return ret, frame
+
             aspect_ratio = original_width / original_height
             target_width = int(target_height * aspect_ratio)
 
-            # Ensure width is even (good practice for some video operations)
+            # Ensure width is even (strict requirement for many video encoders/decoders)
             if target_width % 2 != 0:
                 target_width += 1
 
-            # cv2.INTER_AREA is generally the fastest and best for downscaling
+            # Dynamic interpolation based on scale direction:
+            # - INTER_CUBIC: Best trade-off for real-time video upscaling on CPU.
+            # - INTER_LANCZOS4: Best quality for upscaling (sharper), but higher CPU cost (8x8 neighborhood).
+            # - INTER_AREA: Best quality for downscaling (averaging pixels, avoids moire patterns).
+            if target_height > original_height:
+                inter_method = cv2.INTER_LANCZOS4
+                # inter_method = cv2.INTER_CUBIC
+            else:
+                inter_method = cv2.INTER_AREA
+
             frame = cv2.resize(
-                frame, (target_width, target_height), interpolation=cv2.INTER_AREA
+                frame, (target_width, target_height), interpolation=inter_method
             )
         except Exception as e:
             print(f"[ERROR] Failed to resize frame in preview_mode: {e}")
