@@ -187,14 +187,6 @@ class IssueScanWorker(qtc.QThread):
             for widget_name, widget in main_window.parameter_widgets.items()
             if widget_name in main_window.control
         }
-        self._target_faces_snapshot = (
-            main_window.video_processor.prepare_issue_scan_target_faces_snapshot(
-                self._scan_ranges,
-                self._base_control,
-                self._base_params,
-                self._control_defaults_snapshot,
-            )
-        )
         self._reset_frame_number = int(main_window.videoSeekSlider.value())
 
     def cancel(self):
@@ -202,6 +194,20 @@ class IssueScanWorker(qtc.QThread):
 
     def run(self):
         try:
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
+            target_faces_snapshot = self.main_window.video_processor.prepare_issue_scan_target_faces_snapshot(
+                self._scan_ranges,
+                self._base_control,
+                self._base_params,
+                self._control_defaults_snapshot,
+            )
+            if self._cancel_event.is_set():
+                self.cancelled.emit()
+                return
+
             start_time = time.monotonic()
 
             def progress_with_fps(
@@ -222,7 +228,7 @@ class IssueScanWorker(qtc.QThread):
                 target_height=self._target_height,
                 base_control=self._base_control,
                 base_params=self._base_params,
-                target_faces_snapshot=self._target_faces_snapshot,
+                target_faces_snapshot=target_faces_snapshot,
                 control_defaults_snapshot=self._control_defaults_snapshot,
                 reset_frame_number=self._reset_frame_number,
             )
