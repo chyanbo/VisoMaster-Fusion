@@ -1,6 +1,9 @@
 from typing import Any
 import app.ui.widgets.actions.control_actions as control_actions
 
+MASK_SHOW_OPTIONS = ["swap_mask", "diff", "texture"]
+MASK_SHOW_DEFAULT = "swap_mask"
+
 # Widgets in Face Swap tab are created from this Layout
 SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
     "Swapper": {
@@ -182,13 +185,6 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
         },
     },
     "Masks": {
-        "MaskShowSelection": {
-            "level": 1,
-            "label": "Mask view selection",
-            "options": ["swap_mask", "diff", "texture"],
-            "default": "swap_mask",
-            "help": 'select what mask is shown in "view face mask".',
-        },
         "BordermaskEnableToggle": {
             "level": 1,
             "label": "Border Mask",
@@ -1731,6 +1727,7 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
             "help": "Target age to transform the input face to (0–100). Click 'Apply' after changing this value.",
             "action_button": {
                 "label": "Apply",
+                "fixed_width": 68,
                 "help": "Apply the age transformation to the input face and re-compute embeddings and KV maps.",
                 "exec_function": control_actions.apply_face_reaging,
             },

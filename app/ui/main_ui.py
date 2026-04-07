@@ -32,7 +32,11 @@ from app.ui.widgets.event_filters import (
 from app.ui.widgets import ui_workers
 from app.ui.widgets.common_layout_data import COMMON_LAYOUT_DATA
 from app.ui.widgets.denoiser_layout_data import DENOISER_LAYOUT_DATA
-from app.ui.widgets.swapper_layout_data import SWAPPER_LAYOUT_DATA
+from app.ui.widgets.swapper_layout_data import (
+    SWAPPER_LAYOUT_DATA,
+    MASK_SHOW_DEFAULT,
+    MASK_SHOW_OPTIONS,
+)
 from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
 from app.ui.widgets.face_editor_layout_data import FACE_EDITOR_LAYOUT_DATA
 from app.helpers.app_metadata import get_app_display_metadata
@@ -402,6 +406,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             layoutWidget=self.swapWidgetsLayout,
             data_type="parameter",
             section_namespace="swapper",
+        )
+        common_widget_actions.create_default_parameter(
+            self, "MaskShowSelection", MASK_SHOW_DEFAULT
         )
         self._connect_mask_show_selection_sync()
         layout_actions.add_widgets_to_tab_layout(
@@ -1352,7 +1359,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     item_value if item_value is not None else widget.itemText(index)
                 )
             return values
-        return list(SWAPPER_LAYOUT_DATA["Masks"]["MaskShowSelection"]["options"])
+        return list(MASK_SHOW_OPTIONS)
 
     def _get_current_mask_show_value(self) -> str:
         widget = self._get_mask_show_selection_widget()
@@ -1366,7 +1373,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         return str(
             self.current_widget_parameters.get(
                 "MaskShowSelection",
-                SWAPPER_LAYOUT_DATA["Masks"]["MaskShowSelection"]["default"],
+                MASK_SHOW_DEFAULT,
             )
         )
 
@@ -1419,7 +1426,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             label_map = self._get_mask_show_label_map()
             widget.blockSignals(True)
             widget.clear()
-            for option in SWAPPER_LAYOUT_DATA["Masks"]["MaskShowSelection"]["options"]:
+            for option in MASK_SHOW_OPTIONS:
                 widget.addItem(label_map.get(option, option), option)
             widget.set_value(current_value)
             widget.blockSignals(False)
