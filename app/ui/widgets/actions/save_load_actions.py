@@ -166,13 +166,37 @@ def open_embeddings_from_file(main_window: "MainWindow"):
                     for recogn_model, embed in embedding_store.items():
                         embedding_store[recogn_model] = np.array(embed)
 
+                    embedding_id = str(uuid.uuid1().int)
+
                     # Pass the entire embedding_store to the function
                     list_view_actions.create_and_add_embed_button_to_list(
                         main_window,
                         embed_data["name"],
                         embedding_store,
-                        embedding_id=str(uuid.uuid1().int),
+                        embedding_id=embedding_id,
                     )
+
+                    # Restore KV map if it exists
+                    if embedding_id in main_window.merged_embeddings:
+                        embed_button = main_window.merged_embeddings[embedding_id]
+                        kv_map_path = embed_data.get("kv_map")
+                        if kv_map_path and os.path.exists(kv_map_path):
+                            try:
+                                import torch
+
+                                payload = torch.load(kv_map_path, map_location="cpu")
+                                if isinstance(payload, dict):
+                                    embed_button.kv_map = payload.get("kv_map")
+                                else:
+                                    embed_button.kv_map = payload
+                                print(
+                                    f"[INFO] Restored standalone K/V map for imported embedding: {embed_data['name']}"
+                                )
+                            except Exception as e:
+                                print(
+                                    f"[ERROR] Error loading K/V map for imported embedding from {kv_map_path}: {e}"
+                                )
+
         except (json.JSONDecodeError, KeyError, TypeError, Exception) as e:
             QtWidgets.QMessageBox.critical(
                 main_window, "Error", f"Failed to load embeddings: {e}"
@@ -205,16 +229,33 @@ def save_embeddings_to_file(main_window: "MainWindow", save_as=False):
             main_window, filter="JSON (*.json)"
         )
 
-    # Build a list of dicts, each containing the embedding name and its embedding_store
-    embeddings_list = [
-        {
-            "name": embed_button.embedding_name,
-            "embedding_store": {
-                k: v.tolist() for k, v in embed_button.embedding_store.items()
-            },  # Convert embeddings to lists
-        }
-        for embedding_id, embed_button in main_window.merged_embeddings.items()
-    ]
+    # Build a list of dicts, each containing the embedding name, embedding_store, and kv_map path
+    embeddings_list = []
+    for embedding_id, embed_button in main_window.merged_embeddings.items():
+        kv_map_path = None
+        # If embedding has KV maps we save on disk
+        if getattr(embed_button, "kv_map", None) is not None:
+            kv_data_dir = (
+                main_window.project_root_path / "model_assets" / "reference_kv_data"
+            )
+            kv_data_dir.mkdir(parents=True, exist_ok=True)
+            kv_map_file = kv_data_dir / f"embedding_standalone_{embedding_id}.pt"
+            try:
+                payload = {"kv_map": embed_button.kv_map}
+                torch.save(payload, str(kv_map_file))
+                kv_map_path = str(kv_map_file)
+            except Exception as e:
+                print(f"[ERROR] Error saving K/V map for embedding {embedding_id}: {e}")
+
+        embeddings_list.append(
+            {
+                "name": embed_button.embedding_name,
+                "embedding_store": {
+                    k: v.tolist() for k, v in embed_button.embedding_store.items()
+                },  # Convert embeddings to lists
+                "kv_map": kv_map_path,  # Save the path to JSON file
+            }
+        )
 
     # Save to file
     if embedding_filename:
@@ -452,13 +493,36 @@ def load_saved_workspace(
                         "embedding_store"
                     ].items()
                 }
-                embedding_name = embedding_data["embedding_name"]
+                # Ancient job compatibility
+                embedding_name = embedding_data.get(
+                    "embedding_name", embedding_data.get("name", "Unknown")
+                )
+
+                # Embedding button creation
                 list_view_actions.create_and_add_embed_button_to_list(
                     main_window,
                     embedding_name,
                     embedding_store_loaded,
                     embedding_id=embedding_id,
                 )
+
+                if embedding_id in main_window.merged_embeddings:
+                    embed_button = main_window.merged_embeddings[embedding_id]
+                    kv_map_path = embedding_data.get("kv_map")
+                    if kv_map_path and os.path.exists(kv_map_path):
+                        try:
+                            payload = torch.load(kv_map_path, map_location="cpu")
+                            if isinstance(payload, dict):
+                                embed_button.kv_map = payload.get("kv_map")
+                            else:
+                                embed_button.kv_map = payload
+                            print(
+                                f"[INFO] Restored K/V map for embedding: {embedding_name}"
+                            )
+                        except Exception as e:
+                            print(
+                                f"[ERROR] Error loading K/V map for embedding from {kv_map_path}: {e}"
+                            )
 
             # Add target_faces
             for face_id, target_face_data in data.get("target_faces_data", {}).items():
@@ -841,12 +905,29 @@ def save_current_workspace(
 
     # --- Serialize Embeddings ---
     for embedding_id, embedding_button in main_window.merged_embeddings.items():
+        kv_map_path = None
+        if getattr(embedding_button, "kv_map", None) is not None:
+            kv_data_dir = (
+                main_window.project_root_path / "model_assets" / "reference_kv_data"
+            )
+            kv_data_dir.mkdir(parents=True, exist_ok=True)
+            kv_map_file = kv_data_dir / f"embedding_{embedding_id}.pt"
+            try:
+                payload = {"kv_map": embedding_button.kv_map}
+                torch.save(payload, str(kv_map_file))
+                kv_map_path = str(kv_map_file)
+            except Exception as e:
+                print(
+                    f"[ERROR] Error saving K/V map for embedding {embedding_id} to {kv_map_file}: {e}"
+                )
+
         embeddings_data[embedding_id] = {
             "embedding_name": embedding_button.embedding_name,
             "embedding_store": {
                 model: emb.tolist()
                 for model, emb in embedding_button.embedding_store.items()
             },
+            "kv_map": kv_map_path,
         }
     # --- Serialize Markers ---
     # Convert Parameters inside the markers from ParametersDict to dict before saving
@@ -1012,6 +1093,29 @@ def save_current_job(main_window: "MainWindow"):
             "kv_map": kv_map_path,
         }
 
+    # --- Serialize Embeddings for Job ---
+    embeddings_data = {}
+    for eid, emb in main_window.merged_embeddings.items():
+        kv_map_path = None
+        if getattr(emb, "kv_map", None) is not None:
+            kv_data_dir = (
+                main_window.project_root_path / "model_assets" / "reference_kv_data"
+            )
+            kv_data_dir.mkdir(parents=True, exist_ok=True)
+            kv_map_file = kv_data_dir / f"embedding_{eid}.pt"
+            try:
+                payload = {"kv_map": emb.kv_map}
+                torch.save(payload, str(kv_map_file))
+                kv_map_path = str(kv_map_file)
+            except Exception as e:
+                print(f"[ERROR] Error saving K/V map for embedding {eid}: {e}")
+
+        embeddings_data[eid] = {
+            "name": emb.embedding_name,
+            "store": {m: e.tolist() for m, e in emb.embedding_store.items()},
+            "kv_map": kv_map_path,
+        }
+
     # Prepare job data
     job_data = {
         "job_name": job_name,
@@ -1034,13 +1138,7 @@ def save_current_job(main_window: "MainWindow"):
         else None,
         "input_faces_data": input_faces_data,
         "target_faces_data": {},
-        "embeddings_data": {
-            eid: {
-                "name": emb.embedding_name,
-                "store": {m: e.tolist() for m, e in emb.embedding_store.items()},
-            }
-            for eid, emb in main_window.merged_embeddings.items()
-        },
+        "embeddings_data": embeddings_data,
         "markers": convert_markers_to_supported_type(
             main_window, copy.deepcopy(main_window.markers), dict
         ),

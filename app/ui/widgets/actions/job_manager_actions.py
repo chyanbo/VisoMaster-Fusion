@@ -365,12 +365,35 @@ def _load_job_embeddings(main_window: "MainWindow", data: dict):
             embed_model: np.array(embed)
             for embed_model, embed in embedding_data["embedding_store"].items()
         }
+        from app.ui.widgets.actions import list_view_actions
+
         list_view_actions.create_and_add_embed_button_to_list(
             main_window,
             embedding_data["embedding_name"],
             embedding_store,
             embedding_id=embedding_id,
         )
+
+        # Restore KV map if it exists
+        if embedding_id in main_window.merged_embeddings:
+            embed_button = main_window.merged_embeddings[embedding_id]
+            kv_map_path = embedding_data.get("kv_map")
+            if kv_map_path and os.path.exists(kv_map_path):
+                try:
+                    import torch
+
+                    payload = torch.load(kv_map_path, map_location="cpu")
+                    if isinstance(payload, dict):
+                        embed_button.kv_map = payload.get("kv_map")
+                    else:
+                        embed_button.kv_map = payload
+                    print(
+                        f"[INFO] Restored K/V map for job embedding: {embedding_data['embedding_name']}"
+                    )
+                except Exception as e:
+                    print(
+                        f"[ERROR] Error loading K/V map for job embedding from {kv_map_path}: {e}"
+                    )
 
 
 def _load_job_target_faces_and_params(main_window: "MainWindow", data: dict):
@@ -430,14 +453,6 @@ def _load_job_target_faces_and_params(main_window: "MainWindow", data: dict):
                     "assigned_input_embedding", {}
                 ).items()
             }
-            # Now that all assignments are restored, calculate the
-            # final embedding and (critically) the K/V map.
-            # This is done *here* in the main thread, *before*
-            # any FrameWorker starts, to prevent a race condition.
-            print(
-                f"[INFO] Pre-calculating embedding and K/V map for target face {face_id}..."
-            )
-            target_face_obj.calculate_assigned_input_embedding()
         else:
             print(
                 f"[WARN] Target face object with id {face_id} not found after creation."
@@ -788,6 +803,13 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
         progress_dialog.update_progress(7, total_steps, steps[6])
         _load_job_markers(main_window, data)
 
+        # Calculate assigned_input_embedding here for KV injection
+        for face_id, target_face_button in main_window.target_faces.items():
+            print(
+                f"[INFO] Pre-calculating embedding and K/V map for target face {face_id}..."
+            )
+            target_face_button.calculate_assigned_input_embedding()
+
         progress_dialog.update_progress(8, total_steps, steps[7])
         print(f"[INFO] Loaded workspace from: {data_filename}")
 
@@ -950,6 +972,10 @@ def _restore_workspace_from_snapshot(main_window: "MainWindow", data: dict):
         progress_dialog.update_progress(7, total_steps, steps[6])
         _load_job_markers(main_window, data)
 
+        # Calculate assigned_input_embedding here for KV injection
+        for face_id, target_face_button in main_window.target_faces.items():
+            target_face_button.calculate_assigned_input_embedding()
+
         progress_dialog.update_progress(8, total_steps, steps[7])
 
         # After restoring, check if any target faces were restored
@@ -1074,12 +1100,31 @@ def _serialize_job_data(main_window: "MainWindow") -> dict:
 
     # Serialize Merged Embeddings
     for embedding_id, embed_button in main_window.merged_embeddings.items():
+        kv_map_path = None
+        if getattr(embed_button, "kv_map", None) is not None:
+            kv_data_dir = (
+                main_window.project_root_path / "model_assets" / "reference_kv_data"
+            )
+            kv_data_dir.mkdir(parents=True, exist_ok=True)
+            kv_map_file = kv_data_dir / f"embedding_{embedding_id}.pt"
+            try:
+                import torch
+
+                payload = {"kv_map": embed_button.kv_map}
+                torch.save(payload, str(kv_map_file))
+                kv_map_path = str(kv_map_file)
+            except Exception as e:
+                print(
+                    f"[ERROR] Error saving K/V map for job embedding {embedding_id}: {e}"
+                )
+
         embeddings_data[embedding_id] = {
             "embedding_store": {
                 embed_model: embedding.tolist()
                 for embed_model, embedding in embed_button.embedding_store.items()
             },
             "embedding_name": embed_button.embedding_name,
+            "kv_map": kv_map_path,
         }
 
     # Serialize Target Media (excluding webcams)
@@ -1493,6 +1538,13 @@ def load_job_settings(main_window: "MainWindow", job_data: dict):
 
         # 4. Load markers.
         _load_job_markers(main_window, job_data)
+
+        # Calculate assigned_input_embedding here for KV injection
+        for face_id, target_face_button in main_window.target_faces.items():
+            print(
+                f"[INFO] Pre-calculating embedding and K/V map for target face {face_id}..."
+            )
+            target_face_button.calculate_assigned_input_embedding()
 
         # Run exactly one refresh with the final restored state.
         _restore_state_and_refresh(main_window, previous_batch_flag)

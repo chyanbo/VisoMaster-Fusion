@@ -702,8 +702,6 @@ class TargetFaceCardButton(CardButton):
                     merged_emb = np.mean(embeddings_to_merge, axis=0)  # Fallback
 
                 # 2. Apply L2 Normalization
-                # Face embeddings must remain on the unit hypersphere.
-                # Without this, mean/median shrinks the vector length
                 norm = np.linalg.norm(merged_emb)
                 if norm > 0:
                     merged_emb = merged_emb / norm
@@ -725,77 +723,81 @@ class TargetFaceCardButton(CardButton):
         self.assigned_kv_map = None
         self.kv_data_color_transferred = False
 
-        if denoiser_on and self.assigned_input_faces:
+        if denoiser_on and (
+            self.assigned_input_faces or self.assigned_merged_embeddings
+        ):
             all_kv_maps = []
 
-            # 1. Iterate through ALL selected faces instead of just the first one
-            for input_face_id in self.assigned_input_faces.keys():
-                input_face_button = main_window.input_faces.get(input_face_id)
-                if not input_face_button:
+            # 1. Embeddings priority
+            for embedding_id in self.assigned_merged_embeddings.keys():
+                embed_button = main_window.merged_embeddings.get(embedding_id)
+                if not embed_button:
                     continue
 
-                # This lock ensures that only one thread can check the cache and generate the K/V map at a time.
-                with main_window.models_processor.kv_extraction_lock:
-                    # Check the cache *inside* the lock.
-                    if (
-                        hasattr(input_face_button, "kv_map")
-                        and input_face_button.kv_map is not None
-                        and len(input_face_button.kv_map) > 0
-                    ):
-                        # Cache found!
-                        all_kv_maps.append(input_face_button.kv_map)
-                    else:
-                        # Cache missing. Generate, cache, and assign the map.
-                        print(
-                            f"[INFO] Generating K/V map for input face: {input_face_button.media_path}"
-                        )
-                        try:
-                            from PIL import Image
+                # Check if the embedding has a pre-generated KV map
+                if (
+                    hasattr(embed_button, "kv_map")
+                    and embed_button.kv_map is not None
+                    and len(embed_button.kv_map) > 0
+                ):
+                    all_kv_maps.append(embed_button.kv_map)
 
-                            models_processor = main_window.models_processor
+            # 2. Fallback to Input Faces
+            if len(all_kv_maps) == 0:
+                for input_face_id in self.assigned_input_faces.keys():
+                    input_face_button = main_window.input_faces.get(input_face_id)
+                    if not input_face_button:
+                        continue
 
-                            # Prepare the image for the extractor
-                            cropped_face_np = (
-                                input_face_button.cropped_face
-                            )  # BGR Numpy
-                            pil_img = Image.fromarray(
-                                cropped_face_np[..., ::-1]
-                            )  # RGB PIL
+                    with main_window.models_processor.kv_extraction_lock:
+                        if (
+                            hasattr(input_face_button, "kv_map")
+                            and input_face_button.kv_map is not None
+                            and len(input_face_button.kv_map) > 0
+                        ):
+                            all_kv_maps.append(input_face_button.kv_map)
+                        else:
+                            print(
+                                f"[INFO] Generating K/V map for input face: {input_face_button.media_path}"
+                            )
+                            try:
+                                from PIL import Image
 
-                            if pil_img.size != (512, 512):
-                                pil_img = pil_img.resize(
-                                    (512, 512), Image.Resampling.LANCZOS
-                                )
+                                models_processor = main_window.models_processor
+                                cropped_face_np = input_face_button.cropped_face
+                                pil_img = Image.fromarray(cropped_face_np[..., ::-1])
 
-                            # Call the function (which no longer has an internal lock)
-                            # It will load, extract, AND unload.
-                            kv_map = models_processor.get_kv_map_for_face(pil_img)
+                                if pil_img.size != (512, 512):
+                                    pil_img = pil_img.resize(
+                                        (512, 512), Image.Resampling.LANCZOS
+                                    )
 
-                            # Cache and assign
-                            if kv_map:
-                                input_face_button.kv_map = kv_map
-                                all_kv_maps.append(kv_map)
-                                print("[INFO] Generated and cached K/V map.")
-                            else:
+                                kv_map = models_processor.get_kv_map_for_face(pil_img)
+
+                                if kv_map:
+                                    input_face_button.kv_map = kv_map
+                                    all_kv_maps.append(kv_map)
+                                    print("[INFO] Generated and cached K/V map.")
+                                else:
+                                    input_face_button.kv_map = {}
+                            except Exception as e:
+                                print(f"[ERROR] Error generating K/V map: {e}")
+                                import traceback
+
+                                traceback.print_exc()
                                 input_face_button.kv_map = {}
 
-                        except Exception as e:
-                            print(f"[ERROR] Error generating K/V map: {e}")
-                            traceback.print_exc()
-                            input_face_button.kv_map = {}  # Empty cache in case of error
-
-            # 2. Merge all collected KV Maps
+            # 3. Merge all collected KV Maps
             if all_kv_maps:
                 if len(all_kv_maps) == 1:
                     self.assigned_kv_map = all_kv_maps[0]
                 else:
                     print(
-                        f"[INFO] Merging K/V maps across {len(all_kv_maps)} input faces..."
+                        f"[INFO] Merging K/V maps across {len(all_kv_maps)} prioritized sources..."
                     )
                     merged_kv_map = {}
                     first_map = all_kv_maps[0]
 
-                    # KV Maps are dictionaries of dictionaries containing PyTorch Tensors
                     for layer_key, layer_dict in first_map.items():
                         merged_kv_map[layer_key] = {}
                         for kv_key in layer_dict.keys():
@@ -805,11 +807,8 @@ class TargetFaceCardButton(CardButton):
                                     tensors_to_merge.append(m[layer_key][kv_key])
 
                             if tensors_to_merge:
-                                # Stack all tensors along a new dimension (dim=0)
                                 stacked = torch.stack(tensors_to_merge, dim=0)
-                                # Never use Median on spacial k/v
                                 merged_tensor = torch.mean(stacked, dim=0)
-
                                 merged_kv_map[layer_key][kv_key] = merged_tensor
 
                     self.assigned_kv_map = merged_kv_map
@@ -1218,15 +1217,16 @@ class InputFaceCardButton(CardButton):
         ):
             return
 
-        # Raccogli l'intero embedding_store dalle facce selezionate
-        selected_faces_embeddings_store = [
-            input_face.embedding_store
+        # Raccogli i bottoni (oggetti) invece che solo gli store.
+        # Abbiamo bisogno del 'cropped_face' per estrarre le KV map.
+        selected_faces = [
+            input_face
             for _, input_face in self.main_window.input_faces.items()
             if input_face.isChecked()
         ]
 
         # Controlla se ci sono facce selezionate
-        if len(selected_faces_embeddings_store) == 0:
+        if len(selected_faces) == 0:
             common_widget_actions.create_and_show_messagebox(
                 self.main_window,
                 "No Faces Selected!",
@@ -1234,9 +1234,9 @@ class InputFaceCardButton(CardButton):
                 self,
             )
         else:
-            # Passa l'intero embedding_store al dialogo per la creazione dell'embedding
+            # Passa i bottoni completi al dialogo
             embed_create_dialog = CreateEmbeddingDialog(
-                self.main_window, selected_faces_embeddings_store
+                self.main_window, selected_faces
             )
             embed_create_dialog.exec_()
 
@@ -1256,6 +1256,9 @@ class EmbeddingCardButton(CardButton):
             embedding_store  # Key: embedding_swap_model, Value: embedding
         )
         self.embedding_name = embedding_name
+
+        self._kv_map: Dict | None = None
+
         self.setCheckable(True)
         self.setText(embedding_name)
         self.setToolTip(embedding_name)
@@ -1266,6 +1269,27 @@ class EmbeddingCardButton(CardButton):
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
         self.create_context_menu()
+
+    # --- Property definitions to intercept when a K/V map is assigned ---
+    @property
+    def kv_map(self):
+        """Getter for the K/V map."""
+        return self._kv_map
+
+    @kv_map.setter
+    def kv_map(self, value):
+        """Setter for the K/V map. Updates the UI color automatically."""
+        self._kv_map = value
+
+        # If valid tensors are loaded, change the text color to red and update tooltip
+        if self._kv_map is not None and len(self._kv_map) > 0:
+            # Using the UI's native accent color (#4090a3) for consistency
+            self.setStyleSheet("color: #4090a3;")
+            self.setToolTip(f"{self.embedding_name} (Includes K/V Maps)")
+        else:
+            # Reset to default UI style
+            self.setStyleSheet("")
+            self.setToolTip(self.embedding_name)
 
     def set_embedding(self, embedding_swap_model: str, embedding: np.ndarray):
         self.embedding_store[embedding_swap_model] = embedding
@@ -1354,9 +1378,10 @@ class EmbeddingCardButton(CardButton):
 
 
 class CreateEmbeddingDialog(QtWidgets.QDialog):
-    def __init__(self, main_window: "MainWindow", embedding_stores: list | None = None):
+    def __init__(self, main_window: "MainWindow", selected_faces: list | None = None):
         super().__init__()
-        self.embedding_stores = embedding_stores or []
+        # InputFaceCardButton for acces to .cropped_face and .embedding_store
+        self.selected_faces = selected_faces or []
         self.main_window = main_window
         self.embedding_name = ""
         self.merge_type = ""
@@ -1373,6 +1398,17 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
             main_window.control["EmbMergeMethodSelection"]
         )
 
+        # Checkbox to optionally generate and include K/V maps
+        self.include_kv_checkbox = QtWidgets.QCheckBox(
+            "Generate and include K/V Maps (For Denoiser)", self
+        )
+        self.include_kv_checkbox.setChecked(
+            False
+        )  # Optional feature, default to false to save time
+        self.include_kv_checkbox.setToolTip(
+            "Will extract K/V Maps from selected faces and merge them. This might take a moment."
+        )
+
         # Create button box
         QBtn = QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
         self.buttonBox = QtWidgets.QDialogButtonBox(QBtn)
@@ -1385,6 +1421,7 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
         layout.addWidget(self.embed_name_edit)
         layout.addWidget(QtWidgets.QLabel("Merge Type:"))
         layout.addWidget(self.merge_type_selection)
+        layout.addWidget(self.include_kv_checkbox)
         layout.addWidget(self.buttonBox)
 
         # Set dialog layout
@@ -1401,45 +1438,128 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
                 "Embedding Name cannot be empty!",
                 self,
             )
-        else:
-            # Estrai tutti gli embedding per ogni embedding_swap_model
-            merged_embedding_store = {}
+            return
 
-            for embedding_store in self.embedding_stores:
-                for embedding_swap_model, embedding in embedding_store.items():
-                    if embedding_swap_model not in merged_embedding_store:
-                        merged_embedding_store[embedding_swap_model] = []
-                    merged_embedding_store[embedding_swap_model].append(embedding)
+        # 1. Classic embedding merge
+        merged_embedding_store = {}
 
-            # Calcola l'embedding unito per ciascun embedding_swap_model
-            final_embedding_store = {}
-            for swap_model, embeddings in merged_embedding_store.items():
-                # 1. Apply Mean or Median
-                if self.merge_type == "Mean":
-                    merged_emb = np.mean(embeddings, axis=0)
-                elif self.merge_type == "Median":
-                    merged_emb = np.median(embeddings, axis=0)
-                else:
-                    merged_emb = np.mean(embeddings, axis=0)  # Fallback
+        for input_face in self.selected_faces:
+            for embedding_swap_model, embedding in input_face.embedding_store.items():
+                if embedding_swap_model not in merged_embedding_store:
+                    merged_embedding_store[embedding_swap_model] = []
+                merged_embedding_store[embedding_swap_model].append(embedding)
 
-                # 2. Apply L2 Normalization
-                # Ensures the resulting embedding vector length is 1.0
-                norm = np.linalg.norm(merged_emb)
-                if norm > 0:
-                    merged_emb = merged_emb / norm
+        # Calcola l'embedding unito per ciascun embedding_swap_model
+        final_embedding_store = {}
+        for swap_model, embeddings in merged_embedding_store.items():
+            if self.merge_type == "Mean":
+                merged_emb = np.mean(embeddings, axis=0)
+            elif self.merge_type == "Median":
+                merged_emb = np.median(embeddings, axis=0)
+            else:
+                merged_emb = np.mean(embeddings, axis=0)  # Fallback
 
-                final_embedding_store[swap_model] = merged_emb
+            # Apply L2 Normalization
+            norm = np.linalg.norm(merged_emb)
+            if norm > 0:
+                merged_emb = merged_emb / norm
 
-            # Crea e aggiungi il nuovo embedding_store con tutti i modelli di swap
-            from app.ui.widgets.actions import list_view_actions
+            final_embedding_store[swap_model] = merged_emb
 
-            list_view_actions.create_and_add_embed_button_to_list(
-                main_window=self.main_window,
-                embedding_name=self.embedding_name,
-                embedding_store=final_embedding_store,  # Passa l'intero embedding_store
-                embedding_id=str(uuid.uuid1().int),
-            )
-            self.accept()
+        # 2. Extract and merge K/V Maps (if checked)
+        final_kv_map = None
+        if self.include_kv_checkbox.isChecked():
+            all_kv_maps = []
+            import traceback
+            from PIL import Image
+
+            QtWidgets.QApplication.setOverrideCursor(QtCore.Qt.WaitCursor)
+
+            try:
+                for input_face in self.selected_faces:
+                    with self.main_window.models_processor.kv_extraction_lock:
+                        # Check Cache first
+                        if (
+                            hasattr(input_face, "kv_map")
+                            and input_face.kv_map is not None
+                            and len(input_face.kv_map) > 0
+                        ):
+                            all_kv_maps.append(input_face.kv_map)
+                        else:
+                            # Generate Cache
+                            print(
+                                f"[INFO] Dialog: Generating K/V map for {input_face.media_path}"
+                            )
+                            try:
+                                cropped_face_np = input_face.cropped_face
+                                pil_img = Image.fromarray(cropped_face_np[..., ::-1])
+                                if pil_img.size != (512, 512):
+                                    pil_img = pil_img.resize(
+                                        (512, 512), Image.Resampling.LANCZOS
+                                    )
+
+                                kv_map = self.main_window.models_processor.get_kv_map_for_face(
+                                    pil_img
+                                )
+
+                                if kv_map:
+                                    input_face.kv_map = kv_map
+                                    all_kv_maps.append(kv_map)
+                            except Exception as e:
+                                print(f"[ERROR] Error generating K/V map: {e}")
+                                traceback.print_exc()
+
+                if all_kv_maps:
+                    if len(all_kv_maps) == 1:
+                        final_kv_map = all_kv_maps[0]
+                    else:
+                        print(
+                            f"[INFO] Dialog: Merging K/V maps across {len(all_kv_maps)} faces..."
+                        )
+                        merged_kv_map = {}
+                        first_map = all_kv_maps[0]
+
+                        for layer_key, layer_dict in first_map.items():
+                            merged_kv_map[layer_key] = {}
+                            for kv_key in layer_dict.keys():
+                                tensors_to_merge = []
+                                for m in all_kv_maps:
+                                    if layer_key in m and kv_key in m[layer_key]:
+                                        tensors_to_merge.append(m[layer_key][kv_key])
+
+                                if tensors_to_merge:
+                                    import torch
+
+                                    stacked = torch.stack(tensors_to_merge, dim=0)
+                                    # Never use Median on spacial k/v -> always mean
+                                    merged_tensor = torch.mean(stacked, dim=0)
+                                    merged_kv_map[layer_key][kv_key] = merged_tensor
+
+                        final_kv_map = merged_kv_map
+            finally:
+                QtWidgets.QApplication.restoreOverrideCursor()
+
+        # 3. Button Creation and Injection
+        from app.ui.widgets.actions import list_view_actions
+
+        embedding_id = str(uuid.uuid1().int)
+
+        list_view_actions.create_and_add_embed_button_to_list(
+            main_window=self.main_window,
+            embedding_name=self.embedding_name,
+            embedding_store=final_embedding_store,
+            embedding_id=embedding_id,
+        )
+
+        # 4. Assign the K/V Map to the new button
+        if final_kv_map is not None:
+            if embedding_id in self.main_window.merged_embeddings:
+                self.main_window.merged_embeddings[embedding_id].kv_map = final_kv_map
+                print(
+                    f"[INFO] Successfully linked merged K/V map to embedding '{self.embedding_name}'."
+                )
+
+        self.accept()
 
 
 class LoadingDialog(QtWidgets.QDialog):
@@ -1843,6 +1963,31 @@ class ToggleButton(QtWidgets.QPushButton, ParametersWidget):
                 None,
             )
         )
+
+        # Check Denoiser Button
+        if self.widget_name and "Denoiser" in self.widget_name:
+            self.toggled.connect(self._trigger_kv_recalc)
+
+    def _trigger_kv_recalc(self, checked):
+        """
+        Forces the update of K/V Maps and refreshes the image.
+        Uses a QTimer to delay execution and ensure that
+        main_window.control has properly registered the 'True' state of the button.
+        """
+
+        def delayed_recalc():
+            # 1. Recalculate the K/V map for all target faces
+            if hasattr(self.main_window, "target_faces"):
+                for face in self.main_window.target_faces.values():
+                    face.calculate_assigned_input_embedding()
+
+            # 2. Force image refresh with the new data
+            import app.ui.widgets.actions.common_actions as common_widget_actions
+
+            common_widget_actions.refresh_frame(self.main_window)
+
+        # 50 ms delay for PySide6
+        QtCore.QTimer.singleShot(50, delayed_recalc)
 
     # Property for animation
     def _get_circle_position(self):
