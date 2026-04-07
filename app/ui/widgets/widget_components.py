@@ -2564,16 +2564,7 @@ class SectionHeaderButton(QtWidgets.QPushButton):
         )
         self.setFixedHeight(self._fixed_height)
         self.setText("")
-        self.setStyleSheet(
-            "QPushButton {"
-            "border: none;"
-            "background: transparent;"
-            "}"
-            "QPushButton:hover {"
-            "background-color: rgba(255, 255, 255, 12);"
-            "border-radius: 4px;"
-            "}"
-        )
+        self.setStyleSheet("QPushButton {border: none;background: transparent;}")
         self._title = title
 
     def _get_indicator_angle(self) -> float:
@@ -2593,11 +2584,12 @@ class SectionHeaderButton(QtWidgets.QPushButton):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
 
-        if self.underMouse():
-            hover_rect = self.rect().adjusted(0, 0, -1, -1)
-            painter.setPen(QtCore.Qt.PenStyle.NoPen)
-            painter.setBrush(QtGui.QColor(255, 255, 255, 12))
-            painter.drawRoundedRect(hover_rect, 4, 4)
+        background_rect = self.rect().adjusted(0, 0, -1, -1)
+        background_color = self.palette().buttonText().color()
+        background_color.setAlpha(20 if self.underMouse() else 10)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(background_color)
+        painter.drawRoundedRect(background_rect, 4, 4)
 
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
         painter.setBrush(self.palette().buttonText())
@@ -2618,7 +2610,7 @@ class SectionHeaderButton(QtWidgets.QPushButton):
         text_rect = self.rect().adjusted(24, 0, -8, 0)
         painter.setPen(self.palette().buttonText().color())
         font = painter.font()
-        font.setWeight(QtGui.QFont.Weight.DemiBold)
+        font.setWeight(QtGui.QFont.Weight.Bold)
         painter.setFont(font)
         painter.drawText(
             text_rect,

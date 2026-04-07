@@ -54,9 +54,14 @@ def add_widgets_to_tab_layout(
 
     for category, widgets in LAYOUT_DATA.items():
         section_id = build_section_id(category)
+        display_title = (
+            "Face Editor"
+            if section_namespace == "face_editor" and not category
+            else category
+        )
         group_box = widget_components.CollapsibleSection(
             main_window,
-            title=category,
+            title=display_title,
             section_id=section_id,
             expanded=main_window.parameter_section_states.get(section_id, True),
         )
@@ -371,7 +376,10 @@ def add_widgets_to_tab_layout(
                     _ab_data: dict = cast(dict, widget_data["action_button"])
                     _action_btn = QtWidgets.QPushButton(cast(str, _ab_data["label"]))
                     _action_btn.setToolTip(cast(str, _ab_data.get("help", "")))
-                    _action_btn.setMaximumWidth(55)
+                    if "fixed_width" in _ab_data:
+                        _action_btn.setFixedWidth(cast(int, _ab_data["fixed_width"]))
+                    else:
+                        _action_btn.setMaximumWidth(55)
                     if "exec_function" in _ab_data:
                         _action_btn.clicked.connect(
                             partial(
