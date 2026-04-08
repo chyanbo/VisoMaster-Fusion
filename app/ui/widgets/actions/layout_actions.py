@@ -28,7 +28,7 @@ def add_widgets_to_tab_layout(
     layout.setContentsMargins(0, 0, 10, 0)
     scroll_area = QtWidgets.QScrollArea()
     scroll_area.setWidgetResizable(True)
-    scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+    scroll_area.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
     scroll_content = QtWidgets.QWidget()
     scroll_content.setSizePolicy(
         QtWidgets.QSizePolicy.Policy.Expanding,

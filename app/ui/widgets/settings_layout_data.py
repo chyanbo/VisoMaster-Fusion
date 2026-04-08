@@ -18,7 +18,11 @@ EXPERIMENTAL_SETTINGS_CONTROL_KEYS = frozenset(
     }
 )
 REMOVED_SETTINGS_CONTROL_KEYS = frozenset(
-    {"CommandLineDebugEnableToggle", *EXPERIMENTAL_SETTINGS_CONTROL_KEYS}
+    {
+        "CommandLineDebugEnableToggle",
+        "DilatationTypeSelection",
+        *EXPERIMENTAL_SETTINGS_CONTROL_KEYS,
+    }
 )
 
 SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
@@ -681,12 +685,11 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": 'Do not show the "load last workspace" dialog when open then app, always load last workspace.',
         },
-        "DilatationTypeSelection": {
+        "SliderMouseWheelControlToggle": {
             "level": 1,
-            "label": "Mask Dilatation Type",
-            "options": ["conv", "pool", "iter_pool"],
-            "default": "conv",
-            "help": "Max_Pool2d is faster but conv2d is more precise (especially on higher dilatation values)",
+            "label": "Enable Mouse Wheel on Parameter Controls",
+            "default": False,
+            "help": "When enabled, the mouse wheel adjusts parameter sliders and dropdowns on hover.\nWhen disabled, the mouse wheel scrolls the parameter panel instead.\nHold Ctrl to temporarily adjust a hovered slider or dropdown while this is disabled.",
         },
     },
 }

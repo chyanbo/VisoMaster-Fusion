@@ -1960,6 +1960,19 @@ class SelectionBox(QtWidgets.QComboBox, ParametersWidget):
             view.setMaximumHeight(popup_height)
         super().showPopup()
 
+    def wheelEvent(self, event: QtGui.QWheelEvent):
+        wheel_control_enabled = bool(
+            self.main_window.control.get("SliderMouseWheelControlToggle", False)
+        )
+        ctrl_pressed = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        )
+        if not wheel_control_enabled and not ctrl_pressed:
+            event.ignore()
+            return
+        super().wheelEvent(event)
+
 
 class ToggleButton(QtWidgets.QPushButton, ParametersWidget):
     _circle_position = None
@@ -2153,6 +2166,17 @@ class ParameterSlider(QtWidgets.QSlider, ParametersWidget):
 
     def wheelEvent(self, event):
         """Override wheel event to define custom increments/decrements with the mouse wheel."""
+        wheel_control_enabled = bool(
+            self.main_window.control.get("SliderMouseWheelControlToggle", False)
+        )
+        ctrl_pressed = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        )
+        if not wheel_control_enabled and not ctrl_pressed:
+            event.ignore()
+            return
+
         num_steps = event.angleDelta().y() / 120  # 120 is one step of the wheel
 
         # Adjust the current value based on the number of steps
@@ -2311,6 +2335,17 @@ class ParameterDecimalSlider(QtWidgets.QSlider, ParametersWidget):
 
     def wheelEvent(self, event):
         """Override wheel event to define custom increments/decrements with the mouse wheel."""
+        wheel_control_enabled = bool(
+            self.main_window.control.get("SliderMouseWheelControlToggle", False)
+        )
+        ctrl_pressed = bool(
+            QtWidgets.QApplication.keyboardModifiers()
+            & QtCore.Qt.KeyboardModifier.ControlModifier
+        )
+        if not wheel_control_enabled and not ctrl_pressed:
+            event.ignore()
+            return
+
         num_steps = event.angleDelta().y() / 120  # 120 is one step of the wheel
 
         # Adjust the current value based on the number of steps
