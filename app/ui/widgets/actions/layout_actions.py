@@ -678,13 +678,13 @@ def set_up_menu_actions(main_window: "MainWindow"):
 
     if not hasattr(main_window, "actionEdit_CopyParameters"):
         main_window.actionEdit_CopyParameters = QtGui.QAction(
-            "Copy Parameters", main_window
+            "Copy Parameters from Selected Face", main_window
         )
         main_window.actionEdit_PasteParameters = QtGui.QAction(
-            "Paste Parameters", main_window
+            "Paste Parameters to Selected Face", main_window
         )
         main_window.actionEdit_ResetParameters = QtGui.QAction(
-            "Reset Parameters", main_window
+            "Reset Selected Face Parameters", main_window
         )
         main_window.menuEdit.clear()
         main_window.menuEdit.addAction(main_window.actionEdit_CopyParameters)

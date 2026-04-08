@@ -39,6 +39,8 @@ class CardButton(QPushButton):
         self.blockSignals(False)
 
     def get_item_position(self):
+        if self.list_widget is None:
+            return None
         for i in range(self.list_widget.count() - 1, -1, -1):
             list_item = self.list_widget.item(i)
             if list_item.listWidget().itemWidget(list_item) == self:
@@ -484,6 +486,21 @@ class TargetFaceCardButton(CardButton):
         self.mouth_openness_state: MouthOpennessState = MouthOpennessState()
 
         self.setCheckable(True)
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(1)
+
+        self.display_label = QtWidgets.QLabel("", self)
+        self.display_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignBottom)
+        title_font = self.display_label.font()
+        title_font.setPointSize(9)
+        title_font.setBold(True)
+        self.display_label.setFont(title_font)
+        self.display_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout.addStretch(1)
+        layout.addWidget(self.display_label)
         self.clicked.connect(self.load_target_face)
 
         # Set the context menu policy to trigger the custom context menu on right-click
@@ -821,12 +838,19 @@ class TargetFaceCardButton(CardButton):
     def create_context_menu(self):
         # create context menu
         self.popMenu = QtWidgets.QMenu(self)
+        self.face_header_action = QtGui.QAction(self.get_display_label(), self)
+        header_font = self.popMenu.font()
+        header_font.setBold(True)
+        self.face_header_action.setFont(header_font)
+        self.face_header_action.setEnabled(False)
+        self.popMenu.addAction(self.face_header_action)
+        self.popMenu.addSeparator()
         self.parameters_copy_action = QtGui.QAction("Copy Parameters", self)
         self.parameters_copy_action.triggered.connect(self.copy_parameters)
-        self.parameters_paste_action = QtGui.QAction("Apply Copied Parameters", self)
+        self.parameters_paste_action = QtGui.QAction("Paste Parameters", self)
         self.parameters_paste_action.triggered.connect(self.paste_and_apply_parameters)
         self.save_parameters_action = QtGui.QAction(
-            "Save Current Parameters and Settings", self
+            "Save Parameters and Settings", self
         )
         self.save_parameters_action.triggered.connect(
             partial(
@@ -835,7 +859,7 @@ class TargetFaceCardButton(CardButton):
                 self.face_id,
             )
         )
-        self.load_parameters_action = QtGui.QAction("Load Parameters", self)
+        self.load_parameters_action = QtGui.QAction("Load Parameters Only", self)
         self.load_parameters_action.triggered.connect(
             partial(
                 save_load_actions.load_parameters_and_settings,
@@ -866,6 +890,7 @@ class TargetFaceCardButton(CardButton):
     def on_context_menu(self, point):
         # show context menu
         scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+        self.face_header_action.setText(self.get_display_label())
         self.parameters_paste_action.setEnabled(not scan_active)
         self.load_parameters_action.setEnabled(not scan_active)
         self.load_parameters_and_settings_action.setEnabled(not scan_active)
@@ -885,6 +910,9 @@ class TargetFaceCardButton(CardButton):
         i = self.get_item_position()
         main_window.targetFacesList.takeItem(i)
         main_window.target_faces.pop(self.face_id)
+        from app.ui.widgets.actions import list_view_actions
+
+        list_view_actions.refresh_target_face_display_labels(main_window)
         # Pop parameters using the target's face_id
         main_window.parameters.pop(self.face_id)
         if hasattr(main_window, "issue_frames_by_face"):
@@ -901,15 +929,14 @@ class TargetFaceCardButton(CardButton):
             main_window.selected_target_face_id = None
             video_control_actions.refresh_issue_frames_for_selected_face(main_window)
         video_control_actions.update_scan_review_button_states(main_window)
-
         video_control_actions.remove_face_parameters_and_control_from_markers(
             main_window, self.face_id
         )  # Remove parameters for the face from all markers
         common_widget_actions.refresh_frame(self.main_window)
 
         # Explicitly release large data before Qt schedules widget destruction.
-        # KV maps can be 10–100 MB; embeddings are smaller but numpy arrays that
-        # benefit from prompt deallocation.  deleteLater() only schedules the C++
+        # KV maps can be 10-100 MB; embeddings are smaller but numpy arrays that
+        # benefit from prompt deallocation. deleteLater() only schedules the C++
         # widget object; Python-side attributes survive until GC runs otherwise.
         self.assigned_kv_map = None
         self.aged_kv_map = None
@@ -920,6 +947,17 @@ class TargetFaceCardButton(CardButton):
         self.assigned_merged_embeddings.clear()
 
         self.deleteLater()
+
+    def get_display_label(self) -> str:
+        item_position = self.get_item_position()
+        if item_position is None:
+            return "Face"
+        return f"Face {item_position + 1}"
+
+    def refresh_display_label(self):
+        display_label = self.get_display_label()
+        self.display_label.setText(display_label)
+        self.face_header_action.setText(display_label)
 
     def remove_assigned_input_face(self, input_face_id):
         if self.assigned_input_faces.get(input_face_id):
