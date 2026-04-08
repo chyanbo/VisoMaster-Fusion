@@ -872,62 +872,56 @@
     <layout class="QGridLayout" name="gridLayout_4">
      <item row="0" column="0">
       <layout class="QVBoxLayout" name="vboxLayout">
-       <item>
-        <widget class="QGroupBox" name="groupBox_TargetVideos_Select">
-         <property name="title">
-          <string>Target Videos/Images</string>
-         </property>
-         <layout class="QGridLayout" name="gridLayout_3">
-          <item row="0" column="0">
-           <layout class="QHBoxLayout" name="horizontalLayout_7">
-            <item>
-             <widget class="QLabel" name="labelTargetVideosPath">
-              <property name="text">
-               <string>Select Videos/Images Path</string>
-              </property>
-              <property name="wordWrap">
-               <bool>false</bool>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QPushButton" name="buttonTargetVideosPath">
-              <property name="sizePolicy">
-               <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-                <horstretch>0</horstretch>
-                <verstretch>0</verstretch>
-               </sizepolicy>
-              </property>
-              <property name="toolTip">
-               <string>Choose Target Media Folder</string>
-              </property>
-              <property name="text">
-               <string/>
-              </property>
-              <property name="icon">
-               <iconset resource="media.qrc">
-                <normaloff>:/media/media/open_file.png</normaloff>:/media/media/open_file.png</iconset>
-              </property>
-              <property name="iconSize">
-               <size>
-                <width>18</width>
-                <height>18</height>
-               </size>
-              </property>
-              <property name="flat">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-           </layout>
+        <item>
+         <layout class="QHBoxLayout" name="horizontalLayout_7">
+          <item>
+           <widget class="QLineEdit" name="targetVideosPathLineEdit">
+            <property name="text">
+             <string/>
+            </property>
+            <property name="readOnly">
+             <bool>true</bool>
+            </property>
+            <property name="placeholderText">
+             <string>Select Videos/Images Path</string>
+            </property>
+           </widget>
+          </item>
+          <item>
+           <widget class="QPushButton" name="buttonTargetVideosPath">
+            <property name="sizePolicy">
+             <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+              <horstretch>0</horstretch>
+              <verstretch>0</verstretch>
+             </sizepolicy>
+            </property>
+            <property name="toolTip">
+             <string>Choose Target Media Folder</string>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="icon">
+             <iconset resource="media.qrc">
+              <normaloff>:/media/media/open_file.png</normaloff>:/media/media/open_file.png</iconset>
+            </property>
+            <property name="iconSize">
+             <size>
+              <width>18</width>
+              <height>18</height>
+             </size>
+            </property>
+            <property name="flat">
+             <bool>true</bool>
+            </property>
+           </widget>
           </item>
          </layout>
-        </widget>
-       </item>
+        </item>
        <item>
         <layout class="QHBoxLayout" name="horizontalLayout_9">
          <item>
-          <widget class="QLineEdit" name="targetVideosSearchBox">
+         <widget class="QLineEdit" name="targetVideosSearchBox">
            <property name="text">
             <string/>
            </property>
@@ -937,55 +931,27 @@
           </widget>
          </item>
          <item>
-          <widget class="QCheckBox" name="filterImagesCheckBox">
+          <widget class="QPushButton" name="targetVideosFilterMenuButton">
            <property name="toolTip">
-            <string>Include Images</string>
-           </property>
-           <property name="text">
-            <string/>
-           </property>
-           <property name="icon">
-            <iconset resource="media.qrc">
-             <normaloff>:/media/media/image.png</normaloff>:/media/media/image.png</iconset>
-           </property>
-           <property name="checked">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QCheckBox" name="filterVideosCheckBox">
-           <property name="toolTip">
-            <string>Include Videos</string>
-           </property>
-           <property name="text">
-            <string/>
-           </property>
-           <property name="icon">
-            <iconset resource="media.qrc">
-             <normaloff>:/media/media/video.png</normaloff>:/media/media/video.png</iconset>
-           </property>
-           <property name="checked">
-            <bool>true</bool>
-           </property>
-          </widget>
-         </item>
-         <item>
-          <widget class="QCheckBox" name="filterWebcamsCheckBox">
-           <property name="toolTip">
-            <string>Include Webcams</string>
-           </property>
-           <property name="text">
-            <string/>
-           </property>
-           <property name="icon">
-            <iconset resource="media.qrc">
-             <normaloff>:/media/media/webcam.png</normaloff>:/media/media/webcam.png</iconset>
-           </property>
-           <property name="checked">
-            <bool>false</bool>
-           </property>
-          </widget>
+            <string>Target media filters</string>
+            </property>
+            <property name="text">
+             <string/>
+            </property>
+            <property name="icon">
+             <iconset resource="media.qrc">
+             <normaloff>:/media/media/filter.png</normaloff>:/media/media/filter.png</iconset>
+            </property>
+            <property name="iconSize">
+             <size>
+              <width>18</width>
+              <height>18</height>
+             </size>
+            </property>
+             <property name="flat">
+              <bool>true</bool>
+             </property>
+           </widget>
          </item>
         </layout>
        </item>

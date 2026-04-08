@@ -773,13 +773,13 @@ def load_saved_workspace(
             }
             for panel_key, visible in panel_state_map.items():
                 main_window._set_panel_visibility(panel_key, visible)
-            main_window.filterImagesCheckBox.setChecked(
+            main_window.targetVideosFilterImagesCheckBox.setChecked(
                 window_state.get("filterImagesCheckBox", True)
             )
-            main_window.filterVideosCheckBox.setChecked(
+            main_window.targetVideosFilterVideosCheckBox.setChecked(
                 window_state.get("filterVideosCheckBox", True)
             )
-            main_window.filterWebcamsCheckBox.setChecked(
+            main_window.targetVideosFilterWebcamsCheckBox.setChecked(
                 window_state.get("filterWebcamsCheckBox", False)
             )
             if hasattr(main_window, "scanToolsToggleButton"):
@@ -870,9 +870,9 @@ def save_current_workspace(
         "jobs": main_window.panel_visibility_state.get("jobs", True),
         "faces": main_window.panel_visibility_state.get("faces", True),
         "parameters": main_window.panel_visibility_state.get("parameters", True),
-        "filterImagesCheckBox": main_window.filterImagesCheckBox.isChecked(),
-        "filterVideosCheckBox": main_window.filterVideosCheckBox.isChecked(),
-        "filterWebcamsCheckBox": main_window.filterWebcamsCheckBox.isChecked(),
+        "filterImagesCheckBox": main_window.targetVideosFilterImagesCheckBox.isChecked(),
+        "filterVideosCheckBox": main_window.targetVideosFilterVideosCheckBox.isChecked(),
+        "filterWebcamsCheckBox": main_window.targetVideosFilterWebcamsCheckBox.isChecked(),
         "scan_tools_expanded": getattr(main_window, "scan_tools_expanded", False),
         "parameter_section_states": {
             section_id: bool(expanded)

@@ -299,10 +299,8 @@ def select_target_medias(
         )
         if not folder_name:
             return
-        main_window.labelTargetVideosPath.setText(
-            misc_helpers.truncate_text(folder_name)
-        )
-        main_window.labelTargetVideosPath.setToolTip(folder_name)
+        main_window.targetVideosPathLineEdit.setText(folder_name)
+        main_window.targetVideosPathLineEdit.setToolTip(folder_name)
         main_window.last_target_media_folder_path = folder_name
 
     elif source_type == "files":
@@ -311,10 +309,8 @@ def select_target_medias(
             return
         # Get Folder name from the first file
         file_dir = misc_helpers.get_dir_of_file(files_list[0])
-        main_window.labelTargetVideosPath.setText(
-            file_dir
-        )  # Just a temp text until i think of something better
-        main_window.labelTargetVideosPath.setToolTip(file_dir)
+        main_window.targetVideosPathLineEdit.setText(file_dir)
+        main_window.targetVideosPathLineEdit.setToolTip(file_dir)
         main_window.last_target_media_folder_path = file_dir
 
     clear_stop_loading_target_media(main_window)
@@ -355,7 +351,12 @@ def load_target_webcams(
     if video_control_actions.is_issue_scan_active(main_window):
         video_control_actions._mark_pending_target_media_refresh(main_window)
         return
-    if main_window.filterWebcamsCheckBox.isChecked():
+    if filter_actions._get_target_video_filter_checked(
+        main_window,
+        "targetVideosFilterWebcamsAction",
+        "targetVideosFilterWebcamsCheckBox",
+        False,
+    ):
         main_window.video_loader_worker = ui_workers.TargetMediaLoaderWorker(
             main_window=main_window, webcam_mode=True
         )

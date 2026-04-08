@@ -1037,7 +1037,7 @@ def _get_issue_scan_mutation_lock_targets(main_window: "MainWindow") -> list:
         "clearTargetFacesButton",
         "buttonTargetVideosPath",
         "buttonInputFacesPath",
-        "filterWebcamsCheckBox",
+        "targetVideosFilterMenuButton",
         "openEmbeddingButton",
         "addMarkerButton",
         "removeMarkerButton",

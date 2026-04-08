@@ -229,6 +229,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.buttonTargetVideosPath.clicked.connect(
             partial(list_view_actions.select_target_medias, self, "folder")
         )
+        self._initialize_target_videos_filter_menu()
         self.buttonInputFacesPath.clicked.connect(
             partial(list_view_actions.select_input_face_images, self, "folder")
         )
@@ -323,18 +324,6 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.targetVideosSearchBox.textChanged.connect(
             partial(filter_actions.filter_target_videos, self)
         )
-        self.filterImagesCheckBox.clicked.connect(
-            partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterVideosCheckBox.clicked.connect(
-            partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterWebcamsCheckBox.clicked.connect(
-            partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterWebcamsCheckBox.clicked.connect(
-            partial(list_view_actions.load_target_webcams, self)
-        )
 
         self.inputFacesSearchBox.textChanged.connect(
             partial(filter_actions.filter_input_faces, self)
@@ -380,6 +369,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.theatreModeButton.clicked.connect(
             partial(video_control_actions.toggle_theatre_mode, self)
         )
+
         self._install_view_panel_toggle_actions()
         self._install_view_navigation_actions()
         self._install_media_controls_layout()
@@ -549,6 +539,54 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.scan_progress_dialog.setAutoClose(False)
         self.scan_progress_dialog.setAutoReset(False)
         self.scan_progress_dialog.close()
+
+    def _initialize_target_videos_filter_menu(self):
+        self.targetVideosFilterMenu = QtWidgets.QMenu(self.targetVideosFilterMenuButton)
+        self.targetVideosFilterMenuButton.setStyleSheet(
+            "QPushButton::menu-indicator { image: none; width: 0px; }"
+        )
+        self.targetVideosFilterImagesCheckBox = (
+            self._create_target_videos_filter_menu_checkbox(
+                "Images", ":/media/media/image.png", checked=True
+            )
+        )
+        self.targetVideosFilterVideosCheckBox = (
+            self._create_target_videos_filter_menu_checkbox(
+                "Videos", ":/media/media/video.png", checked=True
+            )
+        )
+        self.targetVideosFilterWebcamsCheckBox = (
+            self._create_target_videos_filter_menu_checkbox(
+                "Webcams", ":/media/media/webcam.png", checked=False
+            )
+        )
+
+        self.targetVideosFilterMenuButton.setMenu(self.targetVideosFilterMenu)
+
+        self.targetVideosFilterImagesCheckBox.toggled.connect(
+            partial(filter_actions.filter_target_videos, self)
+        )
+        self.targetVideosFilterVideosCheckBox.toggled.connect(
+            partial(filter_actions.filter_target_videos, self)
+        )
+        self.targetVideosFilterWebcamsCheckBox.toggled.connect(
+            partial(filter_actions.filter_target_videos, self)
+        )
+        self.targetVideosFilterWebcamsCheckBox.toggled.connect(
+            partial(list_view_actions.load_target_webcams, self)
+        )
+
+    def _create_target_videos_filter_menu_checkbox(
+        self, text: str, icon_path: str, checked: bool
+    ) -> QtWidgets.QCheckBox:
+        checkbox = QtWidgets.QCheckBox(text, self.targetVideosFilterMenu)
+        checkbox.setIcon(QtGui.QIcon(icon_path))
+        checkbox.setChecked(checked)
+
+        action = QtWidgets.QWidgetAction(self.targetVideosFilterMenu)
+        action.setDefaultWidget(checkbox)
+        self.targetVideosFilterMenu.addAction(action)
+        return checkbox
 
     def update_denoiser_controls_visibility_for_pass(
         self, pass_suffix: str, current_mode_text: str
