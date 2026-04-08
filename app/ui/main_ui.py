@@ -287,6 +287,15 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         # Set up videoSeekLineEdit and add the event filter to handle changes
         video_control_actions.set_up_video_seek_line_edit(self)
+        self.videoTimeLineEdit = QtWidgets.QLineEdit(self.mediaLayout)
+        self.videoTimeLineEdit.setObjectName("videoTimeLineEdit")
+        self.videoTimeLineEdit.setReadOnly(True)
+        self.videoTimeLineEdit.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.videoTimeLineEdit.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.videoTimeLineEdit.setMaximumSize(QtCore.QSize(55, 16777215))
+        self.videoTimeLineEdit.setToolTip("Current Time (mm:ss)")
+        self.horizontalLayoutMediaSlider.addWidget(self.videoTimeLineEdit)
+        video_control_actions.update_video_time_line_edit(self, 0)
         video_seek_line_edit_event_filter = videoSeekSliderLineEditEventFilter(
             self, self.videoSeekLineEdit
         )
