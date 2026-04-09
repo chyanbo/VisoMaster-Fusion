@@ -4236,6 +4236,7 @@ class FrameWorker(threading.Thread):
                 original_face_512,
                 swap,
                 cast(dict, parameters),
+                cast(dict, control),
                 driving_kps=kps_all_crop,
                 target_kps=None if is_geometry_altered else kps_all_crop,
             )
@@ -4610,6 +4611,7 @@ class FrameWorker(threading.Thread):
                 original_face_512,
                 swap,
                 cast(dict, parameters),
+                cast(dict, control),
                 driving_kps=kps_all_crop,
                 target_kps=None if is_geometry_altered else kps_all_crop,
             )
@@ -4695,6 +4697,7 @@ class FrameWorker(threading.Thread):
                 original_face_512,
                 swap,
                 cast(dict, parameters),
+                cast(dict, control),
                 driving_kps=kps_all_crop,
                 target_kps=None if is_geometry_altered else kps_all_crop,
             )
