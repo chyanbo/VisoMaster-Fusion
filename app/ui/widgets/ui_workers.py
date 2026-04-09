@@ -247,6 +247,8 @@ class IssueScanWorker(qtc.QThread):
                 bool(result.get("cancelled", False)),
             )
         except Exception as exc:
+            print(f"[ERROR] IssueScanWorker Failed to run: {exc}")
+            traceback.print_exc()
             self.failed.emit(str(exc))
 
 
