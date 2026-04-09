@@ -1725,7 +1725,7 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
             "requiredToggleValue": True,
             "enable_refresh_frame": False,
             "help": "Target age to transform the input face to (0–100). Click 'Apply' after changing this value.",
-            "action_button": {
+            "below_row_button": {
                 "label": "Apply",
                 "fixed_width": 68,
                 "help": "Apply the age transformation to the input face and re-compute embeddings and KV maps.",
