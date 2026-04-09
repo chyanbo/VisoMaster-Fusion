@@ -785,14 +785,28 @@ def load_saved_workspace(
             }
             for panel_key, visible in panel_state_map.items():
                 main_window._set_panel_visibility(panel_key, visible)
-            main_window.targetVideosFilterImagesCheckBox.setChecked(
-                window_state.get("filterImagesCheckBox", True)
+
+            def restore_checkbox_without_emitting_signals(checkbox, checked: bool):
+                if hasattr(checkbox, "blockSignals"):
+                    previous_state = checkbox.blockSignals(True)
+                    try:
+                        checkbox.setChecked(checked)
+                    finally:
+                        checkbox.blockSignals(previous_state)
+                else:
+                    checkbox.setChecked(checked)
+
+            restore_checkbox_without_emitting_signals(
+                main_window.targetVideosFilterImagesCheckBox,
+                window_state.get("filterImagesCheckBox", True),
             )
-            main_window.targetVideosFilterVideosCheckBox.setChecked(
-                window_state.get("filterVideosCheckBox", True)
+            restore_checkbox_without_emitting_signals(
+                main_window.targetVideosFilterVideosCheckBox,
+                window_state.get("filterVideosCheckBox", True),
             )
-            main_window.targetVideosFilterWebcamsCheckBox.setChecked(
-                window_state.get("filterWebcamsCheckBox", False)
+            restore_checkbox_without_emitting_signals(
+                main_window.targetVideosFilterWebcamsCheckBox,
+                window_state.get("filterWebcamsCheckBox", False),
             )
             saved_face_thumbnail_size = window_state.get("face_thumbnail_size")
             if saved_face_thumbnail_size == "small":

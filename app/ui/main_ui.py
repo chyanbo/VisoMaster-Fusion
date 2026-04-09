@@ -661,19 +661,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Helper to set visibility for a widget and its associated label and reset button
         def set_widget_visibility(widget_instance, is_visible):
             if widget_instance:
-                widget_instance.setVisible(is_visible)
-                if (
-                    hasattr(widget_instance, "label_widget")
-                    and widget_instance.label_widget
-                ):
-                    widget_instance.label_widget.setVisible(is_visible)
-                if (
-                    hasattr(widget_instance, "reset_default_button")
-                    and widget_instance.reset_default_button
-                ):
-                    widget_instance.reset_default_button.setVisible(is_visible)
-                if hasattr(widget_instance, "line_edit") and widget_instance.line_edit:
-                    widget_instance.line_edit.setVisible(is_visible)
+                common_widget_actions.set_parameter_row_visibility(
+                    widget_instance, is_visible
+                )
 
         # Set visibility for Single Step controls
         is_single_step_mode = current_mode == DENOISER_MODE_SINGLE_STEP
