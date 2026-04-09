@@ -241,6 +241,7 @@ class VideoProcessor(QObject):
 
         # Frame cache
         self._last_requested_frame_num: int | None = None
+        self._cached_raw_frame_media_path: str | None = None
         self._cached_raw_frame_number: int | None = None
         self._cached_raw_frame_target_height: int | None = None
         self._cached_raw_frame_bgr: numpy.ndarray | None = None
@@ -1762,6 +1763,17 @@ class VideoProcessor(QObject):
 
         self._current_single_frame_worker = None
 
+    def _clear_single_frame_preview_caches(self):
+        self._last_requested_frame_num = None
+        self._cached_raw_frame_media_path = None
+        self._cached_raw_frame_number = None
+        self._cached_raw_frame_target_height = None
+        self._cached_raw_frame_bgr = None
+        self._cached_raw_image_path = None
+        self._cached_raw_image_target_height = None
+        self._cached_raw_image_bgr = None
+        self._seek_cached_frame = None
+
     def start_frame_worker(
         self,
         frame_number,
@@ -1877,7 +1889,8 @@ class VideoProcessor(QObject):
         # --- Read the frame based on file type ---
         if self.file_type == "video" and self.media_capture:
             is_cached = (
-                self._cached_raw_frame_number == self.current_frame_number
+                self._cached_raw_frame_media_path == self.media_path
+                and self._cached_raw_frame_number == self.current_frame_number
                 and self._cached_raw_frame_target_height == target_height
                 and self._cached_raw_frame_bgr is not None
             )
@@ -1893,6 +1906,7 @@ class VideoProcessor(QObject):
                     preview_target_height=target_height,
                 )
                 if ret and frame_bgr is not None:
+                    self._cached_raw_frame_media_path = self.media_path
                     self._cached_raw_frame_number = self.current_frame_number
                     self._cached_raw_frame_target_height = target_height
                     self._cached_raw_frame_bgr = frame_bgr.copy()
@@ -2025,6 +2039,7 @@ class VideoProcessor(QObject):
         # VP-34: Check if capture is missing/broken while idle. If so, fix it.
         if not was_active:
             self._cancel_single_frame_preview_state()
+            self._clear_single_frame_preview_caches()
             if self.file_type == "video" and self.media_path:
                 if not self.media_capture or not self.media_capture.isOpened():
                     print(
@@ -2077,7 +2092,7 @@ class VideoProcessor(QObject):
         # VP-24: We clear the queue and then send poison pills to wake workers
         # blocked on queue.get().
         self.frames_to_display.clear()
-        self._seek_cached_frame = None  # release seek-preview frame (~6–25 MB at HD/4K)
+        self._clear_single_frame_preview_caches()
         self.webcam_frames_to_display.queue.clear()
         with self.frame_queue.mutex:
             self.frame_queue.queue.clear()

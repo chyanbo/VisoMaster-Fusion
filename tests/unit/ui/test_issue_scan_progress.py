@@ -1566,6 +1566,115 @@ def test_scan_guard_restores_target_media_card_checked_state(monkeypatch):
     assert len(toast_calls) == 2
 
 
+def test_target_media_load_clears_single_frame_preview_caches(monkeypatch):
+    class _Capture:
+        def __init__(self):
+            self.released = False
+            self.set_calls = []
+
+        def isOpened(self):
+            return True
+
+        def set(self, prop, value):
+            self.set_calls.append((prop, value))
+
+        def get(self, prop):
+            if prop == widget_components.cv2.CAP_PROP_FRAME_COUNT:
+                return 5
+            if prop == widget_components.cv2.CAP_PROP_FPS:
+                return 24
+            return 0
+
+        def release(self):
+            self.released = True
+
+    refresh_calls = []
+    clear_calls = []
+    capture = _Capture()
+    toggled = []
+
+    main_window = SimpleNamespace(
+        selected_video_button=SimpleNamespace(toggle=lambda: toggled.append(True)),
+        selected_target_face_id=None,
+        current_widget_parameters={},
+        parameters={},
+        control={
+            "AutoSwapToggle": False,
+            "SendVirtCamFramesEnableToggle": False,
+        },
+        video_processor=SimpleNamespace(
+            stop_processing=lambda: False,
+            _clear_single_frame_preview_caches=lambda: clear_calls.append(True),
+            current_frame_number=99,
+            media_path="old.mp4",
+            current_frame=[],
+            media_capture=None,
+            media_rotation=0,
+            fps=0,
+            max_frame_number=0,
+            next_frame_to_display=99,
+            file_type=None,
+        ),
+        scene=SimpleNamespace(clear=lambda: None),
+        graphicsViewFrame=SimpleNamespace(update=lambda: None),
+        videoSeekSlider=SimpleNamespace(
+            blockSignals=lambda *_args, **_kwargs: None,
+            setMaximum=lambda *_args, **_kwargs: None,
+            setValue=lambda *_args, **_kwargs: None,
+        ),
+        loading_new_media=False,
+    )
+
+    card = SimpleNamespace(
+        main_window=main_window,
+        file_type="video",
+        media_path="new.mp4",
+        media_capture=None,
+        reset_related_widgets_and_values=lambda: None,
+        _restore_pre_click_checked_state=lambda: None,
+    )
+
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.get_video_rotation", lambda *_args: 0
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.misc_helpers.check_and_warn_vfr",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.cv2.VideoCapture", lambda *_args: capture
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.misc_helpers.read_frame",
+        lambda *_args, **_kwargs: (True, "frame0"),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.common_widget_actions.get_pixmap_from_frame",
+        lambda *_args, **_kwargs: "pixmap",
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.graphics_view_actions.update_graphics_view",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.common_widget_actions.set_widgets_values_using_face_id_parameters",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.widget_components.common_widget_actions.refresh_frame",
+        lambda *_args, **kwargs: refresh_calls.append(kwargs),
+    )
+
+    widget_components.TargetMediaCardButton.load_media(card)
+
+    assert toggled == [True]
+    assert clear_calls == [True]
+    assert refresh_calls == [{"synchronous": True}]
+    assert main_window.video_processor.current_frame == "frame0"
+    assert main_window.video_processor.media_capture is capture
+    assert main_window.selected_video_button is card
+
+
 def test_scan_guard_restores_input_face_card_checked_state(monkeypatch):
     main_window = _make_scan_main_window(keep_controls=True)
     main_window.scan_issue_worker = object()

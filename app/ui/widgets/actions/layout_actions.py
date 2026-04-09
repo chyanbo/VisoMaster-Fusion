@@ -53,6 +53,19 @@ def add_widgets_to_tab_layout(
         category_layout.addRow(row_widget)
         return row_widget, horizontal_layout
 
+    def create_layout_action_button(button_data: dict):
+        action_button = QtWidgets.QPushButton(cast(str, button_data["label"]))
+        action_button.setToolTip(cast(str, button_data.get("help", "")))
+        if "fixed_width" in button_data:
+            action_button.setFixedWidth(cast(int, button_data["fixed_width"]))
+        else:
+            action_button.setMaximumWidth(55)
+        if "exec_function" in button_data:
+            action_button.clicked.connect(
+                partial(cast(Callable, button_data["exec_function"]), main_window)
+            )
+        return action_button
+
     def build_section_id(category_name: str) -> str:
         normalized_name = re.sub(r"[^a-z0-9]+", "_", category_name.lower()).strip("_")
         return f"{section_namespace}:{normalized_name}"
@@ -379,23 +392,28 @@ def add_widgets_to_tab_layout(
                 ]
                 if "action_button" in widget_data:
                     _ab_data: dict = cast(dict, widget_data["action_button"])
-                    _action_btn = QtWidgets.QPushButton(cast(str, _ab_data["label"]))
-                    _action_btn.setToolTip(cast(str, _ab_data.get("help", "")))
-                    if "fixed_width" in _ab_data:
-                        _action_btn.setFixedWidth(cast(int, _ab_data["fixed_width"]))
-                    else:
-                        _action_btn.setMaximumWidth(55)
-                    if "exec_function" in _ab_data:
-                        _action_btn.clicked.connect(
-                            partial(
-                                cast(Callable, _ab_data["exec_function"]), main_window
-                            )
-                        )
+                    _action_btn = create_layout_action_button(_ab_data)
                     _slider_row_widgets.append(_action_btn)
                 row_widget, horizontal_layout = add_horizontal_layout_to_category(
                     category_layout,
                     *_slider_row_widgets,
                 )
+                if "below_row_button" in widget_data:
+                    _below_ab_data: dict = cast(dict, widget_data["below_row_button"])
+                    _below_action_btn = create_layout_action_button(_below_ab_data)
+                    _below_spacer = QtWidgets.QWidget()
+                    _below_spacer.setSizePolicy(
+                        QtWidgets.QSizePolicy.Policy.Expanding,
+                        QtWidgets.QSizePolicy.Policy.Maximum,
+                    )
+                    _below_row_widget, _below_horizontal_layout = (
+                        add_horizontal_layout_to_category(
+                            category_layout,
+                            _below_action_btn,
+                            _below_spacer,
+                        )
+                    )
+                    widget.below_row_widget = _below_row_widget
 
                 if data_type == "parameter":
                     common_widget_actions.create_default_parameter(

@@ -298,6 +298,8 @@ def set_parameter_row_visibility(current_widget, visible: bool):
         current_widget.row_widget.setVisible(visible)
     else:
         current_widget.setVisible(visible)
+    if hasattr(current_widget, "below_row_widget") and current_widget.below_row_widget:
+        current_widget.below_row_widget.setVisible(visible)
 
     # Keep the child widgets in sync so internal widget state matches the row state.
     current_widget.setVisible(visible)

@@ -206,6 +206,22 @@ def test_toggle_on_required_false_hides_child():
 # ---------------------------------------------------------------------------
 
 
+def test_toggle_updates_below_row_widget_visibility():
+    mw, parent, child = _make_toggle_setup(
+        parent_name="FaceReagingEnableToggle",
+        child_name="FaceReagingTargetAgeSlider",
+        required_toggle_value=False,
+        parent_is_checked=True,
+    )
+    child.below_row_widget = MagicMock()
+
+    show_hide_related_widgets(mw, parent, "FaceReagingEnableToggle")
+
+    child.row_widget.setVisible.assert_called_once_with(False)
+    child.below_row_widget.setVisible.assert_called_once_with(False)
+    child.setVisible.assert_called_once_with(False)
+
+
 def test_child_not_in_parameter_widgets_is_skipped():
     parent_widget = MagicMock()
     parent_widget.isChecked.return_value = True
