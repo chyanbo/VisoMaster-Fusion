@@ -3,6 +3,8 @@ from __future__ import annotations
 import queue
 from pathlib import Path
 from types import SimpleNamespace
+import numpy as np
+import torch
 
 from app.processors.video_processor import VideoProcessor
 
@@ -12,6 +14,100 @@ class _RunResult:
         self.returncode = returncode
         self.stderr = stderr
         self.stdout = stdout
+
+
+def test_clear_single_frame_preview_caches_resets_all_preview_state():
+    dummy = SimpleNamespace(
+        _last_requested_frame_num=7,
+        _cached_raw_frame_media_path="video_a.mp4",
+        _cached_raw_frame_number=12,
+        _cached_raw_frame_target_height=720,
+        _cached_raw_frame_bgr=np.zeros((2, 2, 3), dtype=np.uint8),
+        _cached_raw_image_path="image_a.png",
+        _cached_raw_image_target_height=1080,
+        _cached_raw_image_bgr=np.ones((2, 2, 3), dtype=np.uint8),
+        _seek_cached_frame=(12, np.ones((2, 2, 3), dtype=np.uint8)),
+    )
+
+    VideoProcessor._clear_single_frame_preview_caches(dummy)
+
+    assert dummy._last_requested_frame_num is None
+    assert dummy._cached_raw_frame_media_path is None
+    assert dummy._cached_raw_frame_number is None
+    assert dummy._cached_raw_frame_target_height is None
+    assert dummy._cached_raw_frame_bgr is None
+    assert dummy._cached_raw_image_path is None
+    assert dummy._cached_raw_image_target_height is None
+    assert dummy._cached_raw_image_bgr is None
+    assert dummy._seek_cached_frame is None
+
+
+def test_process_current_frame_ignores_cached_video_frame_from_other_media(monkeypatch):
+    read_calls = []
+    displayed_frames = []
+    started_workers = []
+    fresh_frame_bgr = np.full((2, 3, 3), 77, dtype=np.uint8)
+
+    dummy = SimpleNamespace(
+        processing=False,
+        is_processing_segments=False,
+        main_window=SimpleNamespace(
+            control={"DenoiserBaseSeedSlider": 220},
+            videoSeekSlider=SimpleNamespace(value=lambda: 0),
+            last_seek_read_failed=False,
+        ),
+        file_type="video",
+        media_capture=object(),
+        current_frame_number=0,
+        next_frame_to_display=0,
+        media_path="video_b.mp4",
+        media_rotation=0,
+        max_frame_number=20,
+        _last_requested_frame_num=None,
+        _cached_raw_frame_media_path="video_a.mp4",
+        _cached_raw_frame_number=0,
+        _cached_raw_frame_target_height=None,
+        _cached_raw_frame_bgr=np.full((2, 3, 3), 11, dtype=np.uint8),
+        _seek_cached_frame=None,
+        _get_target_input_height=lambda: None,
+        display_current_frame=lambda **kwargs: displayed_frames.append(kwargs),
+        start_frame_worker=lambda frame_number, frame, is_single_frame, synchronous, fit_on_complete: (
+            started_workers.append(
+                (
+                    frame_number,
+                    frame.copy(),
+                    is_single_frame,
+                    synchronous,
+                    fit_on_complete,
+                )
+            )
+            or "worker"
+        ),
+    )
+
+    monkeypatch.setattr(
+        "app.processors.video_processor.misc_helpers.seek_frame",
+        lambda *_args, **_kwargs: None,
+    )
+
+    def fake_read_frame(*_args, **_kwargs):
+        read_calls.append(True)
+        return True, fresh_frame_bgr.copy()
+
+    monkeypatch.setattr(
+        "app.processors.video_processor.misc_helpers.read_frame", fake_read_frame
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+
+    result = VideoProcessor.process_current_frame(dummy, synchronous=True)
+
+    assert result == "worker"
+    assert read_calls == [True]
+    assert dummy._cached_raw_frame_media_path == "video_b.mp4"
+    assert len(displayed_frames) == 1
+    assert np.array_equal(displayed_frames[0]["frame"], fresh_frame_bgr)
+    assert len(started_workers) == 1
+    assert np.array_equal(started_workers[0][1], fresh_frame_bgr[..., ::-1])
 
 
 def test_mark_skipped_frame_tracks_reason_counts():

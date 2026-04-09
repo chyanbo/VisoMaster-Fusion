@@ -301,6 +301,7 @@ class TargetMediaCardButton(CardButton):
 
         # Stop the current video processing
         main_window.video_processor.stop_processing()
+        main_window.video_processor._clear_single_frame_preview_caches()
 
         if main_window.selected_target_face_id:
             main_window.current_widget_parameters = main_window.parameters[
