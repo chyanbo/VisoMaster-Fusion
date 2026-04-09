@@ -737,6 +737,15 @@ def set_up_menu_actions(main_window: "MainWindow"):
     main_window.actionLoad_Source_Images_Folder.triggered.connect(
         partial(list_view_actions.select_input_face_images, main_window, "folder")
     )
+    main_window.actionOpen_Target_Media_Folder.triggered.connect(
+        partial(list_view_actions.open_target_media_folder, main_window)
+    )
+    main_window.actionOpen_Input_Faces_Folder.triggered.connect(
+        partial(list_view_actions.open_input_faces_folder, main_window)
+    )
+    main_window.actionOpen_Output_Folder.triggered.connect(
+        partial(list_view_actions.open_output_media_folder, main_window)
+    )
     main_window.actionLoad_Embeddings.triggered.connect(
         partial(save_load_actions.open_embeddings_from_file, main_window)
     )

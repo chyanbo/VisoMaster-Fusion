@@ -206,6 +206,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Initialize list widgets with consistent sizing and layout configuration
         list_view_actions.initialize_media_list_widgets(self)
         list_view_actions.initialize_embeddings_list_widget(self)
+        self._configure_output_folder_controls()
+        self._configure_file_menu_actions()
 
         # Set up Menu Actions
         layout_actions.set_up_menu_actions(self)
@@ -539,6 +541,55 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.scan_progress_dialog.setAutoClose(False)
         self.scan_progress_dialog.setAutoReset(False)
         self.scan_progress_dialog.close()
+
+    def _configure_output_folder_controls(self):
+        style = self.style()
+        closed_folder_icon = style.standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_DirIcon
+        )
+        self.buttonTargetVideosPath.setIcon(closed_folder_icon)
+        self.buttonInputFacesPath.setIcon(closed_folder_icon)
+        self.outputFolderButton.setText("")
+        self.outputFolderButton.setIcon(closed_folder_icon)
+        self.outputFolderButton.setToolTip("Select Output Directory")
+        self.outputOpenButton.setText("")
+        self.outputOpenButton.setIcon(
+            style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton)
+        )
+        self.outputOpenButton.setToolTip("Open Output Directory")
+
+    def _configure_file_menu_actions(self):
+        self.actionOpen_Videos_Folder.setText("Load Target Media Folder")
+        self.actionOpen_Video_Files.setText("Load Target Media Files")
+        self.actionLoad_Source_Images_Folder.setText("Load Input Faces Folder")
+        self.actionLoad_Source_Image_Files.setText("Load Input Face Files")
+
+        self.actionOpen_Target_Media_Folder = QtGui.QAction(
+            "Open Target Media Folder", self.menuFile
+        )
+        self.actionOpen_Input_Faces_Folder = QtGui.QAction(
+            "Open Input Faces Folder", self.menuFile
+        )
+        self.actionOpen_Output_Folder = QtGui.QAction(
+            "Open Output Folder", self.menuFile
+        )
+
+        self.menuFile.clear()
+        self.menuFile.addAction(self.actionLoad_SavedWorkspace)
+        self.menuFile.addAction(self.actionSave_CurrentWorkspace)
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionOpen_Videos_Folder)
+        self.menuFile.addAction(self.actionOpen_Video_Files)
+        self.menuFile.addAction(self.actionLoad_Source_Images_Folder)
+        self.menuFile.addAction(self.actionLoad_Source_Image_Files)
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionOpen_Target_Media_Folder)
+        self.menuFile.addAction(self.actionOpen_Input_Faces_Folder)
+        self.menuFile.addAction(self.actionOpen_Output_Folder)
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionLoad_Embeddings)
+        self.menuFile.addAction(self.actionSave_Embeddings)
+        self.menuFile.addAction(self.actionSave_Embeddings_As)
 
     def _initialize_target_videos_filter_menu(self):
         self.targetVideosFilterMenu = QtWidgets.QMenu(self.targetVideosFilterMenuButton)
