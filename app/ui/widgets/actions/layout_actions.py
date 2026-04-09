@@ -41,12 +41,17 @@ def add_widgets_to_tab_layout(
     def add_horizontal_layout_to_category(
         category_layout: QtWidgets.QFormLayout, *widgets
     ):
-        horizontal_layout = QtWidgets.QHBoxLayout()
+        row_widget = QtWidgets.QWidget()
+        row_widget.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        horizontal_layout = QtWidgets.QHBoxLayout(row_widget)
 
         for widget in widgets:
             horizontal_layout.addWidget(widget)
-        category_layout.addRow(horizontal_layout)
-        return horizontal_layout
+        category_layout.addRow(row_widget)
+        return row_widget, horizontal_layout
 
     def build_section_id(category_name: str) -> str:
         normalized_name = re.sub(r"[^a-z0-9]+", "_", category_name.lower()).strip("_")
@@ -87,7 +92,7 @@ def add_widgets_to_tab_layout(
                     widget_components.ParameterResetDefaultButton(related_widget=widget)
                 )
 
-                horizontal_layout = add_horizontal_layout_to_category(
+                row_widget, horizontal_layout = add_horizontal_layout_to_category(
                     category_layout, widget, label, widget.reset_default_button
                 )
 
@@ -158,7 +163,7 @@ def add_widgets_to_tab_layout(
                 widget.reset_default_button = (
                     widget_components.ParameterResetDefaultButton(related_widget=widget)
                 )
-                horizontal_layout = add_horizontal_layout_to_category(
+                row_widget, horizontal_layout = add_horizontal_layout_to_category(
                     category_layout, label, widget, widget.reset_default_button
                 )
 
@@ -243,7 +248,7 @@ def add_widgets_to_tab_layout(
                 widget.reset_default_button = (
                     widget_components.ParameterResetDefaultButton(related_widget=widget)
                 )
-                horizontal_layout = add_horizontal_layout_to_category(
+                row_widget, horizontal_layout = add_horizontal_layout_to_category(
                     category_layout,
                     label,
                     widget,
@@ -387,7 +392,7 @@ def add_widgets_to_tab_layout(
                             )
                         )
                     _slider_row_widgets.append(_action_btn)
-                horizontal_layout = add_horizontal_layout_to_category(
+                row_widget, horizontal_layout = add_horizontal_layout_to_category(
                     category_layout,
                     *_slider_row_widgets,
                 )
@@ -519,7 +524,7 @@ def add_widgets_to_tab_layout(
                 widget.reset_default_button = (
                     widget_components.ParameterResetDefaultButton(related_widget=widget)
                 )
-                horizontal_layout = add_horizontal_layout_to_category(
+                row_widget, horizontal_layout = add_horizontal_layout_to_category(
                     category_layout, label, widget, widget.reset_default_button
                 )
 
@@ -536,6 +541,7 @@ def add_widgets_to_tab_layout(
                 # widget.returnPressed.connect(partial(on_enter_pressed, widget, widget_name))
 
             horizontal_layout.setContentsMargins(spacing_level * 10, 0, 0, 0)
+            widget.row_widget = row_widget
             main_window.parameter_widgets[widget_name] = widget
 
         category_layout.setVerticalSpacing(2)
