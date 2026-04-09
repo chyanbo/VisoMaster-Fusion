@@ -4094,10 +4094,36 @@ class VideoProcessor(QObject):
                     use_job_name,
                     output_file_name,
                 )
+                
+                output_folder = self.main_window.control["OutputMediaFolder"]
+                if self.main_window.control.get("ClusterOutputBySourceToggle", False):
+                    target_face_button = getattr(
+                        self.main_window, "cur_selected_target_face_button", None
+                    )
+                    assigned_embeddings = (
+                        getattr(target_face_button, "assigned_merged_embeddings", None)
+                        if target_face_button
+                        else None
+                    )
+                    embedding_id = (
+                        next(iter(assigned_embeddings), None) if assigned_embeddings else None
+                    )
+                    embedding_button = (
+                        self.main_window.merged_embeddings.get(embedding_id)
+                        if embedding_id is not None
+                        else None
+                    )
+                    embedding_name = (
+                        str(getattr(embedding_button, "embedding_name", "")).strip()
+                        if embedding_button is not None
+                        else ""
+                    )
+                    if embedding_name:
+                        output_folder = os.path.join(str(output_folder), embedding_name)
 
                 final_file_path = misc_helpers.get_output_file_path(
                     self.media_path,
-                    self.main_window.control["OutputMediaFolder"],
+                    output_folder,
                     job_name=job_name,
                     use_job_name_for_output=use_job_name,
                     output_file_name=output_file_name,
@@ -4261,8 +4287,35 @@ class VideoProcessor(QObject):
 
             # AutoSave workspace if enabled
             if self.main_window.control.get("AutoSaveWorkspaceToggle"):
+                
+                output_folder = self.main_window.control["OutputMediaFolder"]
+                if self.main_window.control.get("ClusterOutputBySourceToggle", False):
+                    target_face_button = getattr(
+                        self.main_window, "cur_selected_target_face_button", None
+                    )
+                    assigned_embeddings = (
+                        getattr(target_face_button, "assigned_merged_embeddings", None)
+                        if target_face_button
+                        else None
+                    )
+                    embedding_id = (
+                        next(iter(assigned_embeddings), None) if assigned_embeddings else None
+                    )
+                    embedding_button = (
+                        self.main_window.merged_embeddings.get(embedding_id)
+                        if embedding_id is not None
+                        else None
+                    )
+                    embedding_name = (
+                        str(getattr(embedding_button, "embedding_name", "")).strip()
+                        if embedding_button is not None
+                        else ""
+                    )
+                    if embedding_name:
+                        output_folder = os.path.join(str(output_folder), embedding_name)
+                        
                 json_file_path = misc_helpers.get_output_file_path(
-                    self.media_path, self.main_window.control["OutputMediaFolder"]
+                    self.media_path, output_folder
                 )
                 json_file_path += ".json"
                 save_load_actions.save_current_workspace(
