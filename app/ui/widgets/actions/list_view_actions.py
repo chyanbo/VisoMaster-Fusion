@@ -19,7 +19,7 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 _WORKER_STOP_TIMEOUT_MS = 1000
-_TARGET_BUTTON_SIZE = (90, 90)
+_TARGET_BUTTON_SIZE = (96, 96)
 _FACE_BUTTON_SIZE = (70, 70)
 _EMBED_BUTTON_SIZE = (120, 25)
 _EMBED_LIST_HEIGHT = 140
@@ -154,12 +154,16 @@ def add_media_thumbnail_button(
     else:
         pixmap = image_data
 
-    button.setIcon(QtGui.QIcon(pixmap))
-    button.setIconSize(
-        button_size - QtCore.QSize(8, 8)
-    )  # Slightly smaller than the button size to add some margin
     button.setFixedSize(button_size)
     button.setCheckable(True)
+
+    if buttonClass == widget_components.TargetMediaCardButton:
+        button.set_thumbnail_pixmap(pixmap)
+    else:
+        button.setIcon(QtGui.QIcon(pixmap))
+        button.setIconSize(
+            button_size - QtCore.QSize(8, 8)
+        )  # Slightly smaller than the button size to add some margin
 
     if buttonClass in [
         widget_components.TargetFaceCardButton,

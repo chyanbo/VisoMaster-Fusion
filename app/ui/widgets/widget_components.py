@@ -26,6 +26,73 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 
+class TwoLineElidedLabel(QtWidgets.QLabel):
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(parent)
+        self._full_text = ""
+        self.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop
+        )
+        self.setWordWrap(False)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:
+        self._full_text = text
+        self._update_display_text()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_display_text()
+
+    def _fit_text_prefix(self, text: str, max_width: int) -> str:
+        if not text or max_width <= 0:
+            return ""
+
+        font_metrics = self.fontMetrics()
+        if font_metrics.horizontalAdvance(text) <= max_width:
+            return text
+
+        fitted_text = ""
+        last_space_index = -1
+        for index, char in enumerate(text):
+            candidate = fitted_text + char
+            if font_metrics.horizontalAdvance(candidate) > max_width:
+                break
+            fitted_text = candidate
+            if char.isspace():
+                last_space_index = index
+
+        if last_space_index > 0:
+            return text[:last_space_index].rstrip()
+        return fitted_text.rstrip()
+
+    def _update_display_text(self) -> None:
+        if not self._full_text:
+            super().setText("")
+            return
+
+        max_width = self.contentsRect().width()
+        if max_width <= 0:
+            super().setText(self._full_text)
+            return
+
+        font_metrics = self.fontMetrics()
+        first_line = self._fit_text_prefix(self._full_text, max_width)
+
+        if not first_line or first_line == self._full_text:
+            display_text = font_metrics.elidedText(
+                self._full_text, QtCore.Qt.TextElideMode.ElideRight, max_width * 2
+            )
+            super().setText(display_text)
+            return
+
+        remaining_text = self._full_text[len(first_line) :].lstrip()
+        second_line = font_metrics.elidedText(
+            remaining_text, QtCore.Qt.TextElideMode.ElideRight, max_width
+        )
+        super().setText(f"{first_line}\n{second_line}")
+
+
 class CardButton(QPushButton):
     def __init__(self, *args, **kwargs):
         super().__init__(*args)
@@ -121,18 +188,35 @@ class TargetMediaCardButton(CardButton):
         self.webcam_index = webcam_index
         self.webcam_backend = webcam_backend
         self.media_capture: cv2.VideoCapture | bool = False
+        self._thumbnail_pixmap = QtGui.QPixmap()
         self.setCheckable(True)
+        self.setText("")
         self.setToolTip(media_path)
+
         layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(2)  # Space between icon and label
+        layout.setContentsMargins(3, 3, 3, 2)
+        layout.setSpacing(0)
+
+        self.thumbnail_label = QtWidgets.QLabel(self)
+        self.thumbnail_label.setAlignment(
+            QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignBottom
+        )
+        self.thumbnail_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout.addWidget(self.thumbnail_label, 1)
+
         filename = os.path.basename(media_path)
-        text_label = QtWidgets.QLabel(filename, self)
-        text_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignBottom)
-        text_label.setStyleSheet(
-            "font-size: 8px; font-weight:bold;"
-        )  # Style for the label
-        layout.addWidget(text_label)
+        self.text_label = TwoLineElidedLabel(filename, self)
+        title_font = self.text_label.font()
+        title_font.setPointSize(9)
+        self.text_label.setFont(title_font)
+        line_spacing = QtGui.QFontMetrics(title_font).lineSpacing()
+        self.text_label.setFixedHeight((line_spacing * 2) + 4)
+        self.text_label.setAttribute(
+            QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
+        )
+        layout.addWidget(self.text_label, 0)
         self.clicked.connect(self.load_media)
 
         # Set the context menu policy to trigger the custom context menu on right-click
@@ -140,6 +224,30 @@ class TargetMediaCardButton(CardButton):
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
         self.create_context_menu()
+
+    def set_thumbnail_pixmap(self, pixmap: QtGui.QPixmap) -> None:
+        self._thumbnail_pixmap = pixmap
+        self._update_thumbnail_pixmap()
+
+    def resizeEvent(self, event: QtGui.QResizeEvent) -> None:
+        super().resizeEvent(event)
+        self._update_thumbnail_pixmap()
+
+    def _update_thumbnail_pixmap(self) -> None:
+        if self._thumbnail_pixmap.isNull():
+            self.thumbnail_label.clear()
+            return
+
+        target_size = self.thumbnail_label.contentsRect().size()
+        if not target_size.isValid():
+            return
+
+        scaled_pixmap = self._thumbnail_pixmap.scaled(
+            target_size,
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        self.thumbnail_label.setPixmap(scaled_pixmap)
 
     def reset_media_state(self):
         main_window = self.main_window
