@@ -997,53 +997,50 @@
      <item row="0" column="0">
       <layout class="QVBoxLayout" name="vboxLayout_Faces">
        <item>
-        <widget class="QGroupBox" name="groupBox_InputFaces_Select">
-         <property name="title">
-          <string>Input Faces</string>
-         </property>
-         <layout class="QGridLayout" name="gridLayout_Faces1">
-          <item row="0" column="0">
-           <layout class="QHBoxLayout" name="horizontalLayout_Faces">
-            <item>
-             <widget class="QLabel" name="labelInputFacesPath">
-              <property name="text">
-               <string>Select Face Images Path</string>
-              </property>
-             </widget>
-            </item>
-            <item>
-             <widget class="QPushButton" name="buttonInputFacesPath">
-              <property name="sizePolicy">
-               <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
-                <horstretch>0</horstretch>
-                <verstretch>0</verstretch>
-               </sizepolicy>
-              </property>
-              <property name="toolTip">
-               <string>Choose Input Faces Folder</string>
-              </property>
-              <property name="text">
-               <string/>
-              </property>
-              <property name="icon">
-               <iconset resource="media.qrc">
-                <normaloff>:/media/media/open_file.png</normaloff>:/media/media/open_file.png</iconset>
-              </property>
-              <property name="iconSize">
-               <size>
-                <width>18</width>
-                <height>18</height>
-               </size>
-              </property>
-              <property name="flat">
-               <bool>true</bool>
-              </property>
-             </widget>
-            </item>
-           </layout>
-          </item>
-         </layout>
-        </widget>
+        <layout class="QHBoxLayout" name="horizontalLayout_Faces">
+         <item>
+          <widget class="QLineEdit" name="inputFacesPathLineEdit">
+           <property name="text">
+            <string/>
+           </property>
+           <property name="readOnly">
+            <bool>true</bool>
+           </property>
+           <property name="placeholderText">
+            <string>Select Face Images Path</string>
+           </property>
+          </widget>
+         </item>
+         <item>
+          <widget class="QPushButton" name="buttonInputFacesPath">
+           <property name="sizePolicy">
+            <sizepolicy hsizetype="Fixed" vsizetype="Fixed">
+             <horstretch>0</horstretch>
+             <verstretch>0</verstretch>
+            </sizepolicy>
+           </property>
+           <property name="toolTip">
+            <string>Choose Input Faces Folder</string>
+           </property>
+           <property name="text">
+            <string/>
+           </property>
+           <property name="icon">
+            <iconset resource="media.qrc">
+             <normaloff>:/media/media/open_file.png</normaloff>:/media/media/open_file.png</iconset>
+           </property>
+           <property name="iconSize">
+            <size>
+             <width>18</width>
+             <height>18</height>
+            </size>
+           </property>
+           <property name="flat">
+            <bool>true</bool>
+           </property>
+          </widget>
+         </item>
+        </layout>
        </item>
        <item>
         <widget class="QLineEdit" name="inputFacesSearchBox">

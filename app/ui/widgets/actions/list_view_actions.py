@@ -407,8 +407,8 @@ def select_input_face_images(
         )
         if not folder_name:
             return
-        main_window.labelInputFacesPath.setText(misc_helpers.truncate_text(folder_name))
-        main_window.labelInputFacesPath.setToolTip(folder_name)
+        main_window.inputFacesPathLineEdit.setText(folder_name)
+        main_window.inputFacesPathLineEdit.setToolTip(folder_name)
         main_window.last_input_media_folder_path = folder_name
 
     elif source_type == "files":
@@ -416,10 +416,8 @@ def select_input_face_images(
         if not files_list:
             return
         file_dir = misc_helpers.get_dir_of_file(files_list[0])
-        main_window.labelInputFacesPath.setText(
-            file_dir
-        )  # Just a temp text until i think of something better
-        main_window.labelInputFacesPath.setToolTip(file_dir)
+        main_window.inputFacesPathLineEdit.setText(file_dir)
+        main_window.inputFacesPathLineEdit.setToolTip(file_dir)
         main_window.last_input_media_folder_path = file_dir
 
     clear_stop_loading_input_media(main_window)
