@@ -102,6 +102,7 @@ class FrameEdits:
         driving: torch.Tensor,
         target: torch.Tensor,
         parameters: dict,
+        control: dict,
         driving_kps: np.ndarray = None,
         target_kps: np.ndarray = None,
     ) -> torch.Tensor:
@@ -165,9 +166,10 @@ class FrameEdits:
                     from_points=False,
                     use_mean_eyes=use_mean_eyes,
                 )
-                print(
-                    "[WARN] Could not get kps_203, running separate detection on driving face."
-                )
+                if not control.get("VR180ModeEnableToggle", False):
+                    print(
+                        "[WARN] Could not get kps_203, running separate detection on driving face."
+                    )
 
             if driving_lmk_crop is None or (
                 hasattr(driving_lmk_crop, "__len__") and len(driving_lmk_crop) == 0
@@ -218,9 +220,10 @@ class FrameEdits:
                     from_points=False,
                     use_mean_eyes=use_mean_eyes,
                 )
-                print(
-                    "[WARN] Could not get kps_203, running separate detection on target face."
-                )
+                if not control.get("VR180ModeEnableToggle", False):
+                    print(
+                        "[WARN] Could not get kps_203, running separate detection on target face."
+                    )
 
             if source_lmk is None or (
                 hasattr(source_lmk, "__len__") and len(source_lmk) == 0
