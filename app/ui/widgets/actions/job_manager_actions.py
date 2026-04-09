@@ -20,6 +20,7 @@ from app.ui.widgets.actions import card_actions
 from app.ui.widgets.actions import list_view_actions
 from app.ui.widgets.actions import video_control_actions
 from app.ui.widgets.actions import layout_actions
+from app.ui.widgets.actions import save_load_actions
 from app.ui.widgets import ui_workers
 from app.helpers.typing_helper import ParametersTypes, MarkerTypes
 import app.helpers.miscellaneous as misc_helpers
@@ -463,7 +464,11 @@ def _load_job_controls_and_state(
     main_window: "MainWindow", data: dict, is_batch_load: bool = False
 ):
     """Loads global control settings and misc UI state."""
-    for control_name, control_value in data.get("control", {}).items():
+    save_load_actions.purge_removed_settings_controls(main_window.control)
+    control_data = save_load_actions.sanitize_removed_settings_controls(
+        data.get("control", {})
+    )
+    for control_name, control_value in control_data.items():
         main_window.control[control_name] = control_value
     # Ensure AutoSwap is off after loading a job
     main_window.control["AutoSwapToggle"] = False
@@ -484,13 +489,16 @@ def _load_job_controls_and_state(
     main_window.last_input_media_folder_path = data.get(
         "last_input_media_folder_path", ""
     )
-    if main_window.last_input_media_folder_path:
-        main_window.labelInputFacesPath.setText(
-            misc_helpers.truncate_text(main_window.last_input_media_folder_path)
-        )
-        main_window.labelInputFacesPath.setToolTip(
-            main_window.last_input_media_folder_path
-        )
+    main_window.targetVideosPathLineEdit.setText(
+        main_window.last_target_media_folder_path
+    )
+    main_window.targetVideosPathLineEdit.setToolTip(
+        main_window.last_target_media_folder_path
+    )
+    main_window.inputFacesPathLineEdit.setText(main_window.last_input_media_folder_path)
+    main_window.inputFacesPathLineEdit.setToolTip(
+        main_window.last_input_media_folder_path
+    )
     main_window.loaded_embedding_filename = data.get("loaded_embedding_filename", "")
 
     # Update all control widgets in the "Settings" tab
@@ -517,8 +525,10 @@ def _load_job_markers(main_window: "MainWindow", data: dict):
     # Load standard markers
     loaded_markers = data.get("markers", {})
     # Convert marker parameters from dict to ParametersDict
-    loaded_markers_converted = convert_markers_to_job_type(
-        main_window, copy.deepcopy(loaded_markers), misc_helpers.ParametersDict
+    loaded_markers_converted = save_load_actions.scrub_removed_settings_from_markers(
+        convert_markers_to_job_type(
+            main_window, copy.deepcopy(loaded_markers), misc_helpers.ParametersDict
+        )
     )
 
     for marker_position, marker_data in loaded_markers_converted.items():
@@ -558,6 +568,10 @@ def _load_job_markers(main_window: "MainWindow", data: dict):
         video_control_actions.set_scan_tools_expanded(
             main_window, data.get("scan_tools_expanded", False)
         )
+    parameter_section_states = (
+        data["parameter_section_states"] if "parameter_section_states" in data else None
+    )
+    main_window.apply_parameter_section_states(parameter_section_states)
 
 
 def _begin_batch_refresh_suppression(main_window: "MainWindow") -> bool:
@@ -1150,10 +1164,12 @@ def _serialize_job_data(main_window: "MainWindow") -> dict:
     for marker_pos, marker_data in markers_to_save_typed.items():
         markers_to_save[marker_pos] = {
             "parameters": marker_data["parameters"],
-            "control": marker_data["control"],
+            "control": save_load_actions.sanitize_removed_settings_controls(
+                marker_data["control"]
+            ),
         }
-    control_to_save = convert_parameters_to_job_type(
-        main_window, main_window.control, dict
+    control_to_save = save_load_actions.sanitize_removed_settings_controls(
+        convert_parameters_to_job_type(main_window, main_window.control, dict)
     )
 
     # Assemble the final data dictionary
@@ -1170,6 +1186,10 @@ def _serialize_job_data(main_window: "MainWindow") -> dict:
         },
         "dropped_frames": sorted(main_window.dropped_frames),
         "scan_tools_expanded": getattr(main_window, "scan_tools_expanded", False),
+        "parameter_section_states": {
+            section_id: bool(expanded)
+            for section_id, expanded in main_window.parameter_section_states.items()
+        },
         "job_marker_pairs": copy.deepcopy(main_window.job_marker_pairs),
         "selected_media_id": selected_media_id,
         "swap_faces_enabled": main_window.swapfacesButton.isChecked(),

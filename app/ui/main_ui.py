@@ -32,7 +32,11 @@ from app.ui.widgets.event_filters import (
 from app.ui.widgets import ui_workers
 from app.ui.widgets.common_layout_data import COMMON_LAYOUT_DATA
 from app.ui.widgets.denoiser_layout_data import DENOISER_LAYOUT_DATA
-from app.ui.widgets.swapper_layout_data import SWAPPER_LAYOUT_DATA
+from app.ui.widgets.swapper_layout_data import (
+    SWAPPER_LAYOUT_DATA,
+    MASK_SHOW_DEFAULT,
+    MASK_SHOW_OPTIONS,
+)
 from app.ui.widgets.settings_layout_data import SETTINGS_LAYOUT_DATA
 from app.ui.widgets.face_editor_layout_data import FACE_EDITOR_LAYOUT_DATA
 from app.helpers.app_metadata import get_app_display_metadata
@@ -145,6 +149,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.parameters_list = {}
         self.control: ControlTypes = {}
         self.parameter_widgets: ParametersWidgetTypes = {}
+        self.parameter_section_states: dict[str, bool] = {}
+        self.parameter_sections: dict[str, widget_components.CollapsibleSection] = {}
 
         # UNet related
         self.previous_kv_file_selection = ""
@@ -200,6 +206,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Initialize list widgets with consistent sizing and layout configuration
         list_view_actions.initialize_media_list_widgets(self)
         list_view_actions.initialize_embeddings_list_widget(self)
+        self._configure_output_folder_controls()
+        self._configure_file_menu_actions()
 
         # Set up Menu Actions
         layout_actions.set_up_menu_actions(self)
@@ -223,6 +231,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.buttonTargetVideosPath.clicked.connect(
             partial(list_view_actions.select_target_medias, self, "folder")
         )
+        self._initialize_target_videos_filter_menu()
         self.buttonInputFacesPath.clicked.connect(
             partial(list_view_actions.select_input_face_images, self, "folder")
         )
@@ -281,6 +290,15 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         # Set up videoSeekLineEdit and add the event filter to handle changes
         video_control_actions.set_up_video_seek_line_edit(self)
+        self.videoTimeLineEdit = QtWidgets.QLineEdit(self.mediaLayout)
+        self.videoTimeLineEdit.setObjectName("videoTimeLineEdit")
+        self.videoTimeLineEdit.setReadOnly(True)
+        self.videoTimeLineEdit.setFocusPolicy(QtCore.Qt.FocusPolicy.NoFocus)
+        self.videoTimeLineEdit.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.videoTimeLineEdit.setMaximumSize(QtCore.QSize(55, 16777215))
+        self.videoTimeLineEdit.setToolTip("Current Time (mm:ss)")
+        self.horizontalLayoutMediaSlider.addWidget(self.videoTimeLineEdit)
+        video_control_actions.update_video_time_line_edit(self, 0)
         video_seek_line_edit_event_filter = videoSeekSliderLineEditEventFilter(
             self, self.videoSeekLineEdit
         )
@@ -307,18 +325,6 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         )
         self.targetVideosSearchBox.textChanged.connect(
             partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterImagesCheckBox.clicked.connect(
-            partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterVideosCheckBox.clicked.connect(
-            partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterWebcamsCheckBox.clicked.connect(
-            partial(filter_actions.filter_target_videos, self)
-        )
-        self.filterWebcamsCheckBox.clicked.connect(
-            partial(list_view_actions.load_target_webcams, self)
         )
 
         self.inputFacesSearchBox.textChanged.connect(
@@ -365,6 +371,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.theatreModeButton.clicked.connect(
             partial(video_control_actions.toggle_theatre_mode, self)
         )
+
         self._install_view_panel_toggle_actions()
         self._install_view_navigation_actions()
         self._install_media_controls_layout()
@@ -385,18 +392,24 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             LAYOUT_DATA=COMMON_LAYOUT_DATA,
             layoutWidget=self.commonWidgetsLayout,
             data_type="parameter",
+            section_namespace="common",
         )
         layout_actions.add_widgets_to_tab_layout(
             self,
             LAYOUT_DATA=DENOISER_LAYOUT_DATA,
             layoutWidget=self.denoiserWidgetsLayout,
             data_type="control",
+            section_namespace="denoiser",
         )
         layout_actions.add_widgets_to_tab_layout(
             self,
             LAYOUT_DATA=SWAPPER_LAYOUT_DATA,
             layoutWidget=self.swapWidgetsLayout,
             data_type="parameter",
+            section_namespace="swapper",
+        )
+        common_widget_actions.create_default_parameter(
+            self, "MaskShowSelection", MASK_SHOW_DEFAULT
         )
         self._connect_mask_show_selection_sync()
         layout_actions.add_widgets_to_tab_layout(
@@ -404,12 +417,14 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             LAYOUT_DATA=SETTINGS_LAYOUT_DATA,
             layoutWidget=self.settingsWidgetsLayout,
             data_type="control",
+            section_namespace="settings",
         )
         layout_actions.add_widgets_to_tab_layout(
             self,
             LAYOUT_DATA=FACE_EDITOR_LAYOUT_DATA,
             layoutWidget=self.faceEditorWidgetsLayout,
             data_type="parameter",
+            section_namespace="face_editor",
         )
 
         # Set up output folder select button (It is inside the settings tab Widget)
@@ -527,6 +542,103 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self.scan_progress_dialog.setAutoReset(False)
         self.scan_progress_dialog.close()
 
+    def _configure_output_folder_controls(self):
+        style = self.style()
+        closed_folder_icon = style.standardIcon(
+            QtWidgets.QStyle.StandardPixmap.SP_DirIcon
+        )
+        self.buttonTargetVideosPath.setIcon(closed_folder_icon)
+        self.buttonInputFacesPath.setIcon(closed_folder_icon)
+        self.outputFolderButton.setText("")
+        self.outputFolderButton.setIcon(closed_folder_icon)
+        self.outputFolderButton.setToolTip("Select Output Directory")
+        self.outputOpenButton.setText("")
+        self.outputOpenButton.setIcon(
+            style.standardIcon(QtWidgets.QStyle.StandardPixmap.SP_DialogOpenButton)
+        )
+        self.outputOpenButton.setToolTip("Open Output Directory")
+
+    def _configure_file_menu_actions(self):
+        self.actionOpen_Videos_Folder.setText("Load Target Media Folder")
+        self.actionOpen_Video_Files.setText("Load Target Media Files")
+        self.actionLoad_Source_Images_Folder.setText("Load Input Faces Folder")
+        self.actionLoad_Source_Image_Files.setText("Load Input Face Files")
+
+        self.actionOpen_Target_Media_Folder = QtGui.QAction(
+            "Open Target Media Folder", self.menuFile
+        )
+        self.actionOpen_Input_Faces_Folder = QtGui.QAction(
+            "Open Input Faces Folder", self.menuFile
+        )
+        self.actionOpen_Output_Folder = QtGui.QAction(
+            "Open Output Folder", self.menuFile
+        )
+
+        self.menuFile.clear()
+        self.menuFile.addAction(self.actionLoad_SavedWorkspace)
+        self.menuFile.addAction(self.actionSave_CurrentWorkspace)
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionOpen_Videos_Folder)
+        self.menuFile.addAction(self.actionOpen_Video_Files)
+        self.menuFile.addAction(self.actionLoad_Source_Images_Folder)
+        self.menuFile.addAction(self.actionLoad_Source_Image_Files)
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionOpen_Target_Media_Folder)
+        self.menuFile.addAction(self.actionOpen_Input_Faces_Folder)
+        self.menuFile.addAction(self.actionOpen_Output_Folder)
+        self.menuFile.addSeparator()
+        self.menuFile.addAction(self.actionLoad_Embeddings)
+        self.menuFile.addAction(self.actionSave_Embeddings)
+        self.menuFile.addAction(self.actionSave_Embeddings_As)
+
+    def _initialize_target_videos_filter_menu(self):
+        self.targetVideosFilterMenu = QtWidgets.QMenu(self.targetVideosFilterMenuButton)
+        self.targetVideosFilterMenuButton.setStyleSheet(
+            "QPushButton::menu-indicator { image: none; width: 0px; }"
+        )
+        self.targetVideosFilterImagesCheckBox = (
+            self._create_target_videos_filter_menu_checkbox(
+                "Images", ":/media/media/image.png", checked=True
+            )
+        )
+        self.targetVideosFilterVideosCheckBox = (
+            self._create_target_videos_filter_menu_checkbox(
+                "Videos", ":/media/media/video.png", checked=True
+            )
+        )
+        self.targetVideosFilterWebcamsCheckBox = (
+            self._create_target_videos_filter_menu_checkbox(
+                "Webcams", ":/media/media/webcam.png", checked=False
+            )
+        )
+
+        self.targetVideosFilterMenuButton.setMenu(self.targetVideosFilterMenu)
+
+        self.targetVideosFilterImagesCheckBox.toggled.connect(
+            partial(filter_actions.filter_target_videos, self)
+        )
+        self.targetVideosFilterVideosCheckBox.toggled.connect(
+            partial(filter_actions.filter_target_videos, self)
+        )
+        self.targetVideosFilterWebcamsCheckBox.toggled.connect(
+            partial(filter_actions.filter_target_videos, self)
+        )
+        self.targetVideosFilterWebcamsCheckBox.toggled.connect(
+            partial(list_view_actions.load_target_webcams, self)
+        )
+
+    def _create_target_videos_filter_menu_checkbox(
+        self, text: str, icon_path: str, checked: bool
+    ) -> QtWidgets.QCheckBox:
+        checkbox = QtWidgets.QCheckBox(text, self.targetVideosFilterMenu)
+        checkbox.setIcon(QtGui.QIcon(icon_path))
+        checkbox.setChecked(checked)
+
+        action = QtWidgets.QWidgetAction(self.targetVideosFilterMenu)
+        action.setDefaultWidget(checkbox)
+        self.targetVideosFilterMenu.addAction(action)
+        return checkbox
+
     def update_denoiser_controls_visibility_for_pass(
         self, pass_suffix: str, current_mode_text: str
     ):
@@ -549,19 +661,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         # Helper to set visibility for a widget and its associated label and reset button
         def set_widget_visibility(widget_instance, is_visible):
             if widget_instance:
-                widget_instance.setVisible(is_visible)
-                if (
-                    hasattr(widget_instance, "label_widget")
-                    and widget_instance.label_widget
-                ):
-                    widget_instance.label_widget.setVisible(is_visible)
-                if (
-                    hasattr(widget_instance, "reset_default_button")
-                    and widget_instance.reset_default_button
-                ):
-                    widget_instance.reset_default_button.setVisible(is_visible)
-                if hasattr(widget_instance, "line_edit") and widget_instance.line_edit:
-                    widget_instance.line_edit.setVisible(is_visible)
+                common_widget_actions.set_parameter_row_visibility(
+                    widget_instance, is_visible
+                )
 
         # Set visibility for Single Step controls
         is_single_step_mode = current_mode == DENOISER_MODE_SINGLE_STEP
@@ -872,6 +974,33 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             # Re-populate and set current selection for dynamic widgets like DenoiserUNetModelSelection
             self._populate_denoiser_unet_models()
             self._populate_reference_kv_tensors()
+
+    def register_parameter_section(
+        self,
+        section_id: str,
+        section_widget: widget_components.CollapsibleSection,
+    ):
+        self.parameter_sections[section_id] = section_widget
+        expanded = self.parameter_section_states.get(section_id, True)
+        self.parameter_section_states[section_id] = expanded
+        section_widget.set_expanded(expanded, animate=False, update_state=False)
+
+    def apply_parameter_section_states(
+        self, section_states: dict[str, bool] | None = None
+    ):
+        if section_states is None:
+            for section_id, section_widget in self.parameter_sections.items():
+                self.parameter_section_states[section_id] = True
+                section_widget.set_expanded(True, animate=False, update_state=False)
+            return
+
+        for section_id, expanded in section_states.items():
+            self.parameter_section_states[section_id] = bool(expanded)
+
+        for section_id, section_widget in self.parameter_sections.items():
+            expanded = bool(section_states.get(section_id, True))
+            self.parameter_section_states[section_id] = expanded
+            section_widget.set_expanded(expanded, animate=False, update_state=False)
 
     @QtCore.Slot(bool)
     def _on_faces_panel_toggled(self, checked: bool):
@@ -1318,7 +1447,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
                     item_value if item_value is not None else widget.itemText(index)
                 )
             return values
-        return list(SWAPPER_LAYOUT_DATA["Masks"]["MaskShowSelection"]["options"])
+        return list(MASK_SHOW_OPTIONS)
 
     def _get_current_mask_show_value(self) -> str:
         widget = self._get_mask_show_selection_widget()
@@ -1332,7 +1461,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         return str(
             self.current_widget_parameters.get(
                 "MaskShowSelection",
-                SWAPPER_LAYOUT_DATA["Masks"]["MaskShowSelection"]["default"],
+                MASK_SHOW_DEFAULT,
             )
         )
 
@@ -1385,7 +1514,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             label_map = self._get_mask_show_label_map()
             widget.blockSignals(True)
             widget.clear()
-            for option in SWAPPER_LAYOUT_DATA["Masks"]["MaskShowSelection"]["options"]:
+            for option in MASK_SHOW_OPTIONS:
                 widget.addItem(label_map.get(option, option), option)
             widget.set_value(current_value)
             widget.blockSignals(False)

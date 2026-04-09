@@ -38,6 +38,25 @@ def set_up_video_seek_line_edit(main_window: "MainWindow"):
     )  # Restrict input to numbers
 
 
+def update_video_time_line_edit(
+    main_window: "MainWindow", current_frame_number: int | None = None
+):
+    video_time_line_edit = getattr(main_window, "videoTimeLineEdit", None)
+    if video_time_line_edit is None:
+        return
+
+    if current_frame_number is None:
+        current_frame_number = int(
+            getattr(main_window.videoSeekSlider, "value", lambda: 0)()
+        )
+
+    fps = float(getattr(main_window.video_processor, "fps", 0.0) or 0.0)
+    total_seconds = max(0.0, float(current_frame_number) / fps) if fps > 0 else 0.0
+    minutes = int(total_seconds // 60)
+    seconds = int(total_seconds % 60)
+    video_time_line_edit.setText(f"{minutes:02d}:{seconds:02d}")
+
+
 def set_up_video_seek_slider(main_window: "MainWindow"):
     """
     Configures the video seek slider with custom painting, marker management, and
@@ -1018,7 +1037,7 @@ def _get_issue_scan_mutation_lock_targets(main_window: "MainWindow") -> list:
         "clearTargetFacesButton",
         "buttonTargetVideosPath",
         "buttonInputFacesPath",
-        "filterWebcamsCheckBox",
+        "targetVideosFilterMenuButton",
         "openEmbeddingButton",
         "addMarkerButton",
         "removeMarkerButton",
@@ -2123,6 +2142,7 @@ def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
 
     video_processor.current_frame_number = new_position
     video_processor.next_frame_to_display = new_position
+    update_video_time_line_edit(main_window, new_position)
     update_drop_frame_button_label(main_window)
     if video_processor.media_capture:
         misc_helpers.seek_frame(video_processor.media_capture, new_position)

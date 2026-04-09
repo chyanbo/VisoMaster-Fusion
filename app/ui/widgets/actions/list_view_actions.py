@@ -19,8 +19,10 @@ if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
 
 _WORKER_STOP_TIMEOUT_MS = 1000
-_TARGET_BUTTON_SIZE = (90, 90)
-_FACE_BUTTON_SIZE = (70, 70)
+_TARGET_BUTTON_SIZE = (96, 96)
+_SMALL_FACE_BUTTON_SIZE = (70, 70)
+_LARGE_FACE_BUTTON_SIZE = (96, 96)
+_FACE_BUTTON_SIZE = _SMALL_FACE_BUTTON_SIZE
 _EMBED_BUTTON_SIZE = (120, 25)
 _EMBED_LIST_HEIGHT = 140
 
@@ -142,7 +144,7 @@ def add_media_thumbnail_button(
     if buttonClass == widget_components.TargetMediaCardButton:
         button_size = QtCore.QSize(*_TARGET_BUTTON_SIZE)
     else:
-        button_size = QtCore.QSize(*_FACE_BUTTON_SIZE)
+        button_size = QtCore.QSize(*_get_face_button_size(main_window))
 
     button: widget_components.CardButton = buttonClass(
         *constructor_args, main_window=main_window
@@ -154,12 +156,16 @@ def add_media_thumbnail_button(
     else:
         pixmap = image_data
 
-    button.setIcon(QtGui.QIcon(pixmap))
-    button.setIconSize(
-        button_size - QtCore.QSize(8, 8)
-    )  # Slightly smaller than the button size to add some margin
     button.setFixedSize(button_size)
     button.setCheckable(True)
+
+    if buttonClass == widget_components.TargetMediaCardButton:
+        button.set_thumbnail_pixmap(pixmap)
+    else:
+        button.setIcon(QtGui.QIcon(pixmap))
+        button.setIconSize(
+            button_size - QtCore.QSize(8, 8)
+        )  # Slightly smaller than the button size to add some margin
 
     if buttonClass in [
         widget_components.TargetFaceCardButton,
@@ -180,13 +186,58 @@ def add_media_thumbnail_button(
     list_item.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
     listWidget.setItemWidget(list_item, button)
 
+    if buttonClass == widget_components.TargetFaceCardButton:
+        refresh_target_face_display_labels(main_window)
+
+
+def refresh_target_face_display_labels(main_window: "MainWindow"):
+    target_faces_list = getattr(main_window, "targetFacesList", None)
+    if target_faces_list is None:
+        return
+
+    for i in range(target_faces_list.count()):
+        list_item = target_faces_list.item(i)
+        target_face_button = target_faces_list.itemWidget(list_item)
+        if isinstance(target_face_button, widget_components.TargetFaceCardButton):
+            target_face_button.refresh_display_label()
+
+
+def _get_face_button_size(main_window: "MainWindow") -> tuple[int, int]:
+    return getattr(main_window, "face_thumbnail_button_size", _FACE_BUTTON_SIZE)
+
+
+def apply_face_thumbnail_size(
+    main_window: "MainWindow", button_size_tuple: tuple[int, int]
+) -> None:
+    main_window.face_thumbnail_button_size = button_size_tuple
+    button_size = QtCore.QSize(*button_size_tuple)
+    grid_size_with_padding = button_size + QtCore.QSize(4, 4)
+
+    for listWidget in (main_window.targetFacesList, main_window.inputFacesList):
+        listWidget.setGridSize(grid_size_with_padding)
+        for i in range(listWidget.count()):
+            list_item = listWidget.item(i)
+            button = listWidget.itemWidget(list_item)
+            if button is None:
+                continue
+            button.setFixedSize(button_size)
+            button.setIconSize(
+                button_size - QtCore.QSize(8, 8)
+            )  # Slightly smaller than the button size to add some margin
+            list_item.setSizeHint(button_size)
+        listWidget.doItemsLayout()
+        listWidget.viewport().update()
+
 
 def initialize_media_list_widgets(main_window: "MainWindow"):
     """One-time configuration for target/input media and face list widgets."""
+    if not hasattr(main_window, "face_thumbnail_button_size"):
+        main_window.face_thumbnail_button_size = _FACE_BUTTON_SIZE
+
     for listWidget, button_size_tuple in [
         (main_window.targetVideosList, _TARGET_BUTTON_SIZE),
-        (main_window.targetFacesList, _FACE_BUTTON_SIZE),
-        (main_window.inputFacesList, _FACE_BUTTON_SIZE),
+        (main_window.targetFacesList, _get_face_button_size(main_window)),
+        (main_window.inputFacesList, _get_face_button_size(main_window)),
     ]:
         button_size = QtCore.QSize(*button_size_tuple)
         grid_size_with_padding = button_size + QtCore.QSize(4, 4)
@@ -284,10 +335,8 @@ def select_target_medias(
         )
         if not folder_name:
             return
-        main_window.labelTargetVideosPath.setText(
-            misc_helpers.truncate_text(folder_name)
-        )
-        main_window.labelTargetVideosPath.setToolTip(folder_name)
+        main_window.targetVideosPathLineEdit.setText(folder_name)
+        main_window.targetVideosPathLineEdit.setToolTip(folder_name)
         main_window.last_target_media_folder_path = folder_name
 
     elif source_type == "files":
@@ -296,10 +345,8 @@ def select_target_medias(
             return
         # Get Folder name from the first file
         file_dir = misc_helpers.get_dir_of_file(files_list[0])
-        main_window.labelTargetVideosPath.setText(
-            file_dir
-        )  # Just a temp text until i think of something better
-        main_window.labelTargetVideosPath.setToolTip(file_dir)
+        main_window.targetVideosPathLineEdit.setText(file_dir)
+        main_window.targetVideosPathLineEdit.setToolTip(file_dir)
         main_window.last_target_media_folder_path = file_dir
 
     clear_stop_loading_target_media(main_window)
@@ -340,7 +387,12 @@ def load_target_webcams(
     if video_control_actions.is_issue_scan_active(main_window):
         video_control_actions._mark_pending_target_media_refresh(main_window)
         return
-    if main_window.filterWebcamsCheckBox.isChecked():
+    if filter_actions._get_target_video_filter_checked(
+        main_window,
+        "targetVideosFilterWebcamsAction",
+        "targetVideosFilterWebcamsCheckBox",
+        False,
+    ):
         main_window.video_loader_worker = ui_workers.TargetMediaLoaderWorker(
             main_window=main_window, webcam_mode=True
         )
@@ -391,8 +443,8 @@ def select_input_face_images(
         )
         if not folder_name:
             return
-        main_window.labelInputFacesPath.setText(misc_helpers.truncate_text(folder_name))
-        main_window.labelInputFacesPath.setToolTip(folder_name)
+        main_window.inputFacesPathLineEdit.setText(folder_name)
+        main_window.inputFacesPathLineEdit.setToolTip(folder_name)
         main_window.last_input_media_folder_path = folder_name
 
     elif source_type == "files":
@@ -400,10 +452,8 @@ def select_input_face_images(
         if not files_list:
             return
         file_dir = misc_helpers.get_dir_of_file(files_list[0])
-        main_window.labelInputFacesPath.setText(
-            file_dir
-        )  # Just a temp text until i think of something better
-        main_window.labelInputFacesPath.setToolTip(file_dir)
+        main_window.inputFacesPathLineEdit.setText(file_dir)
+        main_window.inputFacesPathLineEdit.setToolTip(file_dir)
         main_window.last_input_media_folder_path = file_dir
 
     clear_stop_loading_input_media(main_window)
@@ -463,30 +513,72 @@ def select_output_media_folder(main_window: "MainWindow"):
         )
 
 
+def _show_missing_folder_message(
+    main_window: "MainWindow", folder_label: str, folder_name: str | None = None
+) -> None:
+    if folder_name:
+        message = f"Could not find:\n{folder_name}"
+    else:
+        message = f"No {folder_label.lower()} is currently set."
+    common_widget_actions.create_and_show_messagebox(
+        main_window,
+        f"{folder_label} Unavailable",
+        message,
+        parent_widget=main_window,
+    )
+
+
+def _open_folder_in_file_manager(main_window: "MainWindow", folder_name: str) -> None:
+    normalized_path = os.path.normpath(os.path.abspath(folder_name))
+
+    if sys.platform == "win32":
+        try:
+            subprocess.Popen(["explorer", normalized_path])
+        except FileNotFoundError:
+            subprocess.Popen([r"C:\Windows\explorer.exe", normalized_path])
+    elif sys.platform == "darwin":
+        subprocess.run(["open", normalized_path])
+    else:
+        subprocess.run(["xdg-open", normalized_path])
+
+
 def open_output_media_folder(main_window: "MainWindow", folder_name: str | None = None):
     if not folder_name:
         configured_folder = main_window.control.get("OutputMediaFolder")
         folder_name = configured_folder if isinstance(configured_folder, str) else None
-    if isinstance(folder_name, str) and folder_name:
-        if os.path.exists(folder_name):
-            # Normalize path
-            normalized_path = os.path.normpath(os.path.abspath(folder_name))
+    if not isinstance(folder_name, str) or not folder_name.strip():
+        _show_missing_folder_message(main_window, "Output Folder")
+        return
+    if not os.path.isdir(folder_name):
+        _show_missing_folder_message(main_window, "Output Folder", folder_name)
+        return
+    _open_folder_in_file_manager(main_window, folder_name)
 
-            if sys.platform == "win32":
-                # Windows - use full path to explorer.exe to avoid PATH issues
-                try:
-                    # Method 1: Using subprocess without shell (more secure and reliable)
-                    subprocess.Popen(["explorer", normalized_path])
-                except FileNotFoundError:
-                    # Fallback: Use full path to explorer.exe
-                    subprocess.Popen([r"C:\Windows\explorer.exe", normalized_path])
-            elif sys.platform == "darwin":
-                # macOS
-                subprocess.run(["open", "-R", folder_name])
-            else:
-                # Linux
-                directory = os.path.dirname(os.path.abspath(folder_name))
-                subprocess.run(["xdg-open", directory])
+
+def open_target_media_folder(main_window: "MainWindow"):
+    folder_name = main_window.targetVideosPathLineEdit.text().strip()
+    if not folder_name:
+        folder_name = getattr(main_window, "last_target_media_folder_path", "").strip()
+    if not folder_name:
+        _show_missing_folder_message(main_window, "Target Media Folder")
+        return
+    if not os.path.isdir(folder_name):
+        _show_missing_folder_message(main_window, "Target Media Folder", folder_name)
+        return
+    _open_folder_in_file_manager(main_window, folder_name)
+
+
+def open_input_faces_folder(main_window: "MainWindow"):
+    folder_name = main_window.inputFacesPathLineEdit.text().strip()
+    if not folder_name:
+        folder_name = getattr(main_window, "last_input_media_folder_path", "").strip()
+    if not folder_name:
+        _show_missing_folder_message(main_window, "Input Faces Folder")
+        return
+    if not os.path.isdir(folder_name):
+        _show_missing_folder_message(main_window, "Input Faces Folder", folder_name)
+        return
+    _open_folder_in_file_manager(main_window, folder_name)
 
 
 def show_shortcuts(main_window: "MainWindow"):

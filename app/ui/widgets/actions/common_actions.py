@@ -291,6 +291,27 @@ def reset_selected_face_parameters(
     return True
 
 
+# Keep a parameter row container and its child widgets in sync when hiding/showing
+# dependency-driven controls.
+def set_parameter_row_visibility(current_widget, visible: bool):
+    if hasattr(current_widget, "row_widget") and current_widget.row_widget:
+        current_widget.row_widget.setVisible(visible)
+    else:
+        current_widget.setVisible(visible)
+
+    # Keep the child widgets in sync so internal widget state matches the row state.
+    current_widget.setVisible(visible)
+    if hasattr(current_widget, "label_widget") and current_widget.label_widget:
+        current_widget.label_widget.setVisible(visible)
+    if (
+        hasattr(current_widget, "reset_default_button")
+        and current_widget.reset_default_button
+    ):
+        current_widget.reset_default_button.setVisible(visible)
+    if hasattr(current_widget, "line_edit") and current_widget.line_edit:
+        current_widget.line_edit.setVisible(visible)
+
+
 # Function to Hide Elements conditionally from values in LayoutData (Currently supports using Selection box and Toggle button to hide other widgets)
 def show_hide_related_widgets(
     main_window: "MainWindow",
@@ -349,41 +370,9 @@ def show_hide_related_widgets(
 
                     # Final Decision
                     if selection_condition_met and toggle_condition_met:
-                        current_widget.show()
-                        # QUAL-15: Guard attribute access with hasattr/None checks (CASE 1 show path)
-                        if (
-                            hasattr(current_widget, "label_widget")
-                            and current_widget.label_widget
-                        ):
-                            current_widget.label_widget.show()
-                        if (
-                            hasattr(current_widget, "reset_default_button")
-                            and current_widget.reset_default_button
-                        ):
-                            current_widget.reset_default_button.show()
-                        if (
-                            hasattr(current_widget, "line_edit")
-                            and current_widget.line_edit
-                        ):
-                            current_widget.line_edit.show()
+                        set_parameter_row_visibility(current_widget, True)
                     else:
-                        current_widget.hide()
-                        # QUAL-15: Guard attribute access with hasattr/None checks (CASE 1 hide path)
-                        if (
-                            hasattr(current_widget, "label_widget")
-                            and current_widget.label_widget
-                        ):
-                            current_widget.label_widget.hide()
-                        if (
-                            hasattr(current_widget, "reset_default_button")
-                            and current_widget.reset_default_button
-                        ):
-                            current_widget.reset_default_button.hide()
-                        if (
-                            hasattr(current_widget, "line_edit")
-                            and current_widget.line_edit
-                        ):
-                            current_widget.line_edit.hide()
+                        set_parameter_row_visibility(current_widget, False)
 
         # --- CASE 2: PARENT IS A TOGGLE BUTTON ---
         elif "Toggle" in parent_widget_name:
@@ -465,41 +454,9 @@ def show_hide_related_widgets(
 
                     # Final Decision
                     if selection_condition_met and toggle_condition_met:
-                        current_widget.show()
-                        # QUAL-15: Guard attribute access with hasattr/None checks (CASE 2 show path)
-                        if (
-                            hasattr(current_widget, "label_widget")
-                            and current_widget.label_widget
-                        ):
-                            current_widget.label_widget.show()
-                        if (
-                            hasattr(current_widget, "reset_default_button")
-                            and current_widget.reset_default_button
-                        ):
-                            current_widget.reset_default_button.show()
-                        if (
-                            hasattr(current_widget, "line_edit")
-                            and current_widget.line_edit
-                        ):
-                            current_widget.line_edit.show()
+                        set_parameter_row_visibility(current_widget, True)
                     else:
-                        current_widget.hide()
-                        # QUAL-15: Guard attribute access with hasattr/None checks (CASE 2 hide path)
-                        if (
-                            hasattr(current_widget, "label_widget")
-                            and current_widget.label_widget
-                        ):
-                            current_widget.label_widget.hide()
-                        if (
-                            hasattr(current_widget, "reset_default_button")
-                            and current_widget.reset_default_button
-                        ):
-                            current_widget.reset_default_button.hide()
-                        if (
-                            hasattr(current_widget, "line_edit")
-                            and current_widget.line_edit
-                        ):
-                            current_widget.line_edit.hide()
+                        set_parameter_row_visibility(current_widget, False)
 
             parent_widget.start_animation()
 

@@ -196,7 +196,8 @@ def _make_scan_main_window(keep_controls=False):
         jobQueueList=_DummyButton("Job Queue"),
         buttonTargetVideosPath=_DummyButton("Target Path"),
         buttonInputFacesPath=_DummyButton("Input Path"),
-        filterWebcamsCheckBox=_DummyButton("Filter Webcams"),
+        targetVideosFilterMenuButton=_DummyButton("Target Media Filter Menu"),
+        targetVideosFilterWebcamsCheckBox=_DummyButton("Filter Webcams"),
         findTargetFacesButton=_DummyButton("Find Faces"),
         clearTargetFacesButton=_DummyButton("Clear Faces"),
         addMarkerButton=_DummyButton("Add Marker"),
@@ -232,6 +233,7 @@ def _make_scan_main_window(keep_controls=False):
         dropAllIssueFramesButton=_DummyButton("Drop Issue Frames"),
         clearScanResultsButton=_DummyButton("Clear Scan Results"),
         clearDroppedFramesButton=_DummyButton("Clear Dropped Frames"),
+        placeholder_update_signal=_DummySignal(),
     )
     main_window.video_processor = SimpleNamespace(
         file_type="video",
@@ -604,7 +606,7 @@ def test_run_issue_scan_disables_controls_like_recording_when_keep_controls_off(
     assert main_window.scanToolsToggleButton.enabled is False
     assert main_window.findTargetFacesButton.enabled is False
     assert main_window.clearTargetFacesButton.enabled is False
-    assert main_window.filterWebcamsCheckBox.enabled is False
+    assert main_window.targetVideosFilterMenuButton.enabled is False
     assert main_window.addMarkerButton.enabled is False
     assert main_window.removeMarkerButton.enabled is False
     assert main_window.videoSeekSlider.enabled is False
@@ -639,7 +641,7 @@ def test_run_issue_scan_respects_keep_controls_toggle(monkeypatch):
     disabled_calls = []
     main_window.frameAdvanceButton.enabled = False
     main_window.openEmbeddingButton.enabled = False
-    main_window.filterWebcamsCheckBox.enabled = False
+    main_window.targetVideosFilterMenuButton.enabled = False
 
     monkeypatch.setattr(
         "app.ui.widgets.actions.video_control_actions.ui_workers.IssueScanWorker",
@@ -669,7 +671,7 @@ def test_run_issue_scan_respects_keep_controls_toggle(monkeypatch):
     assert main_window.issue_frames_by_face == {}
     assert main_window.findTargetFacesButton.enabled is False
     assert main_window.clearTargetFacesButton.enabled is False
-    assert main_window.filterWebcamsCheckBox.enabled is False
+    assert main_window.targetVideosFilterMenuButton.enabled is False
     assert main_window.addMarkerButton.enabled is False
     assert main_window.removeMarkerButton.enabled is False
     assert main_window.videoSeekSlider.enabled is False
@@ -818,7 +820,7 @@ def test_issue_scan_completion_restores_slider_and_ui(monkeypatch):
         "mutation_lock_enabled_states": [
             (main_window.findTargetFacesButton, True),
             (main_window.clearTargetFacesButton, True),
-            (main_window.filterWebcamsCheckBox, True),
+            (main_window.targetVideosFilterMenuButton, True),
             (main_window.videoSeekSlider, True),
             (main_window.videoSeekLineEdit, True),
             (main_window.frameAdvanceButton, False),
@@ -833,7 +835,7 @@ def test_issue_scan_completion_restores_slider_and_ui(monkeypatch):
     }
     main_window.findTargetFacesButton.enabled = False
     main_window.clearTargetFacesButton.enabled = False
-    main_window.filterWebcamsCheckBox.enabled = False
+    main_window.targetVideosFilterMenuButton.enabled = False
     main_window.videoSeekSlider.enabled = False
     main_window.videoSeekLineEdit.enabled = False
     main_window.frameAdvanceButton.enabled = False
@@ -866,7 +868,7 @@ def test_issue_scan_completion_restores_slider_and_ui(monkeypatch):
     assert main_window.buttonMediaPlay.enabled is True
     assert main_window.findTargetFacesButton.enabled is True
     assert main_window.clearTargetFacesButton.enabled is True
-    assert main_window.filterWebcamsCheckBox.enabled is True
+    assert main_window.targetVideosFilterMenuButton.enabled is True
     assert main_window.videoSeekSlider.enabled is True
     assert main_window.videoSeekLineEdit.enabled is True
     assert main_window.frameAdvanceButton.enabled is False
@@ -972,7 +974,7 @@ def test_issue_scan_failed_without_progress_keeps_current_attempt_results_only(
             (main_window.videoSeekSlider, True),
             (main_window.videoSeekLineEdit, True),
             (main_window.frameAdvanceButton, False),
-            (main_window.filterWebcamsCheckBox, True),
+            (main_window.targetVideosFilterMenuButton, True),
         ],
     }
     main_window.videoSeekSlider.setValue(101)
@@ -980,7 +982,7 @@ def test_issue_scan_failed_without_progress_keeps_current_attempt_results_only(
     main_window.videoSeekSlider.enabled = False
     main_window.videoSeekLineEdit.enabled = False
     main_window.frameAdvanceButton.enabled = False
-    main_window.filterWebcamsCheckBox.enabled = False
+    main_window.targetVideosFilterMenuButton.enabled = False
 
     _handle_issue_scan_failed(main_window, "boom")
 
@@ -991,7 +993,7 @@ def test_issue_scan_failed_without_progress_keeps_current_attempt_results_only(
     assert main_window.videoSeekSlider.enabled is True
     assert main_window.videoSeekLineEdit.enabled is True
     assert main_window.frameAdvanceButton.enabled is False
-    assert main_window.filterWebcamsCheckBox.enabled is True
+    assert main_window.targetVideosFilterMenuButton.enabled is True
     assert main_window.prevIssueButton.enabled is True
     assert main_window.nextIssueButton.enabled is True
     assert main_window.dropFrameButton.enabled is True
@@ -1257,13 +1259,13 @@ def test_issue_scan_cancelled_without_progress_keeps_empty_results(monkeypatch):
         "mutation_lock_enabled_states": [
             (main_window.nextMarkerButton, True),
             (main_window.swapfacesButton, True),
-            (main_window.filterWebcamsCheckBox, False),
+            (main_window.targetVideosFilterMenuButton, False),
             (main_window.videoSeekLineEdit, True),
         ],
     }
     main_window.nextMarkerButton.enabled = False
     main_window.swapfacesButton.enabled = False
-    main_window.filterWebcamsCheckBox.enabled = False
+    main_window.targetVideosFilterMenuButton.enabled = False
 
     _handle_issue_scan_cancelled(main_window)
 
@@ -1272,7 +1274,7 @@ def test_issue_scan_cancelled_without_progress_keeps_empty_results(monkeypatch):
     assert fake_worker.deleted is True
     assert main_window.nextMarkerButton.enabled is True
     assert main_window.swapfacesButton.enabled is True
-    assert main_window.filterWebcamsCheckBox.enabled is False
+    assert main_window.targetVideosFilterMenuButton.enabled is False
     assert main_window.videoSeekLineEdit.enabled is True
     assert restore_calls == ["restored"]
     assert toast_calls[0][0][1] == "Scan Cancelled"
@@ -1381,12 +1383,12 @@ def test_issue_scan_completion_replays_deferred_target_media_refresh_once(monkey
         "pending_target_media_refresh": True,
         "mutation_lock_enabled_states": [
             (main_window.findTargetFacesButton, True),
-            (main_window.filterWebcamsCheckBox, True),
+            (main_window.targetVideosFilterMenuButton, True),
             (main_window.videoSeekSlider, True),
         ],
     }
     main_window.findTargetFacesButton.enabled = False
-    main_window.filterWebcamsCheckBox.enabled = False
+    main_window.targetVideosFilterMenuButton.enabled = False
     main_window.videoSeekSlider.enabled = False
     main_window.videoSeekSlider.setValue(90)
     main_window.video_processor.current_frame_number = 90
@@ -1453,7 +1455,7 @@ def test_issue_scan_completion_replays_deferred_refresh_after_scan_is_inactive(
         lambda *_args, **_kwargs: None,
     )
 
-    main_window.filterWebcamsCheckBox.setChecked(True)
+    main_window.targetVideosFilterWebcamsCheckBox.setChecked(True)
     main_window.scan_issue_worker = fake_worker
     main_window.scan_issue_ui_state = {
         "active": True,
@@ -1464,7 +1466,7 @@ def test_issue_scan_completion_replays_deferred_refresh_after_scan_is_inactive(
         "pending_target_media_refresh": True,
         "mutation_lock_enabled_states": [
             (main_window.findTargetFacesButton, True),
-            (main_window.filterWebcamsCheckBox, True),
+            (main_window.targetVideosFilterMenuButton, True),
             (main_window.videoSeekSlider, True),
         ],
     }
@@ -1662,6 +1664,7 @@ def test_target_face_context_menu_disables_mutating_actions_while_scan_is_active
     menu_exec_calls = []
     target_face_button = SimpleNamespace(
         main_window=_make_scan_main_window(keep_controls=True),
+        face_header_action=_DummyButton("Face 1"),
         parameters_copy_action=_DummyButton("Copy Parameters"),
         parameters_paste_action=_DummyButton("Apply Copied Parameters"),
         save_parameters_action=_DummyButton("Save Current Parameters and Settings"),
@@ -1669,7 +1672,10 @@ def test_target_face_context_menu_disables_mutating_actions_while_scan_is_active
         load_parameters_and_settings_action=_DummyButton(
             "Load Parameters and Settings"
         ),
+        small_thumbnails_action=_DummyButton("Small Thumbnails"),
+        large_thumbnails_action=_DummyButton("Large Thumbnails"),
         remove_action=_DummyButton("Remove from List"),
+        get_display_label=lambda: "Face 1",
         mapToGlobal=lambda point: point,
         popMenu=SimpleNamespace(exec_=lambda point: menu_exec_calls.append(point)),
     )

@@ -20,9 +20,38 @@ from app.ui.widgets.actions import filter_actions
 from app.ui.widgets import ui_workers
 from app.helpers.typing_helper import ParametersTypes, MarkerTypes
 import app.helpers.miscellaneous as misc_helpers
+from app.ui.widgets.settings_layout_data import REMOVED_SETTINGS_CONTROL_KEYS
 
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
+
+
+def sanitize_removed_settings_controls(control_data: dict | None) -> dict:
+    if not control_data:
+        return {}
+    return {
+        control_name: control_value
+        for control_name, control_value in control_data.items()
+        if control_name not in REMOVED_SETTINGS_CONTROL_KEYS
+    }
+
+
+def purge_removed_settings_controls(control_data: dict) -> None:
+    for control_name in REMOVED_SETTINGS_CONTROL_KEYS:
+        control_data.pop(control_name, None)
+
+
+def scrub_removed_settings_from_markers(markers: dict | None) -> dict:
+    if not markers:
+        return {}
+    scrubbed_markers = {}
+    for marker_position, marker_data in markers.items():
+        marker_payload = copy.deepcopy(marker_data)
+        marker_payload["control"] = sanitize_removed_settings_controls(
+            marker_payload.get("control", {})
+        )
+        scrubbed_markers[marker_position] = marker_payload
+    return scrubbed_markers
 
 
 def _get_clamped_window_geometry(
@@ -320,7 +349,7 @@ def save_current_parameters_and_control(main_window: "MainWindow", face_id):
         "parameters": convert_parameters_to_supported_type(
             main_window, main_window.parameters[face_id], dict
         ),
-        "control": main_window.control.copy(),
+        "control": sanitize_removed_settings_controls(main_window.control.copy()),
     }
 
     if data_filename:
@@ -354,7 +383,10 @@ def load_parameters_and_settings(
                     main_window, face_id
                 )
             if load_settings:
-                main_window.control.update(data["control"])
+                purge_removed_settings_controls(main_window.control)
+                main_window.control.update(
+                    sanitize_removed_settings_controls(data.get("control", {}))
+                )
                 common_widget_actions.set_control_widgets_values(main_window)
             common_widget_actions.refresh_frame(main_window)
 
@@ -406,7 +438,8 @@ def load_saved_workspace(
             card_actions.clear_merged_embeddings(main_window)
 
             # Load control (settings)
-            control = data.get("control", {})
+            purge_removed_settings_controls(main_window.control)
+            control = sanitize_removed_settings_controls(data.get("control", {}))
             for control_name, control_value in control.items():
                 main_window.control[control_name] = control_value
 
@@ -599,8 +632,10 @@ def load_saved_workspace(
                     )
 
             # Convert params to ParametersDict
-            data["markers"] = convert_markers_to_supported_type(
-                main_window, data.get("markers", {}), misc_helpers.ParametersDict
+            data["markers"] = scrub_removed_settings_from_markers(
+                convert_markers_to_supported_type(
+                    main_window, data.get("markers", {}), misc_helpers.ParametersDict
+                )
             )
 
             for marker_position, marker_data in data["markers"].items():
@@ -643,6 +678,18 @@ def load_saved_workspace(
             )
             main_window.last_input_media_folder_path = data.get(
                 "last_input_media_folder_path", ""
+            )
+            main_window.targetVideosPathLineEdit.setText(
+                main_window.last_target_media_folder_path
+            )
+            main_window.targetVideosPathLineEdit.setToolTip(
+                main_window.last_target_media_folder_path
+            )
+            main_window.inputFacesPathLineEdit.setText(
+                main_window.last_input_media_folder_path
+            )
+            main_window.inputFacesPathLineEdit.setToolTip(
+                main_window.last_input_media_folder_path
             )
             main_window.loaded_embedding_filename = data.get(
                 "loaded_embedding_filename", ""
@@ -738,19 +785,52 @@ def load_saved_workspace(
             }
             for panel_key, visible in panel_state_map.items():
                 main_window._set_panel_visibility(panel_key, visible)
-            main_window.filterImagesCheckBox.setChecked(
-                window_state.get("filterImagesCheckBox", True)
+
+            def restore_checkbox_without_emitting_signals(checkbox, checked: bool):
+                if hasattr(checkbox, "blockSignals"):
+                    previous_state = checkbox.blockSignals(True)
+                    try:
+                        checkbox.setChecked(checked)
+                    finally:
+                        checkbox.blockSignals(previous_state)
+                else:
+                    checkbox.setChecked(checked)
+
+            restore_checkbox_without_emitting_signals(
+                main_window.targetVideosFilterImagesCheckBox,
+                window_state.get("filterImagesCheckBox", True),
             )
-            main_window.filterVideosCheckBox.setChecked(
-                window_state.get("filterVideosCheckBox", True)
+            restore_checkbox_without_emitting_signals(
+                main_window.targetVideosFilterVideosCheckBox,
+                window_state.get("filterVideosCheckBox", True),
             )
-            main_window.filterWebcamsCheckBox.setChecked(
-                window_state.get("filterWebcamsCheckBox", False)
+            restore_checkbox_without_emitting_signals(
+                main_window.targetVideosFilterWebcamsCheckBox,
+                window_state.get("filterWebcamsCheckBox", False),
             )
+            saved_face_thumbnail_size = window_state.get("face_thumbnail_size")
+            if saved_face_thumbnail_size == "small":
+                list_view_actions.apply_face_thumbnail_size(
+                    main_window, list_view_actions._SMALL_FACE_BUTTON_SIZE
+                )
+            elif saved_face_thumbnail_size == "large":
+                list_view_actions.apply_face_thumbnail_size(
+                    main_window, list_view_actions._LARGE_FACE_BUTTON_SIZE
+                )
+            else:
+                list_view_actions.apply_face_thumbnail_size(
+                    main_window, list_view_actions._FACE_BUTTON_SIZE
+                )
             if hasattr(main_window, "scanToolsToggleButton"):
                 video_control_actions.set_scan_tools_expanded(
                     main_window, window_state.get("scan_tools_expanded", False)
                 )
+            parameter_section_states = None
+            if "parameter_section_states" in window_state:
+                parameter_section_states = window_state["parameter_section_states"]
+            elif "parameter_section_states" in data:
+                parameter_section_states = data["parameter_section_states"]
+            main_window.apply_parameter_section_states(parameter_section_states)
             filter_actions.filter_target_videos(main_window)
             list_view_actions.load_target_webcams(main_window)
 
@@ -829,10 +909,26 @@ def save_current_workspace(
         "jobs": main_window.panel_visibility_state.get("jobs", True),
         "faces": main_window.panel_visibility_state.get("faces", True),
         "parameters": main_window.panel_visibility_state.get("parameters", True),
-        "filterImagesCheckBox": main_window.filterImagesCheckBox.isChecked(),
-        "filterVideosCheckBox": main_window.filterVideosCheckBox.isChecked(),
-        "filterWebcamsCheckBox": main_window.filterWebcamsCheckBox.isChecked(),
+        "filterImagesCheckBox": main_window.targetVideosFilterImagesCheckBox.isChecked(),
+        "filterVideosCheckBox": main_window.targetVideosFilterVideosCheckBox.isChecked(),
+        "filterWebcamsCheckBox": main_window.targetVideosFilterWebcamsCheckBox.isChecked(),
+        "face_thumbnail_size": (
+            "small"
+            if getattr(
+                main_window,
+                "face_thumbnail_button_size",
+                list_view_actions._FACE_BUTTON_SIZE,
+            )
+            == list_view_actions._SMALL_FACE_BUTTON_SIZE
+            else "large"
+        ),
         "scan_tools_expanded": getattr(main_window, "scan_tools_expanded", False),
+        "parameter_section_states": {
+            section_id: bool(expanded)
+            for section_id, expanded in getattr(
+                main_window, "parameter_section_states", {}
+            ).items()
+        },
         "dock_state": dock_state_data,
     }
 
@@ -931,8 +1027,10 @@ def save_current_workspace(
         }
     # --- Serialize Markers ---
     # Convert Parameters inside the markers from ParametersDict to dict before saving
-    markers_to_save = convert_markers_to_supported_type(
-        main_window, copy.deepcopy(main_window.markers), dict
+    markers_to_save = scrub_removed_settings_from_markers(
+        convert_markers_to_supported_type(
+            main_window, copy.deepcopy(main_window.markers), dict
+        )
     )
 
     # Save tab order - store the current tab index and the tab order
@@ -962,7 +1060,7 @@ def save_current_workspace(
         )
 
     data = {
-        "control": main_window.control.copy(),
+        "control": sanitize_removed_settings_controls(main_window.control.copy()),
         "target_medias_data": target_medias_data,
         "selected_media_id": main_window.selected_video_button.media_id
         if isinstance(

@@ -516,10 +516,6 @@ class FrameWorker(threading.Thread):
 
         if not kv_map:
             if use_exclusive_path:
-                if control.get("CommandLineDebugEnableToggle", False):
-                    print(
-                        f"[ERROR] Denoiser {pass_suffix}: No source face for K/V, but 'Exclusive Reference Path' is ON. Skipping."
-                    )
                 return image_tensor_cxhxw_uint8
 
         denoised_image = self.models_processor.apply_denoiser_unet(
@@ -4027,7 +4023,7 @@ class FrameWorker(threading.Thread):
         # calling it again here per-face-per-frame rebuilds 12 transform objects
         # unnecessarily. Removed.
 
-        debug = control.get("CommandLineDebugEnableToggle", False)
+        debug = False
         debug_info: dict[str, str] = {}
 
         tform = self.get_face_similarity_tform(swapper_model, kps_5)
@@ -5308,17 +5304,6 @@ class FrameWorker(threading.Thread):
             )
             swap = torch.clamp(swap + noise, 0.0, 255.0)
 
-        # FW-PERF-14: only run the FFT/pooling analysis when debug output will be shown
-        if debug and control.get("AnalyseImageEnableToggle", False):
-            image_analyse_swap = self.analyze_image(swap)
-            # FW-QUAL-07: flatten image analysis dict into individual debug keys
-            for _k, _v in image_analyse_swap.items():
-                debug_info[f"JS:{_k}"] = _v
-
-        if debug and debug_info:
-            one_liner = ", ".join(f"{key}={value}" for key, value in debug_info.items())
-            print(f"[DEBUG] {one_liner}")
-
         if is_perspective_crop:
             return t512_mask(swap), t512_mask(swap_mask), None
 
@@ -5351,7 +5336,7 @@ class FrameWorker(threading.Thread):
 
         swap_mask_clone = None
         if self.is_view_face_mask:
-            mask_show_type = parameters["MaskShowSelection"]
+            mask_show_type = parameters.get("MaskShowSelection", "swap_mask")
             if mask_show_type == "swap_mask":
                 if (
                     parameters["FaceEditorEnableToggle"]

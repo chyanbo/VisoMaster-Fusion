@@ -1,5 +1,6 @@
 from PySide6 import QtWidgets, QtGui, QtCore
 from typing import TYPE_CHECKING
+from app.ui.widgets.actions import video_control_actions
 
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
@@ -24,6 +25,7 @@ def update_graphics_view(
     current_text = main_window.videoSeekLineEdit.text()
     if current_text != str(current_frame_number):
         main_window.videoSeekLineEdit.setText(str(current_frame_number))
+    video_control_actions.update_video_time_line_edit(main_window, current_frame_number)
 
     # Safely find the QGraphicsPixmapItem in the scene, ignoring other overlays (rectangles, text, etc.)
     scene = main_window.graphicsViewFrame.scene()

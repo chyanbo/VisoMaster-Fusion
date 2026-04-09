@@ -396,6 +396,42 @@ class _FakeTabWidget:
         return self._tabs[index]
 
 
+class _SignalAwareCheckBox:
+    def __init__(self, checked: bool = False, callbacks=None):
+        self._checked = checked
+        self._callbacks = callbacks or []
+        self._signals_blocked = False
+
+    def blockSignals(self, blocked: bool):
+        previous_state = self._signals_blocked
+        self._signals_blocked = blocked
+        return previous_state
+
+    def setChecked(self, checked: bool):
+        changed = self._checked != checked
+        self._checked = checked
+        if changed and not self._signals_blocked:
+            for callback in self._callbacks:
+                callback()
+
+    def isChecked(self):
+        return self._checked
+
+
+class _NoOpSignal:
+    def connect(self, *_args, **_kwargs):
+        return None
+
+
+class _NoOpLoaderWorker:
+    def __init__(self, *args, **kwargs):
+        self.thumbnail_ready = _NoOpSignal()
+        self.finished = _NoOpSignal()
+
+    def run(self):
+        return None
+
+
 def _make_workspace_main_window(
     tmp_path: Path,
     *,
@@ -445,9 +481,9 @@ def _make_workspace_main_window(
         "faces": True,
         "parameters": True,
     }
-    mw.filterImagesCheckBox = SimpleNamespace(isChecked=lambda: True)
-    mw.filterVideosCheckBox = SimpleNamespace(isChecked=lambda: True)
-    mw.filterWebcamsCheckBox = SimpleNamespace(isChecked=lambda: False)
+    mw.targetVideosFilterImagesCheckBox = SimpleNamespace(isChecked=lambda: True)
+    mw.targetVideosFilterVideosCheckBox = SimpleNamespace(isChecked=lambda: True)
+    mw.targetVideosFilterWebcamsCheckBox = SimpleNamespace(isChecked=lambda: False)
     mw.scan_tools_expanded = False
     mw.project_root_path = tmp_path
     mw.geometry = lambda: geometry
@@ -745,3 +781,181 @@ def test_save_workspace_theatre_does_not_serialize_theatre_active_flag(tmp_path)
     saved = _read_saved_workspace(save_path)
     assert "is_theatre_mode" not in saved
     assert "is_theatre_mode" not in saved["window_state_data"]
+
+
+def test_load_workspace_restores_target_media_filters_without_double_loading_webcams(
+    tmp_path, monkeypatch
+):
+    workspace_path = tmp_path / "workspace.json"
+    workspace_path.write_text(
+        json.dumps(
+            {
+                "control": {},
+                "target_medias_data": [],
+                "input_faces_data": {},
+                "embeddings_data": {},
+                "target_faces_data": {},
+                "markers": {},
+                "window_state_data": {
+                    "filterImagesCheckBox": True,
+                    "filterVideosCheckBox": True,
+                    "filterWebcamsCheckBox": True,
+                },
+            }
+        )
+    )
+
+    filter_calls = []
+    webcam_calls = []
+
+    main_window = SimpleNamespace(
+        control={},
+        parameters={},
+        default_parameters=ParametersDict({}, {}),
+        current_widget_parameters=ParametersDict({}, {}),
+        target_videos={},
+        input_faces={},
+        target_faces={},
+        merged_embeddings={},
+        markers={},
+        issue_frames_by_face={},
+        dropped_frames=set(),
+        job_marker_pairs=[],
+        selected_target_face_id=None,
+        videoSeekSlider=SimpleNamespace(update=MagicMock()),
+        targetVideosPathLineEdit=SimpleNamespace(
+            setText=MagicMock(), setToolTip=MagicMock()
+        ),
+        inputFacesPathLineEdit=SimpleNamespace(
+            setText=MagicMock(), setToolTip=MagicMock()
+        ),
+        outputFolderLineEdit=SimpleNamespace(setText=MagicMock()),
+        _set_panel_visibility=MagicMock(),
+        apply_parameter_section_states=MagicMock(),
+        _refresh_panel_visibility_state_from_widgets=MagicMock(),
+        restoreState=MagicMock(),
+        tabWidget=SimpleNamespace(count=lambda: 0),
+        video_loader_worker=None,
+        input_faces_loader_worker=None,
+    )
+
+    main_window.targetVideosFilterImagesCheckBox = _SignalAwareCheckBox(checked=True)
+    main_window.targetVideosFilterVideosCheckBox = _SignalAwareCheckBox(checked=True)
+    main_window.targetVideosFilterWebcamsCheckBox = _SignalAwareCheckBox(
+        checked=False,
+        callbacks=[
+            lambda: filter_calls.append("signal-filter"),
+            lambda: webcam_calls.append("signal-webcam"),
+        ],
+    )
+
+    monkeypatch.setattr(
+        save_load_actions,
+        "_apply_workspace_window_state",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        save_load_actions.video_control_actions,
+        "block_if_issue_scan_active",
+        lambda *_args, **_kwargs: False,
+    )
+    monkeypatch.setattr(
+        save_load_actions.list_view_actions,
+        "clear_stop_loading_input_media",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.list_view_actions,
+        "clear_stop_loading_target_media",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.card_actions,
+        "clear_input_faces",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.card_actions,
+        "clear_target_faces",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.card_actions,
+        "clear_merged_embeddings",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.ui_workers,
+        "TargetMediaLoaderWorker",
+        _NoOpLoaderWorker,
+    )
+    monkeypatch.setattr(
+        save_load_actions.ui_workers,
+        "InputFacesLoaderWorker",
+        _NoOpLoaderWorker,
+    )
+    monkeypatch.setattr(
+        save_load_actions.filter_actions,
+        "filter_target_videos",
+        lambda *_args, **_kwargs: filter_calls.append("final-filter"),
+    )
+    monkeypatch.setattr(
+        save_load_actions.list_view_actions,
+        "load_target_webcams",
+        lambda *_args, **_kwargs: webcam_calls.append("final-webcam"),
+    )
+    monkeypatch.setattr(
+        save_load_actions.list_view_actions,
+        "apply_face_thumbnail_size",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.common_widget_actions,
+        "set_control_widgets_values",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.common_widget_actions,
+        "create_control",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.common_widget_actions,
+        "set_widgets_values_using_face_id_parameters",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.layout_actions,
+        "fit_image_to_view_onchange",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.video_control_actions,
+        "remove_all_markers",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.video_control_actions,
+        "set_issue_frames_by_face",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.video_control_actions,
+        "set_issue_frames_for_face",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.video_control_actions,
+        "set_dropped_frames",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        save_load_actions.video_control_actions,
+        "update_drop_frame_button_label",
+        lambda *_args, **_kwargs: None,
+    )
+
+    save_load_actions.load_saved_workspace(main_window, str(workspace_path))
+
+    assert filter_calls == ["final-filter"]
+    assert webcam_calls == ["final-webcam"]
