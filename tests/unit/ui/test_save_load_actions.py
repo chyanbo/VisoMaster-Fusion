@@ -445,9 +445,9 @@ def _make_workspace_main_window(
         "faces": True,
         "parameters": True,
     }
-    mw.filterImagesCheckBox = SimpleNamespace(isChecked=lambda: True)
-    mw.filterVideosCheckBox = SimpleNamespace(isChecked=lambda: True)
-    mw.filterWebcamsCheckBox = SimpleNamespace(isChecked=lambda: False)
+    mw.targetVideosFilterImagesCheckBox = SimpleNamespace(isChecked=lambda: True)
+    mw.targetVideosFilterVideosCheckBox = SimpleNamespace(isChecked=lambda: True)
+    mw.targetVideosFilterWebcamsCheckBox = SimpleNamespace(isChecked=lambda: False)
     mw.scan_tools_expanded = False
     mw.project_root_path = tmp_path
     mw.geometry = lambda: geometry
