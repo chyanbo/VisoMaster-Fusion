@@ -794,6 +794,19 @@ def load_saved_workspace(
             main_window.targetVideosFilterWebcamsCheckBox.setChecked(
                 window_state.get("filterWebcamsCheckBox", False)
             )
+            saved_face_thumbnail_size = window_state.get("face_thumbnail_size")
+            if saved_face_thumbnail_size == "small":
+                list_view_actions.apply_face_thumbnail_size(
+                    main_window, list_view_actions._SMALL_FACE_BUTTON_SIZE
+                )
+            elif saved_face_thumbnail_size == "large":
+                list_view_actions.apply_face_thumbnail_size(
+                    main_window, list_view_actions._LARGE_FACE_BUTTON_SIZE
+                )
+            else:
+                list_view_actions.apply_face_thumbnail_size(
+                    main_window, list_view_actions._FACE_BUTTON_SIZE
+                )
             if hasattr(main_window, "scanToolsToggleButton"):
                 video_control_actions.set_scan_tools_expanded(
                     main_window, window_state.get("scan_tools_expanded", False)
@@ -885,6 +898,16 @@ def save_current_workspace(
         "filterImagesCheckBox": main_window.targetVideosFilterImagesCheckBox.isChecked(),
         "filterVideosCheckBox": main_window.targetVideosFilterVideosCheckBox.isChecked(),
         "filterWebcamsCheckBox": main_window.targetVideosFilterWebcamsCheckBox.isChecked(),
+        "face_thumbnail_size": (
+            "small"
+            if getattr(
+                main_window,
+                "face_thumbnail_button_size",
+                list_view_actions._FACE_BUTTON_SIZE,
+            )
+            == list_view_actions._SMALL_FACE_BUTTON_SIZE
+            else "large"
+        ),
         "scan_tools_expanded": getattr(main_window, "scan_tools_expanded", False),
         "parameter_section_states": {
             section_id: bool(expanded)

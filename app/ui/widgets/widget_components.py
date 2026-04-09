@@ -217,6 +217,7 @@ class TargetMediaCardButton(CardButton):
             QtCore.Qt.WidgetAttribute.WA_TransparentForMouseEvents, True
         )
         layout.addWidget(self.text_label, 0)
+
         self.clicked.connect(self.load_media)
 
         # Set the context menu policy to trigger the custom context menu on right-click
@@ -945,6 +946,8 @@ class TargetFaceCardButton(CardButton):
 
     def create_context_menu(self):
         # create context menu
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
         self.face_header_action = QtGui.QAction(self.get_display_label(), self)
         header_font = self.popMenu.font()
@@ -986,6 +989,30 @@ class TargetFaceCardButton(CardButton):
                 True,
             )
         )
+        current_face_size = getattr(
+            self.main_window, "face_thumbnail_button_size", None
+        )
+        self.thumbnail_size_action_group = QtGui.QActionGroup(self.popMenu)
+        self.thumbnail_size_action_group.setExclusive(True)
+
+        self.small_thumbnails_action = QtGui.QAction("Small Thumbnails", self)
+        self.small_thumbnails_action.setCheckable(True)
+        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+        self.thumbnail_size_action_group.addAction(self.small_thumbnails_action)
+        self.small_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (70, 70)
+            )
+        )
+        self.large_thumbnails_action = QtGui.QAction("Large Thumbnails", self)
+        self.large_thumbnails_action.setCheckable(True)
+        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+        self.thumbnail_size_action_group.addAction(self.large_thumbnails_action)
+        self.large_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (96, 96)
+            )
+        )
         self.remove_action = QtGui.QAction("Remove from List", self)
         self.remove_action.triggered.connect(self.remove_target_face_from_list)
         self.popMenu.addAction(self.parameters_copy_action)
@@ -993,16 +1020,25 @@ class TargetFaceCardButton(CardButton):
         self.popMenu.addAction(self.save_parameters_action)
         self.popMenu.addAction(self.load_parameters_action)
         self.popMenu.addAction(self.load_parameters_and_settings_action)
+        self.popMenu.addSeparator()
+        self.popMenu.addAction(self.small_thumbnails_action)
+        self.popMenu.addAction(self.large_thumbnails_action)
+        self.popMenu.addSeparator()
         self.popMenu.addAction(self.remove_action)
 
     def on_context_menu(self, point):
         # show context menu
         scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+        current_face_size = getattr(
+            self.main_window, "face_thumbnail_button_size", None
+        )
         self.face_header_action.setText(self.get_display_label())
         self.parameters_paste_action.setEnabled(not scan_active)
         self.load_parameters_action.setEnabled(not scan_active)
         self.load_parameters_and_settings_action.setEnabled(not scan_active)
         self.remove_action.setEnabled(not scan_active)
+        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
         self.popMenu.exec_(self.mapToGlobal(point))
 
     def remove_target_face_from_list(self):
@@ -1328,6 +1364,8 @@ class InputFaceCardButton(CardButton):
 
     def create_context_menu(self):
         # create context menu
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
         self.create_embed_action = QtGui.QAction(
             "Create embedding from selected faces", self
@@ -1348,13 +1386,47 @@ class InputFaceCardButton(CardButton):
         self.open_path_action = QtGui.QAction("Open file location", self)
         self.open_path_action.triggered.connect(self.open_target_path_by_explorer)
         self.popMenu.addAction(self.open_path_action)
+        self.popMenu.addSeparator()
+
+        current_face_size = getattr(
+            self.main_window, "face_thumbnail_button_size", None
+        )
+        self.thumbnail_size_action_group = QtGui.QActionGroup(self.popMenu)
+        self.thumbnail_size_action_group.setExclusive(True)
+
+        self.small_thumbnails_action = QtGui.QAction("Small Thumbnails", self)
+        self.small_thumbnails_action.setCheckable(True)
+        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+        self.thumbnail_size_action_group.addAction(self.small_thumbnails_action)
+        self.small_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (70, 70)
+            )
+        )
+        self.popMenu.addAction(self.small_thumbnails_action)
+
+        self.large_thumbnails_action = QtGui.QAction("Large Thumbnails", self)
+        self.large_thumbnails_action.setCheckable(True)
+        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+        self.thumbnail_size_action_group.addAction(self.large_thumbnails_action)
+        self.large_thumbnails_action.triggered.connect(
+            partial(
+                list_view_actions.apply_face_thumbnail_size, self.main_window, (96, 96)
+            )
+        )
+        self.popMenu.addAction(self.large_thumbnails_action)
 
     def on_context_menu(self, point):
         # show context menu
         scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+        current_face_size = getattr(
+            self.main_window, "face_thumbnail_button_size", None
+        )
         self.create_embed_action.setEnabled(not scan_active)
         self.remove_action.setEnabled(not scan_active)
         self.delete_action.setEnabled(not scan_active)
+        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
         self.popMenu.exec_(self.mapToGlobal(point))
 
     def create_embedding_from_selected_faces(self):

@@ -20,7 +20,9 @@ if TYPE_CHECKING:
 
 _WORKER_STOP_TIMEOUT_MS = 1000
 _TARGET_BUTTON_SIZE = (96, 96)
-_FACE_BUTTON_SIZE = (70, 70)
+_SMALL_FACE_BUTTON_SIZE = (70, 70)
+_LARGE_FACE_BUTTON_SIZE = (96, 96)
+_FACE_BUTTON_SIZE = _SMALL_FACE_BUTTON_SIZE
 _EMBED_BUTTON_SIZE = (120, 25)
 _EMBED_LIST_HEIGHT = 140
 
@@ -142,7 +144,7 @@ def add_media_thumbnail_button(
     if buttonClass == widget_components.TargetMediaCardButton:
         button_size = QtCore.QSize(*_TARGET_BUTTON_SIZE)
     else:
-        button_size = QtCore.QSize(*_FACE_BUTTON_SIZE)
+        button_size = QtCore.QSize(*_get_face_button_size(main_window))
 
     button: widget_components.CardButton = buttonClass(
         *constructor_args, main_window=main_window
@@ -200,12 +202,42 @@ def refresh_target_face_display_labels(main_window: "MainWindow"):
             target_face_button.refresh_display_label()
 
 
+def _get_face_button_size(main_window: "MainWindow") -> tuple[int, int]:
+    return getattr(main_window, "face_thumbnail_button_size", _FACE_BUTTON_SIZE)
+
+
+def apply_face_thumbnail_size(
+    main_window: "MainWindow", button_size_tuple: tuple[int, int]
+) -> None:
+    main_window.face_thumbnail_button_size = button_size_tuple
+    button_size = QtCore.QSize(*button_size_tuple)
+    grid_size_with_padding = button_size + QtCore.QSize(4, 4)
+
+    for listWidget in (main_window.targetFacesList, main_window.inputFacesList):
+        listWidget.setGridSize(grid_size_with_padding)
+        for i in range(listWidget.count()):
+            list_item = listWidget.item(i)
+            button = listWidget.itemWidget(list_item)
+            if button is None:
+                continue
+            button.setFixedSize(button_size)
+            button.setIconSize(
+                button_size - QtCore.QSize(8, 8)
+            )  # Slightly smaller than the button size to add some margin
+            list_item.setSizeHint(button_size)
+        listWidget.doItemsLayout()
+        listWidget.viewport().update()
+
+
 def initialize_media_list_widgets(main_window: "MainWindow"):
     """One-time configuration for target/input media and face list widgets."""
+    if not hasattr(main_window, "face_thumbnail_button_size"):
+        main_window.face_thumbnail_button_size = _FACE_BUTTON_SIZE
+
     for listWidget, button_size_tuple in [
         (main_window.targetVideosList, _TARGET_BUTTON_SIZE),
-        (main_window.targetFacesList, _FACE_BUTTON_SIZE),
-        (main_window.inputFacesList, _FACE_BUTTON_SIZE),
+        (main_window.targetFacesList, _get_face_button_size(main_window)),
+        (main_window.inputFacesList, _get_face_button_size(main_window)),
     ]:
         button_size = QtCore.QSize(*button_size_tuple)
         grid_size_with_padding = button_size + QtCore.QSize(4, 4)
