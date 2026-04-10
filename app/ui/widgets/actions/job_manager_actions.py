@@ -438,6 +438,9 @@ def _load_job_target_faces_and_params(main_window: "MainWindow", data: dict):
                     target_face_obj.assigned_merged_embeddings[assigned_id] = (
                         main_window.merged_embeddings[assigned_id].embedding_store
                     )
+            
+            # use TargetFaceCardButton widget to load existing target_face_button hooks
+            target_face_obj.load_target_face()
 
             # Load assigned input faces
             target_face_obj.assigned_input_faces.clear()
@@ -810,6 +813,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
 
         progress_dialog.update_progress(5, total_steps, steps[4])
         _load_job_target_faces_and_params(main_window, data)
+        
 
         progress_dialog.update_progress(6, total_steps, steps[5])
         _load_job_controls_and_state(main_window, data, is_batch_load=False)
@@ -820,12 +824,12 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
         # Calculate assigned_input_embedding here for KV injection
         for face_id, target_face_button in main_window.target_faces.items():
             print(
-                f"[INFO] Pre-calculating embedding and K/V map for target face {face_id}..."
+                f"[INFO] Pre-calculating Job workspace embedding and K/V map for target face {face_id}..."
             )
             target_face_button.calculate_assigned_input_embedding()
 
         progress_dialog.update_progress(8, total_steps, steps[7])
-        print(f"[INFO] Loaded workspace from: {data_filename}")
+        print(f"[INFO] Loaded Job workspace from: {data_filename}")
 
         # After loading, check if any target faces were loaded
         if main_window.target_faces:
@@ -841,6 +845,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
             if first_face_button:
                 first_face_button.setChecked(True)  # Visually select it
                 main_window.cur_selected_target_face_button = first_face_button
+                print(f"[INFO] Loaded Job target_face {main_window.cur_selected_target_face_button}")
                 assigned_embedding_ids = (
                     first_face_button.assigned_merged_embeddings.keys()
                 )

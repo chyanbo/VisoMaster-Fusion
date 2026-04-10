@@ -1,0 +1,117 @@
+From a2b75a492d3a875c7ab3297b9cf2d7aa7311be82 Mon Sep 17 00:00:00 2001
+From: mr-szgz <31197922+mr-szgz@users.noreply.github.com>
+Date: Fri, 10 Apr 2026 14:40:08 -0400
+Subject: [PATCH] restores ClusterOutputBySourceToggle when using job-manager
+
+---
+ .gitignore                                    |  1 +
+ app/processors/video_processor.py             | 28 ++++++++++++-------
+ app/ui/widgets/actions/job_manager_actions.py |  7 +++--
+ 3 files changed, 24 insertions(+), 12 deletions(-)
+
+diff --git a/.gitignore b/.gitignore
+index aed0522..4d8b0c8 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -40,3 +40,4 @@ tensorrt-engines/
+ test_frames*/
+ test_videos*/
+ presets/
++temp_files/
+diff --git a/app/processors/video_processor.py b/app/processors/video_processor.py
+index b6e1b28..b21e7fb 100644
+--- a/app/processors/video_processor.py
++++ b/app/processors/video_processor.py
+@@ -27,6 +27,7 @@ from app.ui.widgets.actions import video_control_actions
+ from app.ui.widgets.actions import layout_actions
+ from app.ui.widgets.actions import list_view_actions
+ from app.ui.widgets.actions import save_load_actions
++import app.ui.widgets.widget_components as widget_components
+ from app.ui.widgets.settings_layout_data import CAMERA_BACKENDS
+ import app.helpers.miscellaneous as misc_helpers
+ from app.helpers.typing_helper import (
+@@ -1557,10 +1558,7 @@ class VideoProcessor(QObject):
+                 )
+                 if embedding_name:
+                     output_folder = os.path.join(output_folder, embedding_name)
+-                else:
+-                    print(
+-                        f"[WARN] ClusterOutputBySourceToggle enabled but embedding_name is falsy"
+-                    )
++
+             self.active_output_folder = output_folder
+             # Disable UI elements
+             if not self.main_window.control["KeepControlsToggle"]:
+@@ -4097,11 +4095,20 @@ class VideoProcessor(QObject):
+                 
+                 output_folder = self.main_window.control["OutputMediaFolder"]
+                 if self.main_window.control.get("ClusterOutputBySourceToggle", False):
+-                    target_face_button = getattr(
+-                        self.main_window, "cur_selected_target_face_button", None
++                    target_face_button = cast(
++                        widget_components.TargetFaceCardButton | None,
++                        getattr(self.main_window, "cur_selected_target_face_button", None),
+                     )
++                    if target_face_button:
++                        print(f"[INFO] Finalizing output_folder for default-style recording with target_face_button {target_face_button}")
++                    else:
++                        print(f"[WARN] ClusterOutputBySourceToggle enabled but target_face_button invalid. Got {target_face_button}")
+                     assigned_embeddings = (
+-                        getattr(target_face_button, "assigned_merged_embeddings", None)
++                        cast(
++                            # type copied from TargetFaceCardButton. (See app\ui\widgets\widget_components.py:581)
++                            Dict[str, Dict[str, numpy.ndarray]] | None,
++                            getattr(target_face_button, "assigned_merged_embeddings", None),
++                        )
+                         if target_face_button
+                         else None
+                     )
+@@ -4114,12 +4121,13 @@ class VideoProcessor(QObject):
+                         else None
+                     )
+                     embedding_name = (
+-                        str(getattr(embedding_button, "embedding_name", "")).strip()
+-                        if embedding_button is not None
+-                        else ""
++                        getattr(embedding_button, "embedding_name", None)
+                     )
+                     if embedding_name:
++                        print(f"[INFO] Finalizing output_folder with embedding_name {embedding_name}")
+                         output_folder = os.path.join(str(output_folder), embedding_name)
++                    else:
++                        print(f"[WARN] ClusterOutputBySourceToggle enabled but embedding_name invalid. Got '{embedding_name}'")
+ 
+                 final_file_path = misc_helpers.get_output_file_path(
+                     self.media_path,
+diff --git a/app/ui/widgets/actions/job_manager_actions.py b/app/ui/widgets/actions/job_manager_actions.py
+index 7500832..6753b64 100644
+--- a/app/ui/widgets/actions/job_manager_actions.py
++++ b/app/ui/widgets/actions/job_manager_actions.py
+@@ -438,6 +438,9 @@ def _load_job_target_faces_and_params(main_window: "MainWindow", data: dict):
+                     target_face_obj.assigned_merged_embeddings[assigned_id] = (
+                         main_window.merged_embeddings[assigned_id].embedding_store
+                     )
++            
++            # use TargetFaceCardButton widget to load existing target_face_button hooks
++            target_face_obj.load_target_face()
+ 
+             # Load assigned input faces
+             target_face_obj.assigned_input_faces.clear()
+@@ -820,12 +823,12 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
+         # Calculate assigned_input_embedding here for KV injection
+         for face_id, target_face_button in main_window.target_faces.items():
+             print(
+-                f"[INFO] Pre-calculating embedding and K/V map for target face {face_id}..."
++                f"[INFO] Pre-calculating Job workspace embedding and K/V map for target face {face_id}..."
+             )
+             target_face_button.calculate_assigned_input_embedding()
+ 
+         progress_dialog.update_progress(8, total_steps, steps[7])
+-        print(f"[INFO] Loaded workspace from: {data_filename}")
++        print(f"[INFO] Loaded Job workspace from: {data_filename}")
+ 
+         # After loading, check if any target faces were loaded
+         if main_window.target_faces:
+-- 
+2.49.0.vfs.0.2
+
