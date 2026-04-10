@@ -824,12 +824,12 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
         # Calculate assigned_input_embedding here for KV injection
         for face_id, target_face_button in main_window.target_faces.items():
             print(
-                f"[INFO] Pre-calculating Job workspace embedding and K/V map for target face {face_id}..."
+                f"[INFO] Pre-calculating embedding and K/V map for target face {face_id}..."
             )
             target_face_button.calculate_assigned_input_embedding()
 
         progress_dialog.update_progress(8, total_steps, steps[7])
-        print(f"[INFO] Loaded Job workspace from: {data_filename}")
+        print(f"[INFO] Loaded workspace from: {data_filename}")
 
         # After loading, check if any target faces were loaded
         if main_window.target_faces:
