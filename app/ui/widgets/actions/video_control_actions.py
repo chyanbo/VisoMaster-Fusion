@@ -3002,11 +3002,19 @@ def toggle_theatre_mode(main_window: "MainWindow"):
     if not is_theatre:
         # --- ENTER THEATRE MODE ---
         main_window.is_theatre_mode = True
+        use_fullscreen_with_theatre = bool(
+            getattr(main_window, "control", {}).get(
+                "TheatreModeUsesFullscreenToggle", False
+            )
+        )
 
         # 0. Save the exact state of all docks and toolbars (sizes, proportions, splitters)
         main_window._saved_window_state = main_window.saveState()
         main_window._was_maximized = main_window.isMaximized()
         main_window._was_custom_fullscreen = main_window.isFullScreen()
+        main_window._theatre_forced_fullscreen = bool(
+            use_fullscreen_with_theatre and not main_window._was_custom_fullscreen
+        )
         if main_window.isMaximized() or main_window.isFullScreen():
             main_window._was_normal_geometry = main_window.normalGeometry()
         else:
@@ -3086,8 +3094,17 @@ def toggle_theatre_mode(main_window: "MainWindow"):
             QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff
         )
 
-        # 6. Preserve the base window mode; only remain fullscreen if already fullscreen.
-        if main_window._was_custom_fullscreen:
+        # 6. Preserve the base window mode; optionally enter fullscreen with theatre.
+        if main_window._was_custom_fullscreen or main_window._theatre_forced_fullscreen:
+            if main_window._theatre_forced_fullscreen:
+                main_window._fullscreen_restore_was_maximized = (
+                    main_window._was_maximized
+                )
+                main_window._fullscreen_restore_geometry = (
+                    None
+                    if main_window._was_maximized
+                    else main_window._was_normal_geometry
+                )
             main_window.setWindowState(QtCore.Qt.WindowState.WindowFullScreen)
             main_window.showFullScreen()
             QtWidgets.QApplication.processEvents()
@@ -3188,6 +3205,7 @@ def toggle_theatre_mode(main_window: "MainWindow"):
         was_custom_fullscreen = getattr(main_window, "_was_custom_fullscreen", False)
         was_maximized = getattr(main_window, "_was_maximized", False)
         saved_normal_geometry = getattr(main_window, "_was_normal_geometry", None)
+        main_window._theatre_forced_fullscreen = False
 
         _restore_window_base_mode(
             main_window,

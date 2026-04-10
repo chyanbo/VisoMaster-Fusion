@@ -205,6 +205,7 @@ class _StatefulFullscreenWindow:
         state: str = "normal",
         geometry: _FakeGeometry | None = None,
         is_theatre_mode: bool = False,
+        theatre_forced_fullscreen: bool = False,
     ):
         self._state = state
         self._geometry = geometry or _FakeGeometry()
@@ -216,6 +217,7 @@ class _StatefulFullscreenWindow:
         self._was_maximized = state == "maximized"
         self._was_custom_fullscreen = False
         self._was_normal_geometry = self._normal_geometry
+        self._theatre_forced_fullscreen = theatre_forced_fullscreen
         self._sync_calls: list[bool] = []
         self._theatre_snapshot_sync_calls = 0
         self.showFullScreen = MagicMock(side_effect=self._show_fullscreen)
@@ -260,6 +262,8 @@ class _StatefulFullscreenWindow:
             return
 
         if self.isFullScreen():
+            if self._theatre_forced_fullscreen:
+                return
             self._was_custom_fullscreen = True
             self._was_maximized = False
             self._was_normal_geometry = (
@@ -453,12 +457,32 @@ class _FakeGraphicsViewFrame:
         return None
 
 
-def _make_theatre_entry_window(*, is_fullscreen: bool, is_maximized: bool = False):
+def _make_theatre_entry_window(
+    *,
+    is_fullscreen: bool,
+    is_maximized: bool = False,
+    theatre_uses_fullscreen: bool = False,
+):
     menu_bar = _FakeMenuBar()
+    state = "fullscreen" if is_fullscreen else "maximized" if is_maximized else "normal"
+
+    def _show_fullscreen():
+        nonlocal state
+        state = "fullscreen"
+
+    def _show_normal():
+        nonlocal state
+        state = "normal"
+
+    def _show_maximized():
+        nonlocal state
+        state = "maximized"
+
     return SimpleNamespace(
         is_theatre_mode=False,
         is_full_screen=False,
         _saved_window_state=None,
+        _theatre_forced_fullscreen=False,
         input_Target_DockWidget=_FakeWidget(),
         input_Faces_DockWidget=_FakeWidget(),
         jobManagerDockWidget=_FakeWidget(),
@@ -471,12 +495,16 @@ def _make_theatre_entry_window(*, is_fullscreen: bool, is_maximized: bool = Fals
         panelVisibilityCheckBoxLayout=_FakeLayout(),
         graphicsViewFrame=_FakeGraphicsViewFrame(),
         saveState=lambda: "window-state",
-        isMaximized=lambda: is_maximized,
-        isFullScreen=lambda: is_fullscreen,
+        isMaximized=lambda: state == "maximized",
+        isFullScreen=lambda: state == "fullscreen",
         normalGeometry=lambda: "normal-geometry",
         geometry=lambda: "live-geometry",
+        control={"TheatreModeUsesFullscreenToggle": theatre_uses_fullscreen},
         setWindowState=MagicMock(),
-        showFullScreen=MagicMock(),
+        showFullScreen=MagicMock(side_effect=_show_fullscreen),
+        showNormal=MagicMock(side_effect=_show_normal),
+        showMaximized=MagicMock(side_effect=_show_maximized),
+        setGeometry=MagicMock(),
     )
 
 
@@ -535,6 +563,128 @@ def test_toggle_theatre_mode_keeps_maximized_window_when_base_mode_is_maximized(
     assert main_window.is_full_screen is False
 
 
+def test_toggle_theatre_mode_enters_fullscreen_from_windowed_state_when_enabled(
+    monkeypatch, video_actions_env
+):
+    monkeypatch.setattr(
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
+    )
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
+    main_window = _make_theatre_entry_window(
+        is_fullscreen=False,
+        is_maximized=False,
+        theatre_uses_fullscreen=True,
+    )
+
+    video_actions_env.toggle_theatre_mode(main_window)
+
+    assert main_window._was_custom_fullscreen is False
+    assert main_window._theatre_forced_fullscreen is True
+    assert main_window._was_maximized is False
+    assert main_window._was_normal_geometry == "live-geometry"
+    main_window.setWindowState.assert_called_once_with(
+        video_actions_env.module.QtCore.Qt.WindowState.WindowFullScreen
+    )
+    main_window.showFullScreen.assert_called_once()
+    assert main_window.is_full_screen is True
+
+
+def test_toggle_theatre_mode_enters_fullscreen_from_maximized_state_when_enabled(
+    monkeypatch, video_actions_env
+):
+    monkeypatch.setattr(
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
+    )
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
+    main_window = _make_theatre_entry_window(
+        is_fullscreen=False,
+        is_maximized=True,
+        theatre_uses_fullscreen=True,
+    )
+
+    video_actions_env.toggle_theatre_mode(main_window)
+
+    assert main_window._was_custom_fullscreen is False
+    assert main_window._theatre_forced_fullscreen is True
+    assert main_window._was_maximized is True
+    assert main_window._was_normal_geometry == "normal-geometry"
+    main_window.setWindowState.assert_called_once_with(
+        video_actions_env.module.QtCore.Qt.WindowState.WindowFullScreen
+    )
+    main_window.showFullScreen.assert_called_once()
+    assert main_window.is_full_screen is True
+
+
+def test_toggle_theatre_mode_keeps_existing_fullscreen_when_setting_enabled(
+    monkeypatch, video_actions_env
+):
+    monkeypatch.setattr(
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
+    )
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
+    main_window = _make_theatre_entry_window(
+        is_fullscreen=True,
+        theatre_uses_fullscreen=True,
+    )
+
+    video_actions_env.toggle_theatre_mode(main_window)
+
+    assert main_window._was_custom_fullscreen is True
+    assert main_window._theatre_forced_fullscreen is False
+    assert main_window._was_normal_geometry == "normal-geometry"
+    main_window.setWindowState.assert_called_once_with(
+        video_actions_env.module.QtCore.Qt.WindowState.WindowFullScreen
+    )
+    main_window.showFullScreen.assert_called_once()
+    assert main_window.is_full_screen is True
+
+
+def test_toggle_theatre_mode_seeds_fullscreen_restore_geometry_when_forced(
+    monkeypatch, video_actions_env
+):
+    monkeypatch.setattr(
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
+    )
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
+    main_window = _make_theatre_entry_window(
+        is_fullscreen=False,
+        is_maximized=False,
+        theatre_uses_fullscreen=True,
+    )
+
+    video_actions_env.toggle_theatre_mode(main_window)
+    video_actions_env.view_fullscreen(main_window)
+
+    assert main_window.is_theatre_mode is True
+    assert main_window._fullscreen_restore_was_maximized is False
+    assert main_window._fullscreen_restore_geometry is None
+    main_window.showNormal.assert_called_once()
+    assert main_window.setGeometry.call_args_list[-1].args == ("live-geometry",)
+
+
+def test_toggle_theatre_mode_seeds_fullscreen_restore_maximized_when_forced(
+    monkeypatch, video_actions_env
+):
+    monkeypatch.setattr(
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
+    )
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
+    main_window = _make_theatre_entry_window(
+        is_fullscreen=False,
+        is_maximized=True,
+        theatre_uses_fullscreen=True,
+    )
+
+    video_actions_env.toggle_theatre_mode(main_window)
+    video_actions_env.view_fullscreen(main_window)
+
+    assert main_window.is_theatre_mode is True
+    assert main_window._fullscreen_restore_was_maximized is False
+    assert main_window._fullscreen_restore_geometry is None
+    main_window.showMaximized.assert_called_once()
+    main_window.showNormal.assert_not_called()
+
+
 def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(
     monkeypatch, video_actions_env
 ):
@@ -554,6 +704,7 @@ def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(
     main_window = SimpleNamespace(
         is_theatre_mode=True,
         _was_custom_fullscreen=False,
+        _theatre_forced_fullscreen=True,
         _was_maximized=False,
         _was_normal_geometry=saved_geometry,
         _saved_window_state="window-state",
@@ -595,6 +746,7 @@ def test_toggle_theatre_mode_restores_saved_normal_geometry_on_exit(
         (False,),
         (True,),
     ]
+    assert main_window._theatre_forced_fullscreen is False
     assert main_window.is_full_screen is False
 
 
@@ -610,6 +762,7 @@ def test_toggle_theatre_mode_restores_maximized_state_on_exit(
     main_window = SimpleNamespace(
         is_theatre_mode=True,
         _was_custom_fullscreen=False,
+        _theatre_forced_fullscreen=True,
         _was_maximized=True,
         _was_normal_geometry="normal-geometry",
         _saved_window_state="window-state",
@@ -652,7 +805,66 @@ def test_toggle_theatre_mode_restores_maximized_state_on_exit(
         (False,),
         (True,),
     ]
+    assert main_window._theatre_forced_fullscreen is False
     assert main_window.is_full_screen is False
+
+
+def test_toggle_theatre_mode_restores_existing_fullscreen_state_on_exit(
+    monkeypatch, video_actions_env
+):
+    monkeypatch.setattr(
+        video_actions_env.module, "_set_media_controls_visible", lambda *_args: None
+    )
+    video_actions_env.module.layout_actions.fit_image_to_view_onchange.reset_mock()
+
+    menu_bar = _FakeMenuBar()
+    main_window = SimpleNamespace(
+        is_theatre_mode=True,
+        _was_custom_fullscreen=True,
+        _theatre_forced_fullscreen=False,
+        _was_maximized=False,
+        _was_normal_geometry="normal-geometry",
+        _saved_window_state="window-state",
+        _saved_dock_states={},
+        _saved_layout_props={},
+        _main_v_spacers=[],
+        _top_bar_spacers=[],
+        _top_bar_widgets_state={},
+        input_Target_DockWidget=_FakeWidget(False),
+        input_Faces_DockWidget=_FakeWidget(False),
+        jobManagerDockWidget=_FakeWidget(False),
+        controlOptionsDockWidget=_FakeWidget(False),
+        facesPanelGroupBox=_FakeWidget(False),
+        menuBar=lambda: menu_bar,
+        horizontalLayout=_FakeLayout(),
+        verticalLayout=_FakeLayout(),
+        verticalLayoutMediaControls=_FakeLayout(),
+        panelVisibilityCheckBoxLayout=_FakeLayout(),
+        graphicsViewFrame=_FakeGraphicsViewFrame(),
+        isFullScreen=lambda: True,
+        isMaximized=lambda: False,
+        normalGeometry=lambda: "normal-geometry",
+        geometry=lambda: "live-geometry",
+        showFullScreen=MagicMock(),
+        showMaximized=MagicMock(),
+        showNormal=MagicMock(),
+        setWindowState=MagicMock(),
+        setGeometry=MagicMock(),
+        restoreState=MagicMock(),
+        setUpdatesEnabled=MagicMock(),
+    )
+
+    video_actions_env.toggle_theatre_mode(main_window)
+
+    main_window.setWindowState.assert_called_once_with(
+        video_actions_env.module.QtCore.Qt.WindowState.WindowFullScreen
+    )
+    main_window.showFullScreen.assert_not_called()
+    main_window.showMaximized.assert_not_called()
+    main_window.showNormal.assert_not_called()
+    main_window.restoreState.assert_called_once_with("window-state")
+    assert main_window._theatre_forced_fullscreen is False
+    assert main_window.is_full_screen is True
 
 
 def test_disable_compare_preview_modes_for_recording_disables_both_and_toasts(
