@@ -812,8 +812,7 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
         _load_job_embeddings(main_window, data)
 
         progress_dialog.update_progress(5, total_steps, steps[4])
-        _load_job_target_faces_and_params(main_window, data)
-        
+        _load_job_target_faces_and_params(main_window, data)        
 
         progress_dialog.update_progress(6, total_steps, steps[5])
         _load_job_controls_and_state(main_window, data, is_batch_load=False)
