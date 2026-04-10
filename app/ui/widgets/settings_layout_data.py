@@ -155,6 +155,12 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": "Auto start over when video playing to the end.(Not work for recording)",
         },
+        "TheatreModeUsesFullscreenToggle": {
+            "level": 1,
+            "label": "Theatre Mode Uses Fullscreen",
+            "default": False,
+            "help": "When enabled, entering Theatre Mode also switches the window to fullscreen and restores the previous window state when Theatre Mode is turned off.",
+        },
         "FrameSkipStepSlider": {
             "level": 1,
             "label": "Frame Skip Step",
@@ -188,6 +194,12 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
         },
     },
     "Video Recording Settings": {
+        "ConfirmBeforeStoppingRecordingToggle": {
+            "level": 1,
+            "label": "Confirm Before Stopping Recording",
+            "default": True,
+            "help": "Show a confirmation prompt before manually stopping a recording.",
+        },
         "FrameEnhancerDownToggle": {
             "level": 1,
             "label": "Frame resize to 1920*1080",

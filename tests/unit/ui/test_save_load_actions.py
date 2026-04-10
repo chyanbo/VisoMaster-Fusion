@@ -444,6 +444,7 @@ def _make_workspace_main_window(
     was_custom_fullscreen: bool = False,
     was_maximized: bool = False,
     fullscreen_restore_geometry: _FakeGeometry | None = None,
+    theatre_forced_fullscreen: bool = False,
 ):
     default_params_data = {"brightness": 1.0, "contrast": 0.8}
     geometry = geometry or _FakeGeometry(10, 20, 1280, 720)
@@ -454,12 +455,16 @@ def _make_workspace_main_window(
     mw.is_theatre_mode = is_theatre_mode
     mw.is_full_screen = is_full_screen
     mw._was_custom_fullscreen = was_custom_fullscreen
+    mw._theatre_forced_fullscreen = theatre_forced_fullscreen
     mw._was_maximized = was_maximized
     mw._was_normal_geometry = normal_geometry
     mw._fullscreen_restore_was_maximized = False
     mw._fullscreen_restore_geometry = fullscreen_restore_geometry
     mw._saved_window_state = _FakeByteArray(saved_window_state)
-    mw.control = {}
+    mw.control = {
+        "TheatreModeUsesFullscreenToggle": False,
+        "ConfirmBeforeStoppingRecordingToggle": True,
+    }
     mw.target_videos = {}
     mw.input_faces = {}
     mw.target_faces = {}
@@ -631,6 +636,40 @@ def test_save_workspace_theatre_from_normal_uses_live_window_state(tmp_path):
     )
 
 
+def test_save_workspace_theatre_forced_fullscreen_uses_pre_theatre_window_state(
+    tmp_path,
+):
+    save_path = tmp_path / "workspace.json"
+    base_geometry = _FakeGeometry(444, 555, 1200, 800)
+    main_window = _make_workspace_main_window(
+        tmp_path,
+        is_theatre_mode=True,
+        is_full_screen=True,
+        is_maximized=False,
+        geometry=_FakeGeometry(0, 0, 1920, 1080),
+        normal_geometry=base_geometry,
+        saved_window_state="pre-theatre-layout",
+        was_custom_fullscreen=False,
+        was_maximized=False,
+        theatre_forced_fullscreen=True,
+    )
+
+    save_current_workspace(main_window, str(save_path))
+
+    saved = _read_saved_workspace(save_path)
+    assert saved["control"]["TheatreModeUsesFullscreenToggle"] is False
+    saved_window = saved["window_state_data"]
+    assert saved_window["isFullScreen"] is False
+    assert saved_window["isMaximized"] is False
+    assert saved_window["dock_state"] == "pre-theatre-layout"
+    assert (
+        saved_window["x"],
+        saved_window["y"],
+        saved_window["width"],
+        saved_window["height"],
+    ) == (444, 555, 1200, 800)
+
+
 def test_save_workspace_theatre_uses_latest_fullscreen_base_toggle(tmp_path):
     save_path = tmp_path / "workspace.json"
     main_window = _make_workspace_main_window(
@@ -670,6 +709,38 @@ def test_save_workspace_theatre_uses_latest_fullscreen_base_toggle(tmp_path):
         1110,
         720,
     )
+
+
+def test_save_workspace_persists_theatre_fullscreen_setting_in_control(tmp_path):
+    save_path = tmp_path / "workspace.json"
+    main_window = _make_workspace_main_window(
+        tmp_path,
+        is_theatre_mode=False,
+        is_full_screen=False,
+        is_maximized=False,
+    )
+    main_window.control["TheatreModeUsesFullscreenToggle"] = True
+
+    save_current_workspace(main_window, str(save_path))
+
+    saved = _read_saved_workspace(save_path)
+    assert saved["control"]["TheatreModeUsesFullscreenToggle"] is True
+
+
+def test_save_workspace_persists_stop_recording_confirmation_setting(tmp_path):
+    save_path = tmp_path / "workspace.json"
+    main_window = _make_workspace_main_window(
+        tmp_path,
+        is_theatre_mode=False,
+        is_full_screen=False,
+        is_maximized=False,
+    )
+    main_window.control["ConfirmBeforeStoppingRecordingToggle"] = False
+
+    save_current_workspace(main_window, str(save_path))
+
+    saved = _read_saved_workspace(save_path)
+    assert saved["control"]["ConfirmBeforeStoppingRecordingToggle"] is False
 
 
 def test_apply_workspace_window_state_fullscreen_seeds_restore_geometry(monkeypatch):

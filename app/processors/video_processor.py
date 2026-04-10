@@ -818,7 +818,7 @@ class VideoProcessor(QObject):
                                 new_smoothed_dense_kps[_i] = valid_kpss[_i].copy()
 
                         # Smoothing on Dense KPS 203
-                        if (has_dense_kps_203):
+                        if has_dense_kps_203:
                             # check if kpss_5 has more shapes than valid_kpss_203
                             if _i < valid_kpss_203.shape[0]:
                                 if _best_match_key in self._smoothed_dense_kps_203:
@@ -833,31 +833,36 @@ class VideoProcessor(QObject):
                                         _i
                                     ].copy()
                             else:
-                                print(f"[WARN] Skipping Smoothing. Dense KPS_203 face {_i} not found.")
+                                print(
+                                    f"[WARN] Skipping Smoothing. Dense KPS_203 face {_i} not found."
+                                )
 
                     else:
                         new_smoothed_kps[_i] = _raw.copy()
                         if has_dense_kps:
                             new_smoothed_dense_kps[_i] = valid_kpss[_i].copy()
-                        if (has_dense_kps_203):
+                        if has_dense_kps_203:
                             # check if kpss_5 has more shapes than valid_kpss_203
                             if _i < valid_kpss_203.shape[0]:
                                 new_smoothed_dense_kps_203[_i] = valid_kpss_203[
                                     _i
                                 ].copy()
                             else:
-                                print(f"[WARN] Skipping Smoothing. Dense KPS_203 face {_i} not found.")
-
+                                print(
+                                    f"[WARN] Skipping Smoothing. Dense KPS_203 face {_i} not found."
+                                )
 
                     kpss_5[_i] = new_smoothed_kps[_i]
                     if has_dense_kps:
                         valid_kpss[_i] = new_smoothed_dense_kps[_i]
-                    if (has_dense_kps_203):
+                    if has_dense_kps_203:
                         # check if kpss_5 has more shapes than valid_kpss_203
                         if _i < valid_kpss_203.shape[0]:
                             valid_kpss_203[_i] = new_smoothed_dense_kps_203[_i]
                         else:
-                            print(f"[WARN] Skipping Smoothing. Dense KPS_203 face {_i} not found.")
+                            print(
+                                f"[WARN] Skipping Smoothing. Dense KPS_203 face {_i} not found."
+                            )
 
                 self._smoothed_kps = new_smoothed_kps
                 self._smoothed_dense_kps = new_smoothed_dense_kps
@@ -1559,7 +1564,7 @@ class VideoProcessor(QObject):
                     output_folder = os.path.join(output_folder, embedding_name)
                 else:
                     print(
-                        f"[WARN] ClusterOutputBySourceToggle enabled but embedding_name is falsy"
+                        "[WARN] ClusterOutputBySourceToggle enabled but embedding_name is falsy"
                     )
             self.active_output_folder = output_folder
             # Disable UI elements

@@ -120,6 +120,7 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         self._theatre_mode_panel_states: dict[str, bool] | None = None
         self._fullscreen_restore_was_maximized = False
         self._fullscreen_restore_geometry = None
+        self._theatre_forced_fullscreen = False
         self.panel_visibility_state: dict[str, bool] = {
             "target_media": True,
             "input_faces": True,
@@ -859,6 +860,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
             return
 
         if self.isFullScreen():
+            if getattr(self, "_theatre_forced_fullscreen", False):
+                return
             restore_geometry = getattr(self, "_fullscreen_restore_geometry", None)
             self._was_custom_fullscreen = True
             self._was_maximized = False
@@ -908,7 +911,11 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
     def keyPressEvent(self, event):
         match event.key():
             case QtCore.Qt.Key_Escape:
-                if self.isFullScreen():
+                if getattr(self, "is_theatre_mode", False) and self.control.get(
+                    "TheatreModeUsesFullscreenToggle", False
+                ):
+                    video_control_actions.toggle_theatre_mode(self)
+                elif self.isFullScreen():
                     video_control_actions.view_fullscreen(self)
                 elif getattr(self, "is_theatre_mode", False):
                     video_control_actions.toggle_theatre_mode(self)
