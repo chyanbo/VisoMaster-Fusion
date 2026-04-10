@@ -638,10 +638,11 @@ def add_scan_review_controls(main_window: "MainWindow"):
 
     run_scan_button = QtWidgets.QPushButton("Scan for Issues")
     run_scan_button.setToolTip(
-        "Scans the current render range using your current settings.\n"
+        "Predicts detect/match misses using your current render-time settings.\n"
         "If record start/end markers exist, only those ranges are scanned.\n"
         "Saved settings markers are applied during the scan.\n"
-        "Flags detection or similarity misses for the selected target face.\n"
+        "Honors detection, tracking, KPS smoothing, recognition, and threshold settings.\n"
+        "Flags detection or similarity misses for the loaded target faces.\n"
         "Single-frame preview may differ from playback on borderline frames."
     )
     run_scan_button.setSizePolicy(
@@ -1184,10 +1185,11 @@ def _restore_issue_scan_ui(main_window: "MainWindow") -> None:
     if run_button is not None:
         run_button.setText("Scan for Issues")
         run_button.setToolTip(
-            "Scans the current render range using your current settings.\n"
+            "Predicts detect/match misses using your current render-time settings.\n"
             "If record start/end markers exist, only those ranges are scanned.\n"
             "Saved settings markers are applied during the scan.\n"
-            "Flags detection or similarity misses for the selected target face.\n"
+            "Honors detection, tracking, KPS smoothing, recognition, and threshold settings.\n"
+            "Flags detection or similarity misses for the loaded target faces.\n"
             "Single-frame preview may differ from playback on borderline frames."
         )
 
@@ -1352,6 +1354,24 @@ def run_issue_scan(main_window: "MainWindow"):
             main_window,
             "Scan Not Available",
             "The selected video could not be found on disk.",
+            main_window.videoSeekSlider,
+        )
+        return
+    scan_ranges = (
+        video_processor._get_issue_scan_ranges()
+        if hasattr(video_processor, "_get_issue_scan_ranges")
+        else None
+    )
+    unsupported_reason = video_processor.get_issue_scan_unavailable_reason(
+        getattr(main_window, "control", None),
+        scan_ranges=scan_ranges,
+        markers=getattr(main_window, "markers", None),
+    )
+    if unsupported_reason:
+        common_widget_actions.create_and_show_messagebox(
+            main_window,
+            "Scan Not Available",
+            unsupported_reason,
             main_window.videoSeekSlider,
         )
         return
