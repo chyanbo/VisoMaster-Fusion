@@ -1408,6 +1408,216 @@ def test_scan_issue_frames_resets_tracker_when_marker_segment_enables_tracking()
     assert reset_calls == ["reset", "reset", "reset"]
 
 
+@pytest.mark.parametrize(
+    ("changed_key", "first_value", "second_value"),
+    [
+        ("ByteTrackTrackThreshSlider", 40, 55),
+        ("ByteTrackMatchThreshSlider", 80, 65),
+        ("ByteTrackTrackBufferSlider", 30, 45),
+    ],
+)
+def test_scan_issue_frames_resets_tracker_when_bytetrack_config_changes_between_tracking_segments(
+    changed_key, first_value, second_value
+):
+    processor = VideoProcessor.__new__(VideoProcessor)
+    processor.media_path = "dummy.mp4"
+    processor.media_rotation = 0
+    processor.fps = 30.0
+    processor.current_frame_number = 0
+    processor.last_detected_faces = []
+    processor._smoothed_kps = {}
+    processor._smoothed_dense_kps = {}
+    processor._smoothed_dense_kps_203 = {}
+    reset_calls = []
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    local_controls_seen = []
+
+    first_control = {
+        "FaceTrackingEnableToggle": True,
+        "ByteTrackTrackThreshSlider": 40,
+        "ByteTrackMatchThreshSlider": 80,
+        "ByteTrackTrackBufferSlider": 30,
+    }
+    second_control = dict(first_control)
+    second_control[changed_key] = second_value
+
+    processor.main_window = SimpleNamespace(
+        control={"FaceTrackingEnableToggle": False},
+        parameters={},
+        target_faces={},
+        dropped_frames=set(),
+        markers={},
+        editFacesButton=SimpleNamespace(isChecked=lambda: False),
+        videoSeekSlider=SimpleNamespace(value=lambda: 0),
+        default_parameters=SimpleNamespace(data={"SimilarityThresholdSlider": 50}),
+        models_processor=SimpleNamespace(
+            device="cpu",
+            face_detectors=SimpleNamespace(
+                reset_tracker=lambda: reset_calls.append("reset")
+            ),
+        ),
+    )
+    processor._get_target_input_height = lambda: 256
+
+    def fake_run_sequential_detection(
+        _frame_rgb,
+        local_control,
+        _local_params,
+        frame_tensor=None,
+        detector_control_override=None,
+    ):
+        local_controls_seen.append(
+            (
+                dict(local_control),
+                dict(detector_control_override or {}),
+            )
+        )
+        return _empty_scan_detection_result()
+
+    with (
+        patch(
+            "app.processors.video_processor.cv2.VideoCapture",
+            return_value=_DummyCapture(),
+        ),
+        patch(
+            "app.processors.video_processor.misc_helpers.read_frame",
+            return_value=(True, frame.copy()),
+        ),
+        patch("app.processors.video_processor.misc_helpers.seek_frame"),
+        patch("app.processors.video_processor.misc_helpers.release_capture"),
+        patch.object(
+            processor,
+            "_build_issue_scan_state_segments",
+            return_value=[
+                (0, 0, first_control, {}),
+                (1, 1, second_control, {}),
+            ],
+        ),
+        patch.object(
+            processor,
+            "_prepare_issue_scan_match_context",
+            return_value={
+                "recognition_model": "arcface_128",
+                "similarity_type": "Opal",
+                "prepared_targets": [],
+            },
+        ),
+        patch.object(
+            processor,
+            "_run_sequential_detection",
+            side_effect=fake_run_sequential_detection,
+        ),
+    ):
+        result = processor.scan_issue_frames(
+            scan_ranges=[(0, 1)],
+            base_control={"FaceTrackingEnableToggle": False},
+            base_params={},
+            target_faces_snapshot={},
+            reset_frame_number=0,
+        )
+
+    assert result == {
+        "issue_frames_by_face": {},
+        "frames_scanned": 2,
+        "faces_with_issues": 0,
+        "cancelled": False,
+    }
+    assert reset_calls == ["reset", "reset", "reset"]
+    assert local_controls_seen == [
+        (first_control, first_control),
+        (second_control, second_control),
+    ]
+
+
+def test_scan_issue_frames_keeps_tracker_when_bytetrack_config_is_unchanged_between_tracking_segments():
+    processor = VideoProcessor.__new__(VideoProcessor)
+    processor.media_path = "dummy.mp4"
+    processor.media_rotation = 0
+    processor.fps = 30.0
+    processor.current_frame_number = 0
+    processor.last_detected_faces = []
+    processor._smoothed_kps = {}
+    processor._smoothed_dense_kps = {}
+    processor._smoothed_dense_kps_203 = {}
+    reset_calls = []
+    frame = np.zeros((4, 4, 3), dtype=np.uint8)
+
+    shared_control = {
+        "FaceTrackingEnableToggle": True,
+        "ByteTrackTrackThreshSlider": 40,
+        "ByteTrackMatchThreshSlider": 80,
+        "ByteTrackTrackBufferSlider": 30,
+    }
+
+    processor.main_window = SimpleNamespace(
+        control={"FaceTrackingEnableToggle": False},
+        parameters={},
+        target_faces={},
+        dropped_frames=set(),
+        markers={},
+        editFacesButton=SimpleNamespace(isChecked=lambda: False),
+        videoSeekSlider=SimpleNamespace(value=lambda: 0),
+        default_parameters=SimpleNamespace(data={"SimilarityThresholdSlider": 50}),
+        models_processor=SimpleNamespace(
+            device="cpu",
+            face_detectors=SimpleNamespace(
+                reset_tracker=lambda: reset_calls.append("reset")
+            ),
+        ),
+    )
+    processor._get_target_input_height = lambda: 256
+
+    with (
+        patch(
+            "app.processors.video_processor.cv2.VideoCapture",
+            return_value=_DummyCapture(),
+        ),
+        patch(
+            "app.processors.video_processor.misc_helpers.read_frame",
+            return_value=(True, frame.copy()),
+        ),
+        patch("app.processors.video_processor.misc_helpers.seek_frame"),
+        patch("app.processors.video_processor.misc_helpers.release_capture"),
+        patch.object(
+            processor,
+            "_build_issue_scan_state_segments",
+            return_value=[
+                (0, 0, shared_control, {}),
+                (1, 1, dict(shared_control), {}),
+            ],
+        ),
+        patch.object(
+            processor,
+            "_prepare_issue_scan_match_context",
+            return_value={
+                "recognition_model": "arcface_128",
+                "similarity_type": "Opal",
+                "prepared_targets": [],
+            },
+        ),
+        patch.object(
+            processor,
+            "_run_sequential_detection",
+            return_value=_empty_scan_detection_result(),
+        ),
+    ):
+        result = processor.scan_issue_frames(
+            scan_ranges=[(0, 1)],
+            base_control={"FaceTrackingEnableToggle": False},
+            base_params={},
+            target_faces_snapshot={},
+            reset_frame_number=0,
+        )
+
+    assert result == {
+        "issue_frames_by_face": {},
+        "frames_scanned": 2,
+        "faces_with_issues": 0,
+        "cancelled": False,
+    }
+    assert reset_calls == ["reset", "reset"]
+
+
 def test_scan_issue_frames_resets_tracker_when_tracking_re_enters_after_disabled_segment():
     processor = VideoProcessor.__new__(VideoProcessor)
     processor.media_path = "dummy.mp4"
