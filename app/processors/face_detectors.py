@@ -472,6 +472,7 @@ class FaceDetectors:
         from_points=False,
         rotation_angles=None,
         bypass_bytetrack=False,
+        control_override=None,
         **kwargs,
     ):
         """
@@ -491,7 +492,11 @@ class FaceDetectors:
         if use_multi_rotation:
             from_points = True
 
-        control = self.models_processor.main_window.control
+        control = (
+            control_override
+            if isinstance(control_override, dict)
+            else self.models_processor.main_window.control
+        )
         use_bytetrack = control.get("FaceTrackingEnableToggle", False)
         # bypass_bytetrack=True disables ByteTrack for this call only (e.g. per-eye VR
         # detection where the half-width coordinate space would corrupt tracker state)

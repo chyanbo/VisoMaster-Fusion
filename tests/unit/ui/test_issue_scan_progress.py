@@ -4,6 +4,7 @@ from app.ui.widgets.actions import common_actions
 from app.ui.widgets.actions import card_actions, job_manager_actions, list_view_actions
 from app.ui.widgets.actions import save_load_actions
 from app.ui.widgets import event_filters
+from app.processors.video_processor import VideoProcessor
 from app.ui.widgets.actions.video_control_actions import (
     _handle_issue_scan_cancelled,
     _handle_issue_scan_completed,
@@ -164,6 +165,8 @@ def _make_worker_main_window():
             _get_issue_scan_ranges=lambda: [(0, 2)],
             describe_issue_scan_scope=lambda _ranges: "Scanning 1 marked range",
             _get_target_input_height=lambda: 256,
+            _filter_scan_control=VideoProcessor._filter_scan_control,
+            _filter_scan_face_params=VideoProcessor._filter_scan_face_params,
             prepare_issue_scan_target_faces_snapshot=lambda *_args, **_kwargs: {},
             scan_issue_frames=None,
         ),
@@ -242,6 +245,8 @@ def _make_scan_main_window(keep_controls=False):
         current_frame=None,
         stop_processing=lambda: False,
         process_current_frame=lambda: None,
+        _get_issue_scan_ranges=lambda: [(0, 24)],
+        get_issue_scan_unavailable_reason=VideoProcessor.get_issue_scan_unavailable_reason,
     )
     return main_window
 
@@ -339,9 +344,12 @@ def test_issue_scan_worker_prepares_target_snapshot_during_construction():
 def test_issue_scan_worker_passes_control_defaults_snapshot():
     control_widget = SimpleNamespace(default_value="default-control")
     main_window = _make_worker_main_window()
-    main_window.control = {"ControlA": "live-control"}
+    main_window.control = {
+        "DetectorModelSelection": "SCRFD",
+        "IgnoredControl": "live-control",
+    }
     main_window.parameter_widgets = {
-        "ControlA": control_widget,
+        "DetectorModelSelection": control_widget,
         "IgnoredWidget": control_widget,
     }
     captured = {}
@@ -360,7 +368,9 @@ def test_issue_scan_worker_passes_control_defaults_snapshot():
     worker = IssueScanWorker(main_window)
     worker.run()
 
-    assert captured["control_defaults_snapshot"] == {"ControlA": "default-control"}
+    assert captured["control_defaults_snapshot"] == {
+        "DetectorModelSelection": "default-control"
+    }
 
 
 def test_issue_scan_worker_preserves_explicitly_empty_snapshots():
@@ -419,9 +429,12 @@ def test_issue_scan_worker_passes_plain_target_face_snapshot_without_widget_meth
         }
 
     main_window = _make_worker_main_window()
-    main_window.control = {"ControlA": "live-control"}
+    main_window.control = {
+        "DetectorModelSelection": "SCRFD",
+        "IgnoredControl": "live-control",
+    }
     main_window.target_faces = {"face_1": _TargetFaceWithoutEmbeddingAccess()}
-    main_window.parameter_widgets = {"ControlA": control_widget}
+    main_window.parameter_widgets = {"DetectorModelSelection": control_widget}
     main_window.video_processor.prepare_issue_scan_target_faces_snapshot = (
         fake_prepare_issue_scan_target_faces_snapshot
     )
@@ -450,6 +463,70 @@ def test_issue_scan_worker_passes_plain_target_face_snapshot_without_widget_meth
             },
         }
     }
+
+
+def test_issue_scan_worker_filters_snapshot_control_and_params():
+    main_window = _make_worker_main_window()
+    main_window.control = {
+        "DetectorScoreSlider": 42,
+        "FaceTrackingEnableToggle": True,
+        "IgnoredControl": "skip",
+    }
+    main_window.parameters = {
+        "face_1": {
+            "SimilarityThresholdSlider": 77,
+            "FaceExpressionEnableBothToggle": True,
+        },
+        "face_2": {
+            "SimilarityThresholdSlider": 61,
+        },
+    }
+    main_window.target_faces = {"face_1": object()}
+    captured = {}
+
+    def fake_scan_issue_frames(**kwargs):
+        captured["base_control"] = kwargs["base_control"]
+        captured["base_params"] = kwargs["base_params"]
+        return {
+            "issue_frames_by_face": {},
+            "frames_scanned": 1,
+            "faces_with_issues": 0,
+            "cancelled": False,
+        }
+
+    main_window.video_processor.scan_issue_frames = fake_scan_issue_frames
+
+    worker = IssueScanWorker(main_window)
+    worker.run()
+
+    assert captured["base_control"] == {
+        "DetectorScoreSlider": 42,
+        "FaceTrackingEnableToggle": True,
+    }
+    assert captured["base_params"] == {
+        "face_1": {"SimilarityThresholdSlider": 77},
+    }
+
+
+def test_issue_scan_worker_does_not_pass_fixed_target_height():
+    main_window = _make_worker_main_window()
+    captured = {}
+
+    def fake_scan_issue_frames(**kwargs):
+        captured.update(kwargs)
+        return {
+            "issue_frames_by_face": {},
+            "frames_scanned": 1,
+            "faces_with_issues": 0,
+            "cancelled": False,
+        }
+
+    main_window.video_processor.scan_issue_frames = fake_scan_issue_frames
+
+    worker = IssueScanWorker(main_window)
+    worker.run()
+
+    assert "target_height" not in captured
 
 
 def test_handle_issue_scan_progress_moves_slider_and_updates_abort_button(monkeypatch):
@@ -742,6 +819,65 @@ def test_run_issue_scan_does_not_start_twice(monkeypatch):
 
     assert worker_calls == []
     assert main_window.scan_issue_worker is existing_worker
+
+
+def test_run_issue_scan_blocks_vr180_mode(monkeypatch):
+    main_window = _make_scan_main_window()
+    main_window.control["VR180ModeEnableToggle"] = True
+    messagebox_calls = []
+    worker_calls = []
+
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.common_widget_actions.create_and_show_messagebox",
+        lambda *_args, **_kwargs: messagebox_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.ui_workers.IssueScanWorker",
+        lambda _main_window: worker_calls.append("created"),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.Path.is_file",
+        lambda self: True,
+    )
+
+    run_issue_scan(main_window)
+
+    assert worker_calls == []
+    assert messagebox_calls[0][0][1] == "Scan Not Available"
+    assert (
+        messagebox_calls[0][0][2]
+        == "Issue scans are not supported while VR180 mode is enabled."
+    )
+
+
+def test_run_issue_scan_blocks_marker_enabled_vr180_mode(monkeypatch):
+    main_window = _make_scan_main_window()
+    main_window.markers = {12: {"control": {"VR180ModeEnableToggle": True}}}
+    main_window.video_processor._get_issue_scan_ranges = lambda: [(0, 24)]
+    messagebox_calls = []
+    worker_calls = []
+
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.common_widget_actions.create_and_show_messagebox",
+        lambda *_args, **_kwargs: messagebox_calls.append((_args, _kwargs)),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.ui_workers.IssueScanWorker",
+        lambda _main_window: worker_calls.append("created"),
+    )
+    monkeypatch.setattr(
+        "app.ui.widgets.actions.video_control_actions.Path.is_file",
+        lambda self: True,
+    )
+
+    run_issue_scan(main_window)
+
+    assert worker_calls == []
+    assert messagebox_calls[0][0][1] == "Scan Not Available"
+    assert (
+        messagebox_calls[0][0][2]
+        == "Issue scans are not supported while VR180 mode is enabled."
+    )
 
 
 def test_run_issue_scan_reports_construction_failures_without_clearing_results(
