@@ -461,7 +461,10 @@ def _make_workspace_main_window(
     mw._fullscreen_restore_was_maximized = False
     mw._fullscreen_restore_geometry = fullscreen_restore_geometry
     mw._saved_window_state = _FakeByteArray(saved_window_state)
-    mw.control = {"TheatreModeUsesFullscreenToggle": False}
+    mw.control = {
+        "TheatreModeUsesFullscreenToggle": False,
+        "ConfirmBeforeStoppingRecordingToggle": True,
+    }
     mw.target_videos = {}
     mw.input_faces = {}
     mw.target_faces = {}
@@ -722,6 +725,22 @@ def test_save_workspace_persists_theatre_fullscreen_setting_in_control(tmp_path)
 
     saved = _read_saved_workspace(save_path)
     assert saved["control"]["TheatreModeUsesFullscreenToggle"] is True
+
+
+def test_save_workspace_persists_stop_recording_confirmation_setting(tmp_path):
+    save_path = tmp_path / "workspace.json"
+    main_window = _make_workspace_main_window(
+        tmp_path,
+        is_theatre_mode=False,
+        is_full_screen=False,
+        is_maximized=False,
+    )
+    main_window.control["ConfirmBeforeStoppingRecordingToggle"] = False
+
+    save_current_workspace(main_window, str(save_path))
+
+    saved = _read_saved_workspace(save_path)
+    assert saved["control"]["ConfirmBeforeStoppingRecordingToggle"] is False
 
 
 def test_apply_workspace_window_state_fullscreen_seeds_restore_geometry(monkeypatch):

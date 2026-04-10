@@ -1963,16 +1963,21 @@ def record_video(main_window: "MainWindow", checked: bool):
         # callers.
         #
         # Do NOT prompt when this stop was initiated programmatically by Job Manager.
+        should_confirm_stop = bool(
+            main_window.control.get("ConfirmBeforeStoppingRecordingToggle", True)
+        )
         if (
-            video_processor.is_processing_segments or video_processor.recording
-        ) and not job_mgr_flag:
+            (video_processor.is_processing_segments or video_processor.recording)
+            and not job_mgr_flag
+            and should_confirm_stop
+        ):
             try:
                 box = QtWidgets.QMessageBox(main_window)
                 box.setIcon(QtWidgets.QMessageBox.Warning)
                 box.setWindowTitle("Confirm stop")
-                box.setText("Stop multi-segment recording?")
+                box.setText("Stop recording?")
                 box.setInformativeText(
-                    "Segment recording will stop immediately. Output may be incomplete."
+                    "Recording will stop immediately. Output may be incomplete."
                 )
                 box.setStandardButtons(
                     QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No

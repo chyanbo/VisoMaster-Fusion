@@ -194,6 +194,12 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
         },
     },
     "Video Recording Settings": {
+        "ConfirmBeforeStoppingRecordingToggle": {
+            "level": 1,
+            "label": "Confirm Before Stopping Recording",
+            "default": True,
+            "help": "Show a confirmation prompt before manually stopping a recording.",
+        },
         "FrameEnhancerDownToggle": {
             "level": 1,
             "label": "Frame resize to 1920*1080",
