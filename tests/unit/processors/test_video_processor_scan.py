@@ -800,6 +800,189 @@ def test_run_sequential_detection_passes_detector_control_override():
     assert captured["control_override"] == override
 
 
+def test_run_sequential_detection_handles_dense_203_shape_mismatch_with_smoothing_enabled():
+    processor = VideoProcessor.__new__(VideoProcessor)
+    processor.last_detected_faces = []
+    processor._smoothed_kps = {}
+    processor._smoothed_dense_kps = {}
+    processor._smoothed_dense_kps_203 = {}
+    processor.current_frame_number = 12
+
+    bboxes = np.array(
+        [[0.0, 0.0, 10.0, 10.0], [20.0, 20.0, 30.0, 30.0]], dtype=np.float32
+    )
+    kpss_5 = np.array(
+        [
+            [[1, 1], [2, 1], [1.5, 2], [1, 3], [2, 3]],
+            [[21, 21], [22, 21], [21.5, 22], [21, 23], [22, 23]],
+        ],
+        dtype=np.float32,
+    )
+    dense_203 = np.zeros((1, 203, 2), dtype=np.float32)
+    dense_203[0, :, 0] = 1.0
+    dense_203[0, :, 1] = 2.0
+
+    def fake_run_detect(*_args, **_kwargs):
+        return bboxes.copy(), kpss_5.copy(), dense_203.copy()
+
+    processor.main_window = SimpleNamespace(
+        editFacesButton=SimpleNamespace(isChecked=lambda: False),
+        models_processor=SimpleNamespace(device="cpu", run_detect=fake_run_detect),
+    )
+
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    with patch("builtins.print") as mock_print:
+        bboxes_out, kpss_5_out, _kpss_out, kpss_203_out = (
+            processor._run_sequential_detection(
+                frame,
+                {
+                    "DetectorModelSelection": "RetinaFace",
+                    "MaxFacesToDetectSlider": 2,
+                    "DetectorScoreSlider": 50,
+                    "LandmarkDetectToggle": True,
+                    "LandmarkDetectModelSelection": "203",
+                    "LandmarkDetectScoreSlider": 50,
+                    "DetectFromPointsToggle": False,
+                    "AutoRotationToggle": False,
+                    "LandmarkMeanEyesToggle": False,
+                    "KPSSmoothingEnableToggle": True,
+                    "KPSEmaAlphaSlider": 35,
+                },
+                {"face_1": {"FaceExpressionEnableBothToggle": True}},
+            )
+        )
+
+    assert bboxes_out.shape == (2, 4)
+    assert kpss_5_out.shape == (2, 5, 2)
+    assert isinstance(kpss_203_out, np.ndarray)
+    assert kpss_203_out.shape == (1, 203, 2)
+    assert mock_print.call_count == 2
+    mock_print.assert_any_call(
+        "[WARN] Dense KPS count mismatch on frame 12: "
+        "kpss_5=2, dense_kps=1. Skipping dense smoothing for missing faces."
+    )
+    mock_print.assert_any_call(
+        "[WARN] Dense KPS_203 count mismatch on frame 12: "
+        "kpss_5=2, dense_kps_203=1. Skipping dense 203 smoothing for missing faces."
+    )
+
+
+def test_run_sequential_detection_handles_dense_shape_mismatch_with_single_warning():
+    processor = VideoProcessor.__new__(VideoProcessor)
+    processor.last_detected_faces = []
+    processor._smoothed_kps = {}
+    processor._smoothed_dense_kps = {}
+    processor._smoothed_dense_kps_203 = {}
+    processor.current_frame_number = 34
+
+    bboxes = np.array(
+        [[0.0, 0.0, 10.0, 10.0], [20.0, 20.0, 30.0, 30.0]], dtype=np.float32
+    )
+    kpss_5 = np.array(
+        [
+            [[1, 1], [2, 1], [1.5, 2], [1, 3], [2, 3]],
+            [[21, 21], [22, 21], [21.5, 22], [21, 23], [22, 23]],
+        ],
+        dtype=np.float32,
+    )
+    dense_kps = np.zeros((1, 68, 2), dtype=np.float32)
+    dense_kps[0, :, 0] = 3.0
+    dense_kps[0, :, 1] = 4.0
+
+    def fake_run_detect(*_args, **_kwargs):
+        return bboxes.copy(), kpss_5.copy(), dense_kps.copy()
+
+    processor.main_window = SimpleNamespace(
+        editFacesButton=SimpleNamespace(isChecked=lambda: False),
+        models_processor=SimpleNamespace(device="cpu", run_detect=fake_run_detect),
+    )
+
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    with patch("builtins.print") as mock_print:
+        bboxes_out, kpss_5_out, kpss_out, kpss_203_out = (
+            processor._run_sequential_detection(
+                frame,
+                {
+                    "DetectorModelSelection": "RetinaFace",
+                    "MaxFacesToDetectSlider": 2,
+                    "DetectorScoreSlider": 50,
+                    "LandmarkDetectToggle": True,
+                    "LandmarkDetectModelSelection": "68",
+                    "LandmarkDetectScoreSlider": 50,
+                    "DetectFromPointsToggle": False,
+                    "AutoRotationToggle": False,
+                    "LandmarkMeanEyesToggle": False,
+                    "KPSSmoothingEnableToggle": True,
+                    "KPSEmaAlphaSlider": 35,
+                },
+                {},
+            )
+        )
+
+    assert bboxes_out.shape == (2, 4)
+    assert kpss_5_out.shape == (2, 5, 2)
+    assert isinstance(kpss_out, np.ndarray)
+    assert kpss_out.shape == (1, 68, 2)
+    assert kpss_203_out is None
+    mock_print.assert_called_once_with(
+        "[WARN] Dense KPS count mismatch on frame 34: "
+        "kpss_5=2, dense_kps=1. Skipping dense smoothing for missing faces."
+    )
+
+
+def test_run_sequential_detection_does_not_warn_when_dense_counts_match():
+    processor = VideoProcessor.__new__(VideoProcessor)
+    processor.last_detected_faces = []
+    processor._smoothed_kps = {}
+    processor._smoothed_dense_kps = {}
+    processor._smoothed_dense_kps_203 = {}
+    processor.current_frame_number = 56
+
+    bboxes = np.array([[0.0, 0.0, 10.0, 10.0]], dtype=np.float32)
+    kpss_5 = np.array([[[1, 1], [2, 1], [1.5, 2], [1, 3], [2, 3]]], dtype=np.float32)
+    dense_kps = np.zeros((1, 68, 2), dtype=np.float32)
+
+    def fake_run_detect(*_args, **_kwargs):
+        return bboxes.copy(), kpss_5.copy(), dense_kps.copy()
+
+    processor.main_window = SimpleNamespace(
+        editFacesButton=SimpleNamespace(isChecked=lambda: False),
+        models_processor=SimpleNamespace(device="cpu", run_detect=fake_run_detect),
+    )
+
+    frame = np.zeros((64, 64, 3), dtype=np.uint8)
+
+    with patch("builtins.print") as mock_print:
+        bboxes_out, kpss_5_out, kpss_out, kpss_203_out = (
+            processor._run_sequential_detection(
+                frame,
+                {
+                    "DetectorModelSelection": "RetinaFace",
+                    "MaxFacesToDetectSlider": 1,
+                    "DetectorScoreSlider": 50,
+                    "LandmarkDetectToggle": True,
+                    "LandmarkDetectModelSelection": "68",
+                    "LandmarkDetectScoreSlider": 50,
+                    "DetectFromPointsToggle": False,
+                    "AutoRotationToggle": False,
+                    "LandmarkMeanEyesToggle": False,
+                    "KPSSmoothingEnableToggle": True,
+                    "KPSEmaAlphaSlider": 35,
+                },
+                {},
+            )
+        )
+
+    assert bboxes_out.shape == (1, 4)
+    assert kpss_5_out.shape == (1, 5, 2)
+    assert isinstance(kpss_out, np.ndarray)
+    assert kpss_out.shape == (1, 68, 2)
+    assert kpss_203_out is None
+    mock_print.assert_not_called()
+
+
 def test_scan_issue_frames_reports_progress_per_frame_and_skips_dropped_runs():
     processor = VideoProcessor.__new__(VideoProcessor)
     processor.media_path = "dummy.mp4"
