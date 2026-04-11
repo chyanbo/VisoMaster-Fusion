@@ -488,6 +488,7 @@ class FrameWorker(threading.Thread):
         control: dict,
         pass_suffix: str,
         kv_map: Dict | None,
+        color_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Helper to run the diffusion-based denoiser (Ref-LDM).
 
@@ -498,25 +499,22 @@ class FrameWorker(threading.Thread):
         """
         use_exclusive_path = control.get("UseReferenceExclusivePathToggle", False)
         denoiser_seed_from_slider_val = int(control.get("DenoiserBaseSeedSlider", 1))
+        denoiser_mode_val = control.get(
+            f"DenoiserModeSelection{pass_suffix}", "Single Step (Fast)"
+        )
+        ddim_steps_val = int(control.get(f"DenoiserDDIMStepsSlider{pass_suffix}", 20))
+        cfg_scale_val = float(
+            control.get(f"DenoiserCFGScaleDecimalSlider{pass_suffix}", 1.0)
+        )
+        single_step_t_val = int(
+            control.get(f"DenoiserSingleStepTimestepSlider{pass_suffix}", 1)
+        )
+        sharpen_val = float(
+            control.get(f"DenoiserLatentSharpeningDecimalSlider{pass_suffix}", 0.0)
+        )
 
-        denoiser_mode_key = f"DenoiserModeSelection{pass_suffix}"
-        denoiser_mode_val = control.get(denoiser_mode_key, "Single Step (Fast)")
-
-        ddim_steps_key = f"DenoiserDDIMStepsSlider{pass_suffix}"
-        ddim_steps_val = int(control.get(ddim_steps_key, 20))
-
-        cfg_scale_key = f"DenoiserCFGScaleDecimalSlider{pass_suffix}"
-        cfg_scale_val = float(control.get(cfg_scale_key, 1.0))
-
-        single_step_t_key = f"DenoiserSingleStepTimestepSlider{pass_suffix}"
-        single_step_t_val = int(control.get(single_step_t_key, 1))
-
-        sharpen_key = f"DenoiserLatentSharpeningDecimalSlider{pass_suffix}"
-        sharpen_val = float(control.get(sharpen_key, 0.0))
-
-        if not kv_map:
-            if use_exclusive_path:
-                return image_tensor_cxhxw_uint8
+        if not kv_map and use_exclusive_path:
+            return image_tensor_cxhxw_uint8
 
         denoised_image = self.models_processor.apply_denoiser_unet(
             image_tensor_cxhxw_uint8,
@@ -528,7 +526,9 @@ class FrameWorker(threading.Thread):
             denoiser_ddim_steps=ddim_steps_val,
             denoiser_cfg_scale=cfg_scale_val,
             latent_sharpening_strength=sharpen_val,
+            color_mask=color_mask,
         )
+
         return torch.clamp(denoised_image, 0, 255)
 
     def _find_best_target_match(
@@ -4175,8 +4175,7 @@ class FrameWorker(threading.Thread):
             tform,
         )
 
-        # FW-PERF-09: skip get_border_mask entirely when the toggle is off;
-        # when disabled it would just return all-ones, so the result equals side_mask.
+        # FW-PERF-09: skip get_border_mask entirely when the toggle is off
         if parameters.get("BordermaskEnableToggle", False):
             border_mask, border_mask_calc = self.get_border_mask(parameters)
             if (
@@ -4192,26 +4191,38 @@ class FrameWorker(threading.Thread):
             border_mask = side_mask
             border_mask_calc = side_mask
 
+        # BLEND MASKS (Soft edges, Alpha compositing)
         swap_mask = torch.ones(
-            (current_swap_h, current_swap_w),
+            (1, current_swap_h, current_swap_w),
             dtype=torch.float32,
             device=self.models_processor.device,
         )
-        swap_mask = torch.unsqueeze(swap_mask, 0)
         swap_mask_noFP = border_mask.clone()
 
-        # FW-MEM-03: allocate one base ones-tensor and share it for masks that will
-        # be unconditionally overwritten before first read; only deep-clone where the
-        # initial all-ones value is truly consumed before the mask is reassigned.
-        BgExclude = torch.ones(
-            (1, 512, 512), dtype=torch.float32, device=self.models_processor.device
+        # CORE STATS MASKS (Hard edges, inner face isolation only)
+        core_stats_mask = torch.ones(
+            (1, current_swap_h, current_swap_w),
+            dtype=torch.float32,
+            device=self.models_processor.device,
         )
-        diff_mask = BgExclude
-        texture_mask_view = BgExclude
-        texture_exclude_512 = BgExclude
-        calc_mask = BgExclude
-        calc_mask_dill = BgExclude
-        mask_forcalc_512 = BgExclude
+
+        # Removed shared tensor 'BgExclude' which was causing state bleeding
+        # (Race Conditions) between unconnected features. Explicit allocation is safer.
+        base_shape = (1, 512, 512)
+        diff_mask = torch.ones(
+            base_shape, dtype=torch.float32, device=self.models_processor.device
+        )
+        texture_mask_view = torch.ones(
+            base_shape, dtype=torch.float32, device=self.models_processor.device
+        )
+        texture_exclude_512 = torch.ones(
+            base_shape, dtype=torch.float32, device=self.models_processor.device
+        )
+
+        # Legacy pointers mapped to our clean core mask to prevent crashing the rest of the pipeline
+        calc_mask = core_stats_mask.clone()
+        calc_mask_dill = core_stats_mask.clone()
+        mask_forcalc_512 = core_stats_mask.clone()
 
         M_ref = cast(np.ndarray, tform.params)[0:2]
         ones_column_ref = np.ones((kps_5.shape[0], 1), dtype=np.float32)
@@ -4267,7 +4278,9 @@ class FrameWorker(threading.Thread):
 
         # First Denoiser pass - Before Restorers
         if control.get("DenoiserUNetEnableBeforeRestorersToggle", False):
-            swap = self._apply_denoiser_pass(swap, control, "Before", kv_map)
+            swap = self._apply_denoiser_pass(
+                swap, control, "Before", kv_map, color_mask=mask_forcalc_512
+            )
 
         # --- MOUTH ENHANCEMENT & ALIGNMENT (PRE-RESTORER) ---
         paste_after_restorer = parameters.get("MouthParserStretchAfterToggle", False)
@@ -4471,8 +4484,7 @@ class FrameWorker(threading.Thread):
             mouth_256 = None
             inner_mouth_protection_256 = None
             if (
-                parameters.get("DFLXSegEnableToggle", False)
-                and parameters.get("XSegMouthEnableToggle", False)
+                parameters.get("XSegMouthEnableToggle", False)
                 and parameters.get("DFLXSegSizeSlider", 0)
                 != parameters.get("DFLXSeg2SizeSlider", 0)
                 and mouth_512 is not None
@@ -4497,6 +4509,7 @@ class FrameWorker(threading.Thread):
                 )
             )
 
+            # 1. Update Blend Masks (swap_mask)
             if img_mask_256.shape[-1] != swap_mask.shape[-1]:
                 img_mask_res = v2.Resize(
                     (swap_mask.shape[-2], swap_mask.shape[-1]), antialias=True
@@ -4508,27 +4521,39 @@ class FrameWorker(threading.Thread):
                 img_mask_res = img_mask_256
                 outpred_noFP_res = outpred_noFP_256
 
-            mask_forcalc_512 = t512_mask(mask_forcalc_256)
-            mask_forcalc_dill_512 = t512_mask(mask_forcalc_dill_256)
-
-            mask_forcalc_512 = 1 - mask_forcalc_512
-            mask_forcalc_dill_512 = 1 - mask_forcalc_dill_512
-            calc_mask = mask_forcalc_512
-            calc_mask_dill = mask_forcalc_dill_512
-
             if swap_mask_noFP.shape[-1] != outpred_noFP_res.shape[-1]:
                 swap_mask_noFP = v2.Resize(
                     (outpred_noFP_res.shape[-2], outpred_noFP_res.shape[-1]),
                     antialias=True,
                 )(swap_mask_noFP)
 
+            # apply_dfl_xseg returns inverted masks (0=Face, 1=BG).
+            # We multiply by (1 - mask) to carve out the background.
             swap_mask_noFP.mul_(1.0 - outpred_noFP_res)
             swap_mask.mul_(1.0 - img_mask_res)
-        else:
-            calc_mask = t512_mask(swap_mask.clone()).clamp(0, 1)
-            calc_mask_dill = calc_mask.clone()
+
+            # 2. Update Core Stats Masks (Strictly for statistics/color/texture)
+            mask_forcalc_512 = t512_mask(mask_forcalc_256)
+            mask_forcalc_dill_512 = t512_mask(mask_forcalc_dill_256)
+
+            # Re-invert XSeg core masks so 1 = Face, 0 = BG
+            xseg_core = 1.0 - mask_forcalc_512
+            xseg_core_dill = 1.0 - mask_forcalc_dill_512
+
+            # INTERSECT XSeg with our global core_stats_mask.
+            # This ensures we never expand beyond the valid face area.
+            calc_mask = core_stats_mask * xseg_core
+            calc_mask_dill = core_stats_mask * xseg_core_dill
             mask_forcalc_512 = calc_mask.clone()
 
+        else:
+            # If XSeg is off, DO NOT clone swap_mask (which has blurred edges).
+            # Use the pure core_stats_mask created at initialization.
+            calc_mask = core_stats_mask.clone()
+            calc_mask_dill = core_stats_mask.clone()
+            mask_forcalc_512 = core_stats_mask.clone()
+
+        # Initialize AutoColor mask based on the pure calculation mask
         mask_autocolor = calc_mask.clone()
         mask_autocolor = mask_autocolor > 0.05
 
@@ -4648,7 +4673,9 @@ class FrameWorker(threading.Thread):
 
         # Second Denoiser pass - After First Restorer
         if control.get("DenoiserAfterFirstRestorerToggle", False):
-            swap = self._apply_denoiser_pass(swap, control, "AfterFirst", kv_map)
+            swap = self._apply_denoiser_pass(
+                swap, control, "AfterFirst", kv_map, color_mask=mask_forcalc_512
+            )
 
         # --- RESTORATION 2 ---
         # FW-QUAL-01/02: duplicated ~60-line block extracted to _apply_restorer_with_auto
@@ -5086,12 +5113,16 @@ class FrameWorker(threading.Thread):
 
         # --- COLOR CORRECTIONS ---
         if parameters["ColorEnableToggle"]:
-            swap = torch.unsqueeze(swap, 0).contiguous()
-            swap = v2.functional.adjust_gamma(
-                swap, parameters["ColorGammaDecimalSlider"], 1.0
+            # 1. Save a backup of the original swap to preserve the background/padding
+            swap_pre_color = swap.clone()
+
+            # 2. Apply color transformations
+            swap_adj = torch.unsqueeze(swap, 0).contiguous()
+            swap_adj = v2.functional.adjust_gamma(
+                swap_adj, parameters["ColorGammaDecimalSlider"], 1.0
             )
-            swap = torch.squeeze(swap)
-            swap = swap.permute(1, 2, 0).type(torch.float32)
+            swap_adj = torch.squeeze(swap_adj)
+            swap_adj = swap_adj.permute(1, 2, 0).type(torch.float32)
 
             del_color = torch.tensor(
                 [
@@ -5101,25 +5132,41 @@ class FrameWorker(threading.Thread):
                 ],
                 device=self.models_processor.device,
             )
-            swap += del_color
-            swap = torch.clamp(swap, min=0.0, max=255.0)
-            swap = swap.permute(2, 0, 1) / 255.0
+            swap_adj += del_color
+            swap_adj = torch.clamp(swap_adj, min=0.0, max=255.0)
+            swap_adj = swap_adj.permute(2, 0, 1) / 255.0
 
-            swap = v2.functional.adjust_brightness(
-                swap, parameters["ColorBrightnessDecimalSlider"]
+            swap_adj = v2.functional.adjust_brightness(
+                swap_adj, parameters["ColorBrightnessDecimalSlider"]
             )
-            swap = v2.functional.adjust_contrast(
-                swap, parameters["ColorContrastDecimalSlider"]
+            swap_adj = v2.functional.adjust_contrast(
+                swap_adj, parameters["ColorContrastDecimalSlider"]
             )
-            swap = v2.functional.adjust_saturation(
-                swap, parameters["ColorSaturationDecimalSlider"]
+            swap_adj = v2.functional.adjust_saturation(
+                swap_adj, parameters["ColorSaturationDecimalSlider"]
             )
-            swap = v2.functional.adjust_sharpness(
-                swap, parameters["ColorSharpnessDecimalSlider"]
+            swap_adj = v2.functional.adjust_sharpness(
+                swap_adj, parameters["ColorSharpnessDecimalSlider"]
             )
-            swap = v2.functional.adjust_hue(swap, parameters["ColorHueDecimalSlider"])
+            swap_adj = v2.functional.adjust_hue(
+                swap_adj, parameters["ColorHueDecimalSlider"]
+            )
 
-            swap = swap * 255.0
+            swap_adj = swap_adj * 255.0
+
+            # 3. Blend back using a Soft Padding Mask.
+            color_bounds_mask = (swap_pre_color.sum(dim=0, keepdim=True) > 0.05).float()
+
+            # Apply a strong blur to the boundary mask for a seamless transition
+            color_bounds_mask = v2.functional.gaussian_blur(
+                color_bounds_mask, kernel_size=15, sigma=5.0
+            )
+
+            swap = (
+                torch.lerp(swap_pre_color.float(), swap_adj.float(), color_bounds_mask)
+                .to(swap.dtype)
+                .contiguous()
+            )
 
         # --- RESTORATION 2 (END) ---
         # FW-QUAL-01/02: duplicated ~60-line block extracted to _apply_restorer_with_auto
@@ -5194,10 +5241,28 @@ class FrameWorker(threading.Thread):
 
                 swap_mask.mul_(FaceParser_mask)
 
-        # Recalculate AutoColor Mask
-        calc_mask = t512_mask(swap_mask.clone()).clamp(0, 1)
-        mask_autocolor = calc_mask.clone()
-        mask_autocolor = mask_autocolor > 0.05
+        # ====================================================================
+        # RECALCULATE FINAL CORE STATS MASK (For Ending Color Transfer)
+        # ====================================================================
+        mask_autocolor_end = mask_forcalc_512.clone()
+
+        # If FaceParser End pass was active, intersect it strictly to exclude eyes/mouth from stats
+        if (
+            parameters.get("FaceParserEnableToggle")
+            and parameters.get("FaceParserEndToggle")
+            and FaceParser_mask is not None
+        ):
+            # Create a hard binary mask from the soft parser mask to protect stats
+            fp_core = (FaceParser_mask > 0.5).float()
+            if fp_core.shape[-1] != mask_autocolor_end.shape[-1]:
+                fp_core = v2.Resize(
+                    (mask_autocolor_end.shape[-2], mask_autocolor_end.shape[-1]),
+                    antialias=True,
+                )(fp_core)
+            mask_autocolor_end = mask_autocolor_end * fp_core
+
+        # Ensure it is strictly binary
+        mask_autocolor_end = (mask_autocolor_end > 0.5).float()
 
         # AutoColor End (EndingColorTransfer)
         if parameters.get("EndingColorTransferEnableToggle", False):
@@ -5209,7 +5274,7 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.histogram_matching_withmask(
                     original_face_512,
                     swap,
-                    mask_autocolor,
+                    mask_autocolor_end,
                     parameters["EndingColorBlendAmountSlider"],
                 )
             elif parameters["EndingColorTransferTypeSelection"] == "DFL_Test":
@@ -5220,22 +5285,23 @@ class FrameWorker(threading.Thread):
                 swap = faceutil.histogram_matching_DFL_Orig(
                     original_face_512,
                     swap,
-                    mask_autocolor,
+                    mask_autocolor_end,
                     parameters["EndingColorBlendAmountSlider"],
                 )
             elif parameters["EndingColorTransferTypeSelection"] == "AdaIN_Statistical":
                 swap = faceutil.apply_adain_color_transfer(
                     swap,
                     original_face_512,
-                    mask_autocolor,
+                    mask_autocolor_end,
                     parameters["EndingColorBlendAmountSlider"],
                 )
 
-        # Third denoiser pass - After all restorations, colour corrections and
-        # ending colour transfer.  Placed last so no subsequent colour operation
-        # can undo the denoiser's normalisation and cause a visible colour shift.
+        # Third denoiser pass - After all restorations, colour corrections and ending colour transfer.
         if control.get("DenoiserAfterRestorersToggle", False):
-            swap = self._apply_denoiser_pass(swap, control, "After", kv_map)
+            # We use mask_autocolor_end here because it is the most strict mask available at the end of the pipeline
+            swap = self._apply_denoiser_pass(
+                swap, control, "After", kv_map, color_mask=mask_autocolor_end
+            )
 
         # Final blending
         if (

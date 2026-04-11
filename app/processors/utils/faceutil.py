@@ -2573,10 +2573,13 @@ def histogram_matching_withmask(source_image, target_image, mask, diffslider):
     # Determine the device (CPU or GPU)
     device = source_image.device
 
-    # mask_t = mask.float().to(device)
-    # valid_mask = (mask_t > 0.00)  # Shape: (1, H, W) or (H, W)
-    valid_mask = mask
-    # target_image = torch.where(valid_mask, target_image, source_image)
+    # Convert the mask explicitly to boolean for PyTorch indexing.
+    # Float tensors cannot be used to slice/index other tensors.
+    valid_mask = mask.bool()
+
+    # Remove channel dimension from mask if present so shape becomes (H, W)
+    if valid_mask.dim() == 3 and valid_mask.size(0) == 1:
+        valid_mask = valid_mask.squeeze(0)
 
     # Convert images to float tensors in range [0, 1], shape (C, H, W)
     source_image_t = source_image.float().to(device) / 255.0  # (C, H, W)
@@ -2584,12 +2587,6 @@ def histogram_matching_withmask(source_image, target_image, mask, diffslider):
 
     # Apply histogram matching only to the masked areas
     matched_target_image_t = target_image_t.clone()
-
-    # Define the condition for the mask
-
-    # Remove channel dimension from mask if present
-    if valid_mask.dim() == 3 and valid_mask.size(0) == 1:
-        valid_mask = valid_mask.squeeze(0)
 
     # Create bin edges for histograms
     bin_edges = torch.linspace(
