@@ -2201,14 +2201,14 @@ def update_delta_new_eyeball_direction(
         delta_new[0, 11, 0] += eyeball_direction_x * 0.001
         delta_new[0, 15, 0] += eyeball_direction_x * 0.0007
 
-    delta_new[0, 11, 1] += eyeball_direction_y * -0.001
-    delta_new[0, 15, 1] += eyeball_direction_y * -0.001
+    delta_new[0, 11, 1] += eyeball_direction_y * -0.0005
+    delta_new[0, 15, 1] += eyeball_direction_y * -0.0006
     blink = -eyeball_direction_y / 2.0
 
-    delta_new[0, 11, 1] += blink * -0.001
-    delta_new[0, 13, 1] += blink * 0.0003
-    delta_new[0, 15, 1] += blink * -0.001
-    delta_new[0, 16, 1] += blink * 0.0003
+    delta_new[0, 11, 1] += blink * -0.0005
+    delta_new[0, 13, 1] += blink * 0.0004
+    delta_new[0, 15, 1] += blink * -0.0006
+    delta_new[0, 16, 1] += blink * 0.00025
 
     return delta_new
 
