@@ -1635,11 +1635,12 @@ class FrameWorker(threading.Thread):
             phi = _fd["phi"]
             original_eye_side = _fd["original_eye_side"]
             dynamic_fov_for_crop = _fd["fov_used_for_crop"]
+            similarity_type = str("Auto")
 
             face_emb_crop, _ = self.models_processor.run_recognize_direct(
                 face_crop_tensor,
                 kps_on_crop,
-                control["SimilarityTypeSelection"],
+                similarity_type,
                 control["RecognitionModelSelection"],
             )
 
@@ -2061,10 +2062,11 @@ class FrameWorker(threading.Thread):
                     kpss_5[i], _bbox_i, self._MIN_FACE_PIXELS
                 ):
                     continue  # too small to produce meaningful swap
+                similarity_type = str("Auto")
                 face_emb, _ = self.models_processor.run_recognize_direct(
                     img,
                     kpss_5[i],
-                    control["SimilarityTypeSelection"],
+                    similarity_type,
                     control["RecognitionModelSelection"],
                 )
 

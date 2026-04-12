@@ -163,12 +163,13 @@ def find_target_faces(main_window: "MainWindow"):
             )
 
             faces_list: list = []
+            similarity_type = str("Auto")
             for face_kps in kpss_5:
                 face_emb, cropped_img = (
                     main_window.models_processor.run_recognize_direct(
                         img,
                         face_kps,
-                        control.get("SimilarityTypeSelection", "Auto"),
+                        similarity_type,
                         control.get("RecognitionModelSelection", "arcface_128"),
                     )
                 )

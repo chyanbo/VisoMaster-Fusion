@@ -62,7 +62,6 @@ SCAN_CONTROL_ALLOWLIST = frozenset(
         "KPSSmoothingEnableToggle",
         "KPSEmaAlphaSlider",
         "RecognitionModelSelection",
-        "SimilarityTypeSelection",
     }
 )
 SCAN_FACE_PARAM_ALLOWLIST = frozenset({"SimilarityThresholdSlider"})
@@ -3276,7 +3275,7 @@ class VideoProcessor(QObject):
         recognition_model = str(
             local_control.get("RecognitionModelSelection", "arcface_128")
         )
-        similarity_type = str(local_control.get("SimilarityTypeSelection", "Auto"))
+        similarity_type = str("Auto")
         default_params = dict(self.main_window.default_parameters.data)
         prepared_targets: list[tuple[str, float, numpy.ndarray]] = []
 
@@ -3392,7 +3391,7 @@ class VideoProcessor(QObject):
         required_embedding_modes = {
             (
                 str(local_control.get("RecognitionModelSelection", "arcface_128")),
-                str(local_control.get("SimilarityTypeSelection", "Auto")),
+                str("Auto"),
             )
             for _start_frame, _end_frame, local_control, _local_params in scan_segments
         }

@@ -693,9 +693,7 @@ class TargetFaceCardButton(CardButton):
                 )
 
                 # Get the similarity type from global controls
-                similarity_type = self.main_window.control.get(
-                    "SimilarityTypeSelection", "Auto"
-                )
+                similarity_type = str("Auto")
 
                 # Call run_recognize_direct (which expects CHW tensor)
                 new_embedding, _ = (
