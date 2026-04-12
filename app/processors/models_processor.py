@@ -1468,7 +1468,7 @@ class ModelsProcessor(QtCore.QObject):
             raise ValueError(f"Face swapper model {face_swapper_model} not found.")
 
     def run_recognize_direct(
-        self, img, kps, similarity_type="Opal", arcface_model="Inswapper128ArcFace"
+        self, img, kps, similarity_type="Auto", arcface_model="Inswapper128ArcFace"
     ):
         return self.face_swappers.run_recognize_direct(
             img, kps, similarity_type, arcface_model

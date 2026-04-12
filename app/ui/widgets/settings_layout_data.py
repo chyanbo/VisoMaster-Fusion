@@ -371,13 +371,6 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": "Inswapper128ArcFace",
             "help": "Choose the ArcFace model to be used for comparing the similarity of faces.",
         },
-        "SimilarityTypeSelection": {
-            "level": 1,
-            "label": "Swapping Similarity Type",
-            "options": ["Opal", "Pearl", "Optimal"],
-            "default": "Optimal",
-            "help": "Choose the type of similarity calculation for face detection and matching during the face swapping process.",
-        },
         "DetectorModelSelection": {
             "level": 1,
             "label": "Face Detect Model",

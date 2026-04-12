@@ -6,7 +6,6 @@ from app.processors.utils import faceutil
 import numpy as np
 from numpy.linalg import norm as l2norm
 from typing import TYPE_CHECKING
-import kornia.geometry.transform as kgm
 
 if TYPE_CHECKING:
     from app.processors.models_processor import ModelsProcessor
@@ -106,7 +105,7 @@ class FaceSwappers:
                 self.models_processor.hide_build_dialog.emit()
 
     def run_recognize_direct(
-        self, img, kps, similarity_type="Opal", arcface_model="Inswapper128ArcFace"
+        self, img, kps, similarity_type="Auto", arcface_model="Inswapper128ArcFace"
     ):
         # FS-RACE-01: protect read-modify-write of current_arcface_model with lock
         with self.models_processor.model_lock:
@@ -137,93 +136,60 @@ class FaceSwappers:
         return embedding, cropped_image
 
     def run_recognize(
-        self, img, kps, similarity_type="Opal", face_swapper_model="Inswapper128"
+        self, img, kps, similarity_type="Auto", face_swapper_model="Inswapper128"
     ):
         arcface_model = self.models_processor.get_arcface_model(face_swapper_model)
         return self.run_recognize_direct(img, kps, similarity_type, arcface_model)
 
-    def recognize(self, arcface_model, img, face_kps, similarity_type):
+    def recognize(self, arcface_model, img, face_kps, similarity_type=None):
         """
         Generates the face embedding using the specified ArcFace model and alignment strategy.
-
-        Args:
-            arcface_model (str): Name of the model to use.
-            img (torch.Tensor): Input image tensor (CHW).
-            face_kps (np.ndarray): 5 facial landmarks.
-            similarity_type (str): Alignment strategy ('Optimal', 'Pearl', 'Opal').
-
-        Returns:
-            tuple: (embedding numpy array, cropped_face tensor HWC)
+        Automatically handles pose-awareness, ignoring user UI choice to prevent corrupted embeddings.
         """
         ort_session = self.models_processor.models.get(arcface_model)
         if not ort_session:
-            # This is a safety check; run_recognize_direct should prevent this.
             return None, None
 
-        # --- ALIGNMENT STRATEGIES ---
-        if similarity_type == "Optimal":
+        # --- FORCED DYNAMIC "AUTO" MODE (STATELESS) ---
+        # We ignore 'similarity_type' from UI to protect ArcFace from bad alignments (like Pearl).
+        yaw, pitch = faceutil.calc_face_yaw_pitch(face_kps)
+
+        if abs(yaw) > 30.0 or abs(pitch) > 30.0:
+            actual_mode = "Optimal"
+        else:
+            actual_mode = "Opal"
+
+        # --- ALIGNMENT STRATEGIES (Delegated to faceutil) ---
+        if actual_mode == "Optimal":
+            # Pose-aware 7-templates alignment (arcfacemap) for side faces
             img, _ = faceutil.warp_face_by_face_landmark_5(
                 img,
                 face_kps,
+                image_size=112,
                 mode="arcfacemap",
                 interpolation=v2.InterpolationMode.BILINEAR,
             )
-
-        elif similarity_type == "Pearl":
-            dst = self.models_processor.arcface_dst.copy()
-            dst[:, 0] += 8.0
-            tform = trans.SimilarityTransform.from_estimate(face_kps, dst)
-
-            # OPTIMIZED: Direct GPU Warp to 128x128 using Kornia
-            M_tensor = (
-                torch.from_numpy(tform.params[0:2]).float().unsqueeze(0).to(img.device)
-            )
-            img_b = img.unsqueeze(0) if img.dim() == 3 else img
-            img = kgm.warp_affine(
-                img_b.float(),
-                M_tensor,
-                dsize=(128, 128),
-                mode="bilinear",
-                align_corners=True,
-            ).squeeze(0)
-
-            # Fast resize to standard 112
-            img = v2.functional.resize(img, [112, 112], antialias=True)
-
         else:
-            # Mode 3: Opal (Standard / Default)
-            tform = trans.SimilarityTransform.from_estimate(
-                face_kps, self.models_processor.arcface_dst
+            # Standard frontal alignment (arcface112) for front faces
+            img, _ = faceutil.warp_face_by_face_landmark_5(
+                img,
+                face_kps,
+                image_size=112,
+                mode="arcface112",
+                interpolation=v2.InterpolationMode.BILINEAR,
             )
-
-            # OPTIMIZED: Direct GPU Warp to 112x112 using Kornia (bypasses torchvision crop/affine)
-            M_tensor = (
-                torch.from_numpy(tform.params[0:2]).float().unsqueeze(0).to(img.device)
-            )
-            img_b = img.unsqueeze(0) if img.dim() == 3 else img
-            img = kgm.warp_affine(
-                img_b.float(),
-                M_tensor,
-                dsize=(112, 112),
-                mode="bilinear",
-                align_corners=True,
-            ).squeeze(0)
 
         # --- NORMALIZATION & PRE-PROCESSING ---
         cropped_image = img.permute(1, 2, 0).clone()  # Store for display/debug (H,W,3)
 
-        # Ensure float format
         if img.dtype == torch.uint8:
             img = img.float()
 
-        # We MUST clone the image before doing in-place math if we are
-        # not strictly sure that we own a brand new Kornia tensor.
-        # "Optimal" mode might pass a reference, causing Race Conditions across threads.
+        # CLONE: Prevent race conditions if Kornia passed a reference
         img = img.clone()
 
-        # OPTIMIZED: In-Place math operations (.sub_ and .div_) to save VRAM fragmentation
+        # OPTIMIZED: In-Place math operations (.sub_ and .div_)
         if arcface_model == "Inswapper128ArcFace":
-            # FS-BUG-03: ensure input is in [0, 255] before normalizing
             if img.max() <= 1.0:
                 img = img * 255.0
             img.sub_(127.5).div_(127.5)
@@ -233,18 +199,12 @@ class FaceSwappers:
             v2.functional.normalize(
                 img, (0.485, 0.456, 0.406), (0.229, 0.224, 0.225), inplace=True
             )
-
         else:
-            # GhostArcFace, CSCSArcFace, etc.
             img.div_(127.5).sub_(1.0)
 
         # --- INFERENCE ---
-        # Prepare data (N, C, H, W)
         img = torch.unsqueeze(img, 0).contiguous()
 
-        # FS-PERF-02: cache input/output names by session id to avoid repeated ONNX introspection
-        # Lock prevents 'dictionary changed size during iteration' crashes when multiple
-        # workers encounter a new model ID simultaneously.
         session_id = id(ort_session)
         with self._io_cache_lock:
             if session_id not in self._session_io_name_cache:
@@ -268,10 +228,8 @@ class FaceSwappers:
         for name in output_names:
             io_binding.bind_output(name, self.models_processor.device)
 
-        # Run the model with lazy build handling (TensorRT safety)
         self._run_model_with_lazy_build_check(arcface_model, ort_session, io_binding)
 
-        # Return embedding (flattened) and the cropped image for visualization
         return np.array(io_binding.copy_outputs_to_cpu()).flatten(), cropped_image
 
     def preprocess_image_cscs(self, img, face_kps):

@@ -647,11 +647,26 @@ class FrameWorker(threading.Thread):
             )
         ) or edit_button_is_checked_global:
             source_kps = None
-            if target_face_button and target_face_button.assigned_input_faces:
-                first_input_id = list(target_face_button.assigned_input_faces.keys())[0]
-                store = target_face_button.assigned_input_faces[first_input_id]
-                if "kps_5" in store:
-                    source_kps = store["kps_5"]
+            if target_face_button:
+                # 1. Prioritize assigned Input Faces
+                if target_face_button.assigned_input_faces:
+                    first_input_id = list(
+                        target_face_button.assigned_input_faces.keys()
+                    )[0]
+                    store = target_face_button.assigned_input_faces[first_input_id]
+                    source_kps = store.get("kps_5")
+                # 2. Fallback to assigned Merged Embeddings
+                elif (
+                    hasattr(target_face_button, "assigned_merged_embeddings")
+                    and target_face_button.assigned_merged_embeddings
+                ):
+                    first_embed_id = list(
+                        target_face_button.assigned_merged_embeddings.keys()
+                    )[0]
+                    store = target_face_button.assigned_merged_embeddings[
+                        first_embed_id
+                    ]
+                    source_kps = store.get("kps_5")
 
             kps_5_on_crop_param = keypoints_adjustments(
                 kps_5_on_crop_param,
@@ -1620,11 +1635,12 @@ class FrameWorker(threading.Thread):
             phi = _fd["phi"]
             original_eye_side = _fd["original_eye_side"]
             dynamic_fov_for_crop = _fd["fov_used_for_crop"]
+            similarity_type = str("Auto")
 
             face_emb_crop, _ = self.models_processor.run_recognize_direct(
                 face_crop_tensor,
                 kps_on_crop,
-                control["SimilarityTypeSelection"],
+                similarity_type,
                 control["RecognitionModelSelection"],
             )
 
@@ -2046,10 +2062,11 @@ class FrameWorker(threading.Thread):
                     kpss_5[i], _bbox_i, self._MIN_FACE_PIXELS
                 ):
                     continue  # too small to produce meaningful swap
+                similarity_type = str("Auto")
                 face_emb, _ = self.models_processor.run_recognize_direct(
                     img,
                     kpss_5[i],
-                    control["SimilarityTypeSelection"],
+                    similarity_type,
                     control["RecognitionModelSelection"],
                 )
 
@@ -2129,13 +2146,24 @@ class FrameWorker(threading.Thread):
 
                         # --- MORPHING: Swap Only Best Match ---
                         source_kps = None
-                        if target_face and target_face.assigned_input_faces:
-                            first_input_id = list(
-                                target_face.assigned_input_faces.keys()
-                            )[0]
-                            store = target_face.assigned_input_faces[first_input_id]
-                            if "kps_5" in store:
-                                source_kps = store["kps_5"]
+                        if target_face:
+                            if target_face.assigned_input_faces:
+                                first_input_id = list(
+                                    target_face.assigned_input_faces.keys()
+                                )[0]
+                                store = target_face.assigned_input_faces[first_input_id]
+                                source_kps = store.get("kps_5")
+                            elif (
+                                hasattr(target_face, "assigned_merged_embeddings")
+                                and target_face.assigned_merged_embeddings
+                            ):
+                                first_embed_id = list(
+                                    target_face.assigned_merged_embeddings.keys()
+                                )[0]
+                                store = target_face.assigned_merged_embeddings[
+                                    first_embed_id
+                                ]
+                                source_kps = store.get("kps_5")
 
                         best_fface["kps_5"] = keypoints_adjustments(
                             best_fface["kps_5"],
@@ -2249,13 +2277,24 @@ class FrameWorker(threading.Thread):
 
                         # --- MORPHING: Branch Swap All Matches ---
                         source_kps = None
-                        if best_target and best_target.assigned_input_faces:
-                            first_input_id = list(
-                                best_target.assigned_input_faces.keys()
-                            )[0]
-                            store = best_target.assigned_input_faces[first_input_id]
-                            if "kps_5" in store:
-                                source_kps = store["kps_5"]
+                        if best_target:
+                            if best_target.assigned_input_faces:
+                                first_input_id = list(
+                                    best_target.assigned_input_faces.keys()
+                                )[0]
+                                store = best_target.assigned_input_faces[first_input_id]
+                                source_kps = store.get("kps_5")
+                            elif (
+                                hasattr(best_target, "assigned_merged_embeddings")
+                                and best_target.assigned_merged_embeddings
+                            ):
+                                first_embed_id = list(
+                                    best_target.assigned_merged_embeddings.keys()
+                                )[0]
+                                store = best_target.assigned_merged_embeddings[
+                                    first_embed_id
+                                ]
+                                source_kps = store.get("kps_5")
 
                         fface["kps_5"] = keypoints_adjustments(
                             fface["kps_5"], params, source_kps=source_kps

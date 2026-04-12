@@ -693,9 +693,7 @@ class TargetFaceCardButton(CardButton):
                 )
 
                 # Get the similarity type from global controls
-                similarity_type = self.main_window.control.get(
-                    "SimilarityTypeSelection", "Opal"
-                )
+                similarity_type = str("Auto")
 
                 # Call run_recognize_direct (which expects CHW tensor)
                 new_embedding, _ = (
@@ -1659,16 +1657,22 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
             )
             return
 
-        # 1. Classic embedding merge
+        # 1. Classic embedding merge and KPS separation
         merged_embedding_store = {}
+        kps_5_list = []  # List to safely collect spatial keypoints
 
         for input_face in self.selected_faces:
             for embedding_swap_model, embedding in input_face.embedding_store.items():
+                # Isolate keypoints to prevent L2 Normalization (which destroys spatial pixel coordinates)
+                if embedding_swap_model == "kps_5":
+                    kps_5_list.append(embedding)
+                    continue
+
                 if embedding_swap_model not in merged_embedding_store:
                     merged_embedding_store[embedding_swap_model] = []
                 merged_embedding_store[embedding_swap_model].append(embedding)
 
-        # Calcola l'embedding unito per ciascun embedding_swap_model
+        # Calculate the merged embedding for each arcface model
         final_embedding_store = {}
         for swap_model, embeddings in merged_embedding_store.items():
             if self.merge_type == "Mean":
@@ -1678,12 +1682,16 @@ class CreateEmbeddingDialog(QtWidgets.QDialog):
             else:
                 merged_emb = np.mean(embeddings, axis=0)  # Fallback
 
-            # Apply L2 Normalization
+            # Apply L2 Normalization ONLY to standard latent embeddings
             norm = np.linalg.norm(merged_emb)
             if norm > 0:
                 merged_emb = merged_emb / norm
 
             final_embedding_store[swap_model] = merged_emb
+
+        # Process kps_5 spatial averaging (Always use Mean, never L2 Normalize)
+        if kps_5_list:
+            final_embedding_store["kps_5"] = np.mean(kps_5_list, axis=0)
 
         # 2. Extract and merge K/V Maps (if checked)
         final_kv_map = None
