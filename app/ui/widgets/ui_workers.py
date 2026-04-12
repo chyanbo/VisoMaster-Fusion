@@ -377,7 +377,7 @@ class InputFacesLoaderWorker(qtc.QThread):
                     self.main_window.models_processor.run_recognize_direct(
                         img,
                         face_kps,
-                        control.get("SimilarityTypeSelection", "Optimal"),
+                        control.get("SimilarityTypeSelection", "Auto"),
                         selected_recognition_model,  # Use selected model
                     )
                 )

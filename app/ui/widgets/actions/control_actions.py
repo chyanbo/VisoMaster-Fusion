@@ -688,7 +688,7 @@ def apply_face_reaging(main_window: "MainWindow", *_args) -> None:
             dtype=np.float32,
         )
 
-        similarity_type = main_window.control.get("SimilarityTypeSelection", "Opal")
+        similarity_type = main_window.control.get("SimilarityTypeSelection", "Auto")
 
         # Determine which arcface models to recompute. Filter strictly to known
         # arcface model names so that non-model keys (e.g. "kps_5") that may also

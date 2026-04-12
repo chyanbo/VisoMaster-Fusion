@@ -168,7 +168,7 @@ def find_target_faces(main_window: "MainWindow"):
                     main_window.models_processor.run_recognize_direct(
                         img,
                         face_kps,
-                        control.get("SimilarityTypeSelection", "Opal"),
+                        control.get("SimilarityTypeSelection", "Auto"),
                         control.get("RecognitionModelSelection", "arcface_128"),
                     )
                 )
