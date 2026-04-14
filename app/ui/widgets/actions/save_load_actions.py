@@ -257,6 +257,20 @@ def save_embeddings_to_file(main_window: "MainWindow", save_as=False):
         embedding_filename, _ = QtWidgets.QFileDialog.getSaveFileName(
             main_window, filter="JSON (*.json)"
         )
+    elif (
+        QtWidgets.QMessageBox.question(
+            main_window,
+            "Confirm Save",
+            (
+                "Save all embeddings to the current file?\n\n"
+                f"This will overwrite:\n{embedding_filename}"
+            ),
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.No,
+            QtWidgets.QMessageBox.No,
+        )
+        != QtWidgets.QMessageBox.Yes
+    ):
+        return
 
     # Build a list of dicts, each containing the embedding name, embedding_store, and kv_map path
     embeddings_list = []
