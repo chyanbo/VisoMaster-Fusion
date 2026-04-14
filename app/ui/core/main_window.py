@@ -1074,7 +1074,9 @@ class Ui_MainWindow(object):
         self.openEmbeddingButton.setText("")
         # if QT_CONFIG(tooltip)
         self.saveEmbeddingButton.setToolTip(
-            QCoreApplication.translate("MainWindow", "Save Embedding", None)
+            QCoreApplication.translate(
+                "MainWindow", "Save all embeddings to the current file", None
+            )
         )
         # endif // QT_CONFIG(tooltip)
         self.saveEmbeddingButton.setText("")
