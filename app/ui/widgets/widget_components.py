@@ -531,6 +531,8 @@ class TargetMediaCardButton(CardButton):
                 subprocess.run(["xdg-open", directory])
 
     def create_context_menu(self):
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
         self.remove_action = QtGui.QAction("Remove from list", self)
         self.remove_action.triggered.connect(self.remove_target_media_from_list)
@@ -543,12 +545,22 @@ class TargetMediaCardButton(CardButton):
         self.open_path_action = QtGui.QAction("Open file location", self)
         self.open_path_action.triggered.connect(self.open_target_path_by_explorer)
         self.popMenu.addAction(self.open_path_action)
+        self.popMenu.addSeparator()
+
+        self.clear_all_media_action = QtGui.QAction("Clear All Media", self)
+        self.clear_all_media_action.triggered.connect(
+            partial(list_view_actions.clear_all_target_media, self.main_window)
+        )
+        self.popMenu.addAction(self.clear_all_media_action)
 
     def on_context_menu(self, point):
         # show context menu
         scan_active = video_control_actions.is_issue_scan_active(self.main_window)
         self.remove_action.setEnabled(not scan_active)
         self.delete_action.setEnabled(not scan_active)
+        self.clear_all_media_action.setEnabled(
+            bool(self.main_window.target_videos) and not scan_active
+        )
         self.popMenu.exec_(self.mapToGlobal(point))
 
 
@@ -1414,6 +1426,13 @@ class InputFaceCardButton(CardButton):
             )
         )
         self.popMenu.addAction(self.large_thumbnails_action)
+        self.popMenu.addSeparator()
+
+        self.clear_all_faces_action = QtGui.QAction("Clear All Faces", self)
+        self.clear_all_faces_action.triggered.connect(
+            partial(list_view_actions.clear_all_input_faces, self.main_window)
+        )
+        self.popMenu.addAction(self.clear_all_faces_action)
 
     def on_context_menu(self, point):
         # show context menu
@@ -1426,6 +1445,9 @@ class InputFaceCardButton(CardButton):
         self.delete_action.setEnabled(not scan_active)
         self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
         self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+        self.clear_all_faces_action.setEnabled(
+            bool(self.main_window.input_faces) and not scan_active
+        )
         self.popMenu.exec_(self.mapToGlobal(point))
 
     def create_embedding_from_selected_faces(self):
@@ -1562,15 +1584,26 @@ class EmbeddingCardButton(CardButton):
 
     def create_context_menu(self):
         # create context menu
+        from app.ui.widgets.actions import list_view_actions
+
         self.popMenu = QtWidgets.QMenu(self)
         self.remove_action = QtGui.QAction("Remove Embedding", self)
         self.remove_action.triggered.connect(self.remove_embedding_from_list)
         self.popMenu.addAction(self.remove_action)
+        self.popMenu.addSeparator()
+
+        self.clear_all_embeddings_action = QtGui.QAction("Clear All Embeddings", self)
+        self.clear_all_embeddings_action.triggered.connect(
+            partial(list_view_actions.clear_all_embeddings, self.main_window)
+        )
+        self.popMenu.addAction(self.clear_all_embeddings_action)
 
     def on_context_menu(self, point):
         # show context menu
-        self.remove_action.setEnabled(
-            not video_control_actions.is_issue_scan_active(self.main_window)
+        scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+        self.remove_action.setEnabled(not scan_active)
+        self.clear_all_embeddings_action.setEnabled(
+            bool(self.main_window.merged_embeddings) and not scan_active
         )
         self.popMenu.exec_(self.mapToGlobal(point))
 
