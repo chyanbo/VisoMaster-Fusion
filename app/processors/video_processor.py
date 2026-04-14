@@ -802,6 +802,9 @@ class VideoProcessor(QObject):
                             c2_x = (bboxes_203[:, 0] + bboxes_203[:, 2]) / 2.0
                             c2_y = (bboxes_203[:, 1] + bboxes_203[:, 3]) / 2.0
 
+                            # Track assigned faces to prevent many-to-one mapping
+                            available_mask = numpy.ones(bboxes_203.shape[0], dtype=bool)
+
                             for i, box in enumerate(bboxes):
                                 # Centroid for Pass 1 face
                                 c_x = (box[0] + box[2]) / 2.0
@@ -814,15 +817,28 @@ class VideoProcessor(QObject):
                                 # Dynamic tolerance: 30% of the face's largest dimension
                                 dynamic_tolerance = 0.3 * max(face_width, face_height)
 
-                                # Find closest matching face from Pass 2
-                                dists = numpy.sqrt(
-                                    (c2_x - c_x) ** 2 + (c2_y - c_y) ** 2
-                                )
-                                best_idx = numpy.argmin(dists)
+                                # Filter distances to only consider UNASSIGNED Pass 2 faces
+                                valid_indices = numpy.where(available_mask)[0]
+                                if len(valid_indices) == 0:
+                                    break  # No more unassigned 203-landmarks available
 
-                                # Validation based on dynamic scale rather than static 100px
-                                if dists[best_idx] < dynamic_tolerance:
-                                    aligned_kpss_203[i] = raw_kpss_203[best_idx]
+                                available_c2_x = c2_x[valid_indices]
+                                available_c2_y = c2_y[valid_indices]
+
+                                # Find closest matching face from available Pass 2 faces
+                                dists = numpy.sqrt(
+                                    (available_c2_x - c_x) ** 2
+                                    + (available_c2_y - c_y) ** 2
+                                )
+                                local_best_idx = numpy.argmin(dists)
+
+                                # Validation based on dynamic scale
+                                if dists[local_best_idx] < dynamic_tolerance:
+                                    global_best_idx = valid_indices[local_best_idx]
+                                    aligned_kpss_203[i] = raw_kpss_203[global_best_idx]
+                                    available_mask[global_best_idx] = (
+                                        False  # Mark as consumed
+                                    )
 
                         kpss_203 = aligned_kpss_203
                     else:
@@ -982,11 +998,19 @@ class VideoProcessor(QObject):
                     _best_match_key = None
                     _min_dist = float("inf")
 
+                    # Calculate adaptive threshold based on face dimensions
+                    # Using 40% of the largest face dimension ensures scale-invariance.
+                    _face_w = bboxes[_i][2] - bboxes[_i][0]
+                    _face_h = bboxes[_i][3] - bboxes[_i][1]
+                    _adaptive_threshold = max(30.0, max(_face_w, _face_h) * 0.4)
+
                     # Match current face to previous faces spatially
                     for _k, _prev_kps in self._smoothed_kps.items():
                         _centroid_prev = numpy.mean(_prev_kps, axis=0)
                         _dist = numpy.linalg.norm(_centroid_raw - _centroid_prev)
-                        if _dist < 50.0 and _dist < _min_dist:
+
+                        # Use the dynamic threshold instead of the hardcoded 50.0
+                        if _dist < _adaptive_threshold and _dist < _min_dist:
                             _min_dist = float(_dist)
                             _best_match_key = _k
 
@@ -1025,17 +1049,36 @@ class VideoProcessor(QObject):
                         # Smoothing on Dense KPS 203
                         if has_dense_kps_203:
                             if dense_kps_203_available:
-                                if _best_match_key in self._smoothed_dense_kps_203:
-                                    new_smoothed_dense_kps_203[_i] = (
-                                        dynamic_alpha * valid_kpss_203[_i]
-                                        + (1.0 - dynamic_alpha)
-                                        * self._smoothed_dense_kps_203[_best_match_key]
-                                    )
-                                    del self._smoothed_dense_kps_203[_best_match_key]
+                                # Check if landmarks are valid (not just the initialized zeros)
+                                is_valid_203 = not numpy.all(valid_kpss_203[_i] == 0)
+
+                                if is_valid_203:
+                                    if _best_match_key in self._smoothed_dense_kps_203:
+                                        new_smoothed_dense_kps_203[_i] = (
+                                            dynamic_alpha * valid_kpss_203[_i]
+                                            + (1.0 - dynamic_alpha)
+                                            * self._smoothed_dense_kps_203[
+                                                _best_match_key
+                                            ]
+                                        )
+                                        del self._smoothed_dense_kps_203[
+                                            _best_match_key
+                                        ]
+                                    else:
+                                        new_smoothed_dense_kps_203[_i] = valid_kpss_203[
+                                            _i
+                                        ].copy()
                                 else:
-                                    new_smoothed_dense_kps_203[_i] = valid_kpss_203[
-                                        _i
-                                    ].copy()
+                                    # Pass 2 missed the face. Use last known landmarks to prevent jumping to (0,0)
+                                    if _best_match_key in self._smoothed_dense_kps_203:
+                                        new_smoothed_dense_kps_203[_i] = (
+                                            self._smoothed_dense_kps_203[
+                                                _best_match_key
+                                            ].copy()
+                                        )
+                                        valid_kpss_203[_i] = new_smoothed_dense_kps_203[
+                                            _i
+                                        ]  # Overwrite zeros for downstream
 
                     else:
                         new_smoothed_kps[_i] = _raw.copy()

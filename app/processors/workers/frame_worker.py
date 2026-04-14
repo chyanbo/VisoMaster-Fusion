@@ -1945,6 +1945,16 @@ class FrameWorker(threading.Thread):
                             k[:, 0] *= ratio_w
                             k[:, 1] *= ratio_h
 
+                if self.precomputed_kpss_203 is not None:
+                    self.precomputed_kpss_203 = [
+                        k.copy() if k is not None else None
+                        for k in self.precomputed_kpss_203
+                    ]
+                    for k in self.precomputed_kpss_203:
+                        if k is not None:
+                            k[:, 0] *= ratio_w
+                            k[:, 1] *= ratio_h
+
         # Manual Rotation
         if control["ManualRotationEnableToggle"]:
             img = v2.functional.rotate(
@@ -2071,18 +2081,18 @@ class FrameWorker(threading.Thread):
                 )
 
                 kps_all_i = kpss[i] if kpss is not None and i < len(kpss) else None
-                # NEW: Extract the 203 points specifically
+                # Extract the 203 points specifically
                 kps_203_i = (
                     kpss_203[i] if kpss_203 is not None and i < len(kpss_203) else None
                 )
 
                 det_faces_data_for_display.append(
                     {
-                        "kps_5": kpss_5[i],
-                        "kps_all": kps_all_i,
-                        "kps_203": kps_203_i,
+                        "kps_5": kpss_5[i].copy() if kpss_5[i] is not None else None,
+                        "kps_all": kps_all_i.copy() if kps_all_i is not None else None,
+                        "kps_203": kps_203_i.copy() if kps_203_i is not None else None,
                         "embedding": face_emb,
-                        "bbox": bboxes[i],
+                        "bbox": bboxes[i].copy() if bboxes[i] is not None else None,
                         "original_face": None,
                         "swap_mask": None,
                         "matched_target": None,  # FW-BUG-09: cache slot
@@ -2394,6 +2404,25 @@ class FrameWorker(threading.Thread):
                     antialias=False,
                 )
             img = self._resize_cache[_down_key](img)
+
+            ratio_w_down = img_w / new_w
+            ratio_h_down = img_h / new_h
+
+            for fface in det_faces_data_for_display:
+                if fface.get("bbox") is not None:
+                    fface["bbox"][0] *= ratio_w_down
+                    fface["bbox"][2] *= ratio_w_down
+                    fface["bbox"][1] *= ratio_h_down
+                    fface["bbox"][3] *= ratio_h_down
+                if fface.get("kps_5") is not None:
+                    fface["kps_5"][:, 0] *= ratio_w_down
+                    fface["kps_5"][:, 1] *= ratio_h_down
+                if fface.get("kps_all") is not None:
+                    fface["kps_all"][:, 0] *= ratio_w_down
+                    fface["kps_all"][:, 1] *= ratio_h_down
+                if fface.get("kps_203") is not None:
+                    fface["kps_203"][:, 0] *= ratio_w_down
+                    fface["kps_203"][:, 1] *= ratio_h_down
 
         processed_tensor_rgb_uint8 = img
 
