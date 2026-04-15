@@ -2860,7 +2860,7 @@ def process_batch_images(main_window: "MainWindow", process_all_faces: bool):
     finally:
         main_window.is_batch_processing = False
         # 8. Close the progress dialog
-        progress_dialog.close()
+        progress_dialog.close_without_confirmation()
 
         # 9. Show completion message
         if progress_dialog.confirmedCanceled():
