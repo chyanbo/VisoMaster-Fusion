@@ -797,3 +797,25 @@ def handle_auto_mouth_toggle(main_window: "MainWindow", new_value: bool) -> None
         print(f"[WARN] Auto Mouth Expression: detector unavailable — {err}")
     else:
         print("[INFO] Auto Mouth Expression enabled. Mouth action detector ready.")
+
+
+def handle_ff_auto_quality_toggle(main_window: "MainWindow", new_value: bool) -> None:
+    """Disable manual FFQualitySlider while auto source-quality matching is enabled."""
+    quality_widget = main_window.parameter_widgets.get("FFQualitySlider")
+    if quality_widget is None:
+        return
+
+    manual_enabled = not bool(new_value)
+
+    quality_widget.setEnabled(manual_enabled)
+    if hasattr(quality_widget, "row_widget") and quality_widget.row_widget:
+        quality_widget.row_widget.setEnabled(manual_enabled)
+    if hasattr(quality_widget, "label_widget") and quality_widget.label_widget:
+        quality_widget.label_widget.setEnabled(manual_enabled)
+    if (
+        hasattr(quality_widget, "reset_default_button")
+        and quality_widget.reset_default_button
+    ):
+        quality_widget.reset_default_button.setEnabled(manual_enabled)
+    if hasattr(quality_widget, "line_edit") and quality_widget.line_edit:
+        quality_widget.line_edit.setEnabled(manual_enabled)
