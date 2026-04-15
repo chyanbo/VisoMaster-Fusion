@@ -1881,6 +1881,7 @@ class ProgressDialog(QtWidgets.QProgressDialog):
 
         self._confirmed_cancelled = False
         self._confirm_dialog_open = False
+        self._confirmation_disabled = False
 
         # Prevent Qt from auto-closing/resetting the dialog unexpectedly
         try:
@@ -1905,6 +1906,30 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         """Return True only if the user confirmed stopping."""
         return self._confirmed_cancelled
 
+    def close_without_confirmation(self):
+        """
+        Close the dialog for normal teardown without treating it as a user cancel.
+        """
+        self._confirmation_disabled = True
+        blocker = None
+        try:
+            blocker = QtCore.QSignalBlocker(self)
+        except Exception:
+            blocker = None
+
+        try:
+            try:
+                self.reset()
+            except Exception:
+                pass
+
+            try:
+                self.close()
+            except Exception:
+                pass
+        finally:
+            del blocker
+
     def _on_canceled(self):
         """
         Qt has already marked the dialog as canceled and may hide it.
@@ -1912,6 +1937,8 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         - confirm: keep _confirmed_cancelled=True (batch loop will stop)
         - decline: reset & re-show dialog, and keep _confirmed_cancelled=False (batch continues)
         """
+        if self._confirmation_disabled:
+            return
         if self._confirmed_cancelled:
             return
         if self._confirm_dialog_open:
@@ -1921,6 +1948,8 @@ class ProgressDialog(QtWidgets.QProgressDialog):
         QtCore.QTimer.singleShot(0, self._show_confirm_and_apply)
 
     def _show_confirm_and_apply(self):
+        if self._confirmation_disabled:
+            return
         if self._confirmed_cancelled:
             return
         if self._confirm_dialog_open:
