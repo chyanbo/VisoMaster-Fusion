@@ -264,11 +264,11 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
         },
         "FFAutoMatchSourceQualityToggle": {
             "level": 2,
-            "label": "Auto match source quality",
+            "label": "Auto-set quality from source",
             "default": False,
             "parentToggle": "FFMpegOptionsToggle",
             "requiredToggleValue": True,
-            "help": "Estimate source complexity with ffprobe and gently adjust Quality for more consistent visual quality across mixed source encodes. Off keeps manual Quality unchanged.",
+            "help": "Estimate source complexity with ffprobe and automatically set Quality from the source metrics for more consistent visual quality across mixed encodes. When enabled, the manual Quality slider is overridden; when disabled, manual Quality is used.",
             "exec_function": control_actions.handle_ff_auto_quality_toggle,
             "exec_function_args": [],
         },

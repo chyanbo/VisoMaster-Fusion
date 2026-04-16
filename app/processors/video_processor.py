@@ -2747,8 +2747,10 @@ class VideoProcessor(QObject):
                 "quiet",
                 "-print_format",
                 "json",
+                "-select_streams",
+                "v:0",
                 "-show_entries",
-                "stream=codec_type,width,height,bit_rate,avg_frame_rate,r_frame_rate:format=bit_rate",
+                "stream=codec_type,codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate:format=bit_rate",
                 file_path,
             ]
             result = subprocess.run(args, capture_output=True, text=True, timeout=30)
@@ -3086,7 +3088,15 @@ class VideoProcessor(QObject):
 
         source_metrics: Mapping[str, Any] | None = None
         if bool(control.get("FFAutoMatchSourceQualityToggle", False)):
-            source_metrics = self._probe_source_video_metrics(self.media_path or "")
+            media_path = self.media_path or ""
+            source_metrics_cache = getattr(self, "_source_metrics_cache", None)
+            if source_metrics_cache is None:
+                source_metrics_cache = {}
+                setattr(self, "_source_metrics_cache", source_metrics_cache)
+            source_metrics = source_metrics_cache.get(media_path)
+            if source_metrics is None:
+                source_metrics = self._probe_source_video_metrics(media_path)
+                source_metrics_cache[media_path] = source_metrics
 
         ffquality = self._get_adaptive_recording_quality(
             control,
