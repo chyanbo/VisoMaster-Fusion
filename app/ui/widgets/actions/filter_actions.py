@@ -107,23 +107,30 @@ def update_filtered_list(
     visible_indices: list,
     snapshot_size: int = 0,
 ):
-    # Flush pending paint events so thumbnails added during loading become visible
-    # before the hide/show cycle suppresses updates.
-    QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+    # Defer hide/show work to the next event loop tick so pending paint events can
+    # complete naturally without pumping the queue inside this function.
+    sequence = getattr(filter_list_widget, "_pending_filter_sequence", 0) + 1
+    filter_list_widget._pending_filter_sequence = sequence
 
-    filter_list_widget.setUpdatesEnabled(False)
+    def apply_update():
+        if getattr(filter_list_widget, "_pending_filter_sequence", None) != sequence:
+            return
 
-    try:
-        # Only manage items that existed at snapshot time; items added after the
-        # snapshot was captured (index >= snapshot_size) are left visible so they
-        # are not accidentally hidden by a stale filter result.
-        limit = snapshot_size if snapshot_size > 0 else filter_list_widget.count()
-        for i in range(min(limit, filter_list_widget.count())):
-            filter_list_widget.item(i).setHidden(True)
+        filter_list_widget.setUpdatesEnabled(False)
+        try:
+            # Only manage items that existed at snapshot time; items added after the
+            # snapshot was captured (index >= snapshot_size) are left visible so they
+            # are not accidentally hidden by a stale filter result.
+            limit = snapshot_size if snapshot_size > 0 else filter_list_widget.count()
+            for i in range(min(limit, filter_list_widget.count())):
+                filter_list_widget.item(i).setHidden(True)
 
-        # Show only the items in the visible_indices list
-        for i in visible_indices:
-            if i < filter_list_widget.count():
-                filter_list_widget.item(i).setHidden(False)
-    finally:
-        filter_list_widget.setUpdatesEnabled(True)
+            # Show only the items in the visible_indices list
+            for i in visible_indices:
+                if i < filter_list_widget.count():
+                    filter_list_widget.item(i).setHidden(False)
+        finally:
+            filter_list_widget.setUpdatesEnabled(True)
+            filter_list_widget.viewport().update()
+
+    QtCore.QTimer.singleShot(0, apply_update)
