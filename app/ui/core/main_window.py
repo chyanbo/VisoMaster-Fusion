@@ -875,7 +875,7 @@ class Ui_MainWindow(object):
     def retranslateUi(self, MainWindow):
         MainWindow.setWindowTitle(
             QCoreApplication.translate(
-                "MainWindow", "VisoMaster - Fusion - 1.0.0", None
+                "MainWindow", "VisoMaster - Fusion", None
             )
         )
         self.actionExit.setText(QCoreApplication.translate("MainWindow", "Exit", None))
