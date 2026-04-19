@@ -1320,10 +1320,25 @@ class VideoProcessor(QObject):
 
                 frame_rgb = numpy.ascontiguousarray(frame_bgr[..., ::-1])
 
-                # --- Inject Sequential Detection ---
-                bboxes, kpss_5, kpss, kpss_203 = self._run_sequential_detection(
-                    frame_rgb, local_control_for_worker, local_params_for_worker
-                )
+                if len(self.main_window.target_faces) > 0:
+                    # If Faces present run detect
+                    bboxes, kpss_5, kpss, kpss_203 = self._run_sequential_detection(
+                        frame_rgb, local_control_for_worker, local_params_for_worker
+                    )
+                else:
+                    # Bypass : No Faces present, skip with empy arrays
+                    bboxes = numpy.empty((0, 4), dtype=numpy.float32)
+                    kpss_5 = numpy.empty((0, 5, 2), dtype=numpy.float32)
+                    kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
+                    kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
+
+                    # Reset the arrays for clean retargeting
+                    if self.last_detected_faces:
+                        self.last_detected_faces.clear()
+                        self._smoothed_kps.clear()
+                        self._smoothed_dense_kps.clear()
+                        self._smoothed_dense_kps_203.clear()
+                        self.main_window.models_processor.face_detectors.reset_tracker()
 
                 # The worker will use the feeder's state *from this exact moment*
                 task = (
@@ -1398,9 +1413,23 @@ class VideoProcessor(QObject):
                     local_control_for_worker = self.main_window.control.copy()
 
                 # --- Inject Sequential Detection ---
-                bboxes, kpss_5, kpss, kpss_203 = self._run_sequential_detection(
-                    frame_rgb, local_control_for_worker, local_params_for_worker
-                )
+                if len(self.main_window.target_faces) > 0:
+                    bboxes, kpss_5, kpss, kpss_203 = self._run_sequential_detection(
+                        frame_rgb, local_control_for_worker, local_params_for_worker
+                    )
+                else:
+                    # Bypass
+                    bboxes = numpy.empty((0, 4), dtype=numpy.float32)
+                    kpss_5 = numpy.empty((0, 5, 2), dtype=numpy.float32)
+                    kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
+                    kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
+
+                    if self.last_detected_faces:
+                        self.last_detected_faces.clear()
+                        self._smoothed_kps.clear()
+                        self._smoothed_dense_kps.clear()
+                        self._smoothed_dense_kps_203.clear()
+                        self.main_window.models_processor.face_detectors.reset_tracker()
 
                 # Create the 8-tuple task
                 task = (
