@@ -3949,11 +3949,17 @@ class FrameWorker(threading.Thread):
         face_bbox: "np.ndarray | None" = None,
         vr_crop_chw: "torch.Tensor | np.ndarray | None" = None,
     ) -> dict:
-        """Check auto-mouth state and, if active, return a modified params dict
-        using Simple-mode lip transfer (same quality path as 'Restore The Lips').
+        """Check auto-mouth state and, if active, return a modified params dict.
 
-        Returns *params* unchanged (same object, zero allocation) when the
-        feature is disabled or not yet triggered.
+        'Expression Restorer' mode: takes precedence over the face expression
+        restorer's lip settings while preserving the user's eye/brow/general
+        restorer configuration. When auto-mouth deactivates, the original restorer
+        settings resume automatically for lips.
+
+        'Face Parser Only' mode: applies face-parser mouth masks only, no
+        expression transfer — faster, no mouth-position update.
+
+        Returns *params* unchanged (same object) when disabled or not triggered.
         """
         if not params.get("AutoMouthExpressionEnableToggle", False):
             return params
@@ -3963,13 +3969,11 @@ class FrameWorker(threading.Thread):
         _alpha = params.get("AutoMouthEMAAlphaDecimalSlider", 0.65)
         _threshold = params.get("AutoMouthOpenThresholdDecimalSlider", 0.50)
 
-        # Run detection on the face-region crop for this specific face.
         # None = no detection; triggers occlusion grace period in state machine.
         _ratio: "float | None" = self._detect_mouth_action_score(
             face_bbox=face_bbox, vr_crop_chw=vr_crop_chw
         )
 
-        # Defensive: handle stale button objects that predate this attribute
         _state: "MouthOpennessState | None" = getattr(
             target_fb, "mouth_openness_state", None
         )
@@ -3979,83 +3983,95 @@ class FrameWorker(threading.Thread):
 
         _auto_active, _ema_value = _state.update(_ratio, _alpha, _threshold)
 
-        if _auto_active:
-            # Smart gate: respect user's expression restorer when they already have
-            # lip transfer active. Only skip auto-mouth when the user is explicitly
-            # driving lip motion so we don't override their settings silently.
-            _user_mode = params.get("FaceExpressionModeSelection", "Advanced")
-            _user_region = str(
-                params.get("FaceExpressionAnimationRegionSelection", "all")
-            )
-            _user_has_lip_transfer = params.get(
-                "FaceExpressionEnableBothToggle", False
-            ) and (
-                (
-                    _user_mode == "Advanced"
-                    and params.get("FaceExpressionLipsToggle", False)
-                )
-                or (
-                    _user_mode == "Simple"
-                    and ("lips" in _user_region or "all" in _user_region)
-                )
-            )
-            if _user_has_lip_transfer:
-                return params
+        if not _auto_active:
+            return params
 
-            _base_strength = params.get(
-                "AutoMouthExpressionStrengthDecimalSlider", 1.00
+        _base_strength = params.get("AutoMouthExpressionStrengthDecimalSlider", 1.00)
+        _normalize = params.get("AutoMouthNormalizeLipsToggle", True)
+        _restore_mode = params.get(
+            "AutoMouthRestoreModeSelection", "Expression Restorer"
+        )
+
+        # Proportional strength ramp: smooth fade-in from threshold to threshold+ramp.
+        _ramp_range = max(_threshold * 0.5, 0.04)
+        _proportion = min(1.0, max(0.0, (_ema_value - _threshold) / _ramp_range))
+        _strength = _base_strength * _proportion
+
+        # Skip entirely when strength is negligible — avoids a full warp-decode cycle.
+        if _strength < 0.01:
+            return params
+
+        _p = dict(params)
+
+        # --- Face-parser mouth override (applied in both modes) ---
+        _mouth_val = int(params.get("AutoMouthMouthParserSlider", 1))
+        _upper_val = int(params.get("AutoMouthUpperLipParserSlider", 3))
+        _lower_val = int(params.get("AutoMouthLowerLipParserSlider", 17))
+        if _mouth_val > 0 or _upper_val > 0 or _lower_val > 0:
+            _p["FaceParserEnableToggle"] = True
+        _p["MouthParserSlider"] = _mouth_val
+        _p["UpperLipParserSlider"] = _upper_val
+        _p["LowerLipParserSlider"] = _lower_val
+
+        if _restore_mode == "Face Parser Only":
+            # Mask-only mode: do not touch the expression restorer.
+            return _p
+
+        # --- Expression Restorer mode ---
+        # Auto mouth takes precedence over restorer lip settings; eyes/brows/general
+        # are preserved from the user's existing restorer configuration.
+        _user_enabled = params.get("FaceExpressionEnableBothToggle", False)
+        _user_mode = params.get("FaceExpressionModeSelection", "Advanced")
+        _user_region = str(params.get("FaceExpressionAnimationRegionSelection", "all"))
+
+        _p["FaceExpressionEnableBothToggle"] = True
+        _p["FaceExpressionBeforeTypeSelection"] = "Beginning"
+
+        if _user_enabled and _user_mode == "Advanced":
+            # Keep user's Advanced-mode eye/brow/general settings; force lips only.
+            _p["FaceExpressionModeSelection"] = "Advanced"
+            _p["FaceExpressionLipsToggle"] = True
+            _p["FaceExpressionFriendlyFactorLipsDecimalSlider"] = _strength
+            _p["FaceExpressionRelativeLipsToggle"] = True
+            _p["FaceExpressionRetargetingLipsBothEnableToggle"] = _normalize
+            _p["FaceExpressionRetargetingLipsMultiplierBothDecimalSlider"] = 1.0
+            # Eyes, brows, general keep user values from _p (shallow copy of params).
+
+        elif _user_enabled and _user_mode == "Simple":
+            # Convert Simple → Advanced, preserving eye motion if user had 'all' region.
+            _had_eyes = "eyes" in _user_region or "all" in _user_region
+            _user_factor = float(
+                params.get("FaceExpressionFriendlyFactorDecimalSlider", 1.0)
             )
-            _normalize = params.get("AutoMouthNormalizeLipsToggle", True)
+            _p["FaceExpressionModeSelection"] = "Advanced"
+            _p["FaceExpressionLipsToggle"] = True
+            _p["FaceExpressionFriendlyFactorLipsDecimalSlider"] = _strength
+            _p["FaceExpressionRelativeLipsToggle"] = True
+            _p["FaceExpressionRetargetingLipsBothEnableToggle"] = _normalize
+            _p["FaceExpressionRetargetingLipsMultiplierBothDecimalSlider"] = 1.0
+            # Carry user's Simple eye factor over if they had eye motion.
+            _p["FaceExpressionEyesToggle"] = _had_eyes
+            if _had_eyes:
+                _p["FaceExpressionFriendlyFactorEyesDecimalSlider"] = _user_factor
+                _p["FaceExpressionRelativeEyesToggle"] = True
+            _p["FaceExpressionBrowsToggle"] = False
+            _p["FaceExpressionGeneralToggle"] = False
+
+        else:
+            # Restorer was disabled: enable Simple mode for lips (or region from UI).
             _region = params.get("AutoMouthAnimationRegionSelection", "lips")
-
-            # Proportional strength: ramp from 0 at threshold to full at threshold + ramp_range.
-            # This produces a smooth fade-in instead of a binary snap-on.
-            _ramp_range = max(_threshold * 0.5, 0.04)
-            _proportion = min(1.0, max(0.0, (_ema_value - _threshold) / _ramp_range))
-            _strength = _base_strength * _proportion
-
-            # Skip the restorer entirely when strength is negligible — avoids a full
-            # landmark-detection + warp-decode cycle with no visible output change.
-            if _strength < 0.01:
-                return params
-
-            _p = dict(params)
-            # Simple mode uses lp_retarget_lip internally via the normalize path —
-            # this is the same high-quality path as the manual "Restore The Lips" toggle.
-            _p["FaceExpressionEnableBothToggle"] = True
             _p["FaceExpressionModeSelection"] = "Simple"
-            _p["FaceExpressionBeforeTypeSelection"] = "Beginning"
             _p["FaceExpressionAnimationRegionSelection"] = _region
             _p["FaceExpressionFriendlyFactorDecimalSlider"] = _strength
-            # FaceExpressionNormalizeLipsEnableToggle is the correct Simple-mode key.
             _p["FaceExpressionNormalizeLipsEnableToggle"] = _normalize
-            # Pin normalize threshold to ensure lp_retarget_lip always fires when
-            # auto-mouth is active, regardless of the user's slider value.
             _p["FaceExpressionNormalizeLipsThresholdDecimalSlider"] = 0.03
-            # Pin neutral factor to 1.0 so _strength alone controls intensity.
-            # Without this, the user's neutral slider would silently dampen auto-mouth.
             _p["FaceExpressionNeutralDecimalSlider"] = 1.0
-            # Explicitly set the Advanced-mode toggle keys that swap_core checks with
-            # bare [] access. Plain dict copies may be missing these keys on the first
-            # frame for a new face (before ParametersDict has resolved them from defaults).
-            _p["FaceExpressionLipsToggle"] = False  # Simple mode; avoid KeyError
+            _p["FaceExpressionLipsToggle"] = False
             _p["FaceExpressionEyesToggle"] = False
             _p["FaceExpressionBrowsToggle"] = False
             _p["FaceExpressionGeneralToggle"] = False
-            # Face-parser mouth/lip override — reads configurable values from the
-            # AutoMouth UI section and forces them onto the per-face params, overriding
-            # whatever the user has set in the Face Swap tab for these three sliders.
-            _mouth_val = int(params.get("AutoMouthMouthParserSlider", 1))
-            _upper_val = int(params.get("AutoMouthUpperLipParserSlider", 3))
-            _lower_val = int(params.get("AutoMouthLowerLipParserSlider", 17))
-            if _mouth_val > 0 or _upper_val > 0 or _lower_val > 0:
-                _p["FaceParserEnableToggle"] = True
-            _p["MouthParserSlider"] = _mouth_val
-            _p["UpperLipParserSlider"] = _upper_val
-            _p["LowerLipParserSlider"] = _lower_val
-            return _p
 
-        return params
+        return _p
 
     def swap_core(
         self,

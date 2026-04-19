@@ -659,8 +659,26 @@ COMMON_LAYOUT_DATA: Any = {
             "exec_function": control_actions.handle_auto_mouth_toggle,
             "exec_function_args": [],
             "help": (
-                "Automatically activates lip-transfer expression and face-parser mouth "
-                "regions when mouth action is detected in the scene. "
+                "Triggers lip expression or face-parser mouth masks automatically when "
+                "mouth action is detected. In 'Expression Restorer' mode, takes "
+                "precedence over the face expression restorer's lip settings while "
+                "preserving your eye configuration. Deactivating auto mouth restores "
+                "normal face expression restorer behaviour for lips."
+            ),
+        },
+        "AutoMouthRestoreModeSelection": {
+            "level": 2,
+            "label": "Trigger Mode",
+            "options": ["Expression Restorer", "Face Parser Only"],
+            "default": "Expression Restorer",
+            "parentToggle": "AutoMouthExpressionEnableToggle",
+            "requiredToggleValue": True,
+            "help": (
+                "'Expression Restorer': overrides the face expression restorer lip "
+                "settings when mouth is detected — preserves your eye/brow/general "
+                "restorer settings, updates mouth position. Slower (runs LivePortrait). "
+                "'Face Parser Only': applies face-parser mouth dilation masks only, "
+                "no expression transfer — faster, similar to xseg mouth."
             ),
         },
         "AutoMouthOpenThresholdDecimalSlider": {
@@ -668,7 +686,7 @@ COMMON_LAYOUT_DATA: Any = {
             "label": "Confidence Threshold",
             "min_value": "0.01",
             "max_value": "0.99",
-            "default": "0.20",
+            "default": "0.80",
             "decimals": 2,
             "step": 0.01,
             "parentToggle": "AutoMouthExpressionEnableToggle",
@@ -721,8 +739,9 @@ COMMON_LAYOUT_DATA: Any = {
             "parentToggle": "AutoMouthExpressionEnableToggle",
             "requiredToggleValue": True,
             "help": (
-                "'lips' transfers only mouth motion (recommended). "
-                "'all' also includes eyes, matching full Simple-mode expression restorer."
+                "Used when the face expression restorer is not already enabled. "
+                "'lips' transfers only mouth motion. 'all' includes eyes too. "
+                "When the restorer is active, eye settings are inherited from it automatically."
             ),
         },
         "AutoMouthNormalizeLipsToggle": {
@@ -732,8 +751,9 @@ COMMON_LAYOUT_DATA: Any = {
             "parentToggle": "AutoMouthExpressionEnableToggle",
             "requiredToggleValue": True,
             "help": (
-                "Enable lip-ratio normalisation (uses lp_retarget_lip) for better "
-                "lip shape accuracy when auto-mouth is active."
+                "Enables lip-ratio normalisation for better lip shape accuracy. "
+                "In Expression Restorer mode uses lip retargeting (Advanced) or "
+                "lp_retarget_lip (Simple/fallback)."
             ),
         },
         "AutoMouthMouthParserSlider": {
