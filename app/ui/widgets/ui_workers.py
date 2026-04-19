@@ -34,6 +34,7 @@ class TargetMediaLoaderWorker(qtc.QThread):
         folder_name=False,
         files_list=None,
         media_ids=None,
+        sort_files_list_by_name=True,
         webcam_mode=False,
         parent=None,
     ):
@@ -42,6 +43,7 @@ class TargetMediaLoaderWorker(qtc.QThread):
         self.folder_name = folder_name
         self.files_list = files_list or []
         self.media_ids = media_ids or []
+        self.sort_files_list_by_name = sort_files_list_by_name
         self.webcam_mode = webcam_mode
         self._running = True  # Flag to control the running state
 
@@ -112,8 +114,9 @@ class TargetMediaLoaderWorker(qtc.QThread):
             m_id = self.media_ids[idx] if self.media_ids else str(uuid.uuid1().int)
             paired_files_ids.append((path, m_id))
 
-        # Alphabetical sorting on filename only
-        paired_files_ids.sort(key=lambda x: os.path.basename(str(x[0])).lower())
+        # Keep existing behavior by default; allow callers to preserve original order.
+        if self.sort_files_list_by_name:
+            paired_files_ids.sort(key=lambda x: os.path.basename(str(x[0])).lower())
 
         for media_file_path, media_id in paired_files_ids:
             if not self._running:  # Check if the thread is still running

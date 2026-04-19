@@ -470,6 +470,7 @@ def load_saved_workspace(
                 folder_name=False,
                 files_list=target_medias_files_list,
                 media_ids=target_media_ids,
+                sort_files_list_by_name=False,
             )
             main_window.video_loader_worker.thumbnail_ready.connect(
                 partial(
