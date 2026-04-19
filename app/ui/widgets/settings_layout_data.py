@@ -262,6 +262,16 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "requiredToggleValue": True,
             "help": "Constant quality slider, lower values = better quality but less encoding (bigger files). Default = 18.",
         },
+        "FFAutoMatchSourceQualityToggle": {
+            "level": 2,
+            "label": "Auto-set quality from source",
+            "default": False,
+            "parentToggle": "FFMpegOptionsToggle",
+            "requiredToggleValue": True,
+            "help": "Estimate source complexity with ffprobe and automatically set Quality from the source metrics for more consistent visual quality across mixed encodes. When enabled, the manual Quality slider is overridden; when disabled, manual Quality is used.",
+            "exec_function": control_actions.handle_ff_auto_quality_toggle,
+            "exec_function_args": [],
+        },
         "FFSpatialAQToggle": {
             "level": 2,
             "label": "Spatial AQ",
