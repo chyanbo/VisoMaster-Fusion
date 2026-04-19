@@ -54,6 +54,14 @@ class TargetMediaLoaderWorker(qtc.QThread):
             self.load_webcams()
         self.finished.emit()
 
+    def _iter_sorted_recursive_media_files(self, folder_name: str):
+        for dirpath, dirnames, filenames in os.walk(folder_name, topdown=True):
+            dirnames.sort(key=str.lower)
+            for filename in sorted(filenames, key=str.lower):
+                media_file_path = os.path.abspath(os.path.join(dirpath, filename))
+                if misc_helpers.get_file_type(media_file_path):
+                    yield media_file_path
+
     def load_videos_and_images_from_folder(self, folder_name):
         # Initially hide the placeholder text
         self.main_window.placeholder_update_signal.emit(
@@ -62,13 +70,16 @@ class TargetMediaLoaderWorker(qtc.QThread):
         recursive_toggle = self.main_window.control.get(
             "TargetMediaFolderRecursiveToggle", False
         )
-        video_files = misc_helpers.get_video_files(folder_name, recursive_toggle)
-        image_files = misc_helpers.get_image_files(folder_name, recursive_toggle)
 
         i = 0
-        media_files = video_files + image_files
-        # Sorting the list
-        media_files.sort(key=lambda x: os.path.basename(str(x)).lower())
+        if recursive_toggle:
+            media_files = self._iter_sorted_recursive_media_files(folder_name)
+        else:
+            video_files = misc_helpers.get_video_files(folder_name, recursive_toggle)
+            image_files = misc_helpers.get_image_files(folder_name, recursive_toggle)
+            media_files = video_files + image_files
+            # Sorting the list
+            media_files.sort(key=lambda x: os.path.basename(str(x)).lower())
 
         for media_file in media_files:
             if not self._running:  # Check if the thread is still running

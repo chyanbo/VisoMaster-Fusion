@@ -1,6 +1,6 @@
 from typing import TYPE_CHECKING
 
-from PySide6 import QtWidgets
+from PySide6 import QtCore, QtWidgets
 
 if TYPE_CHECKING:
     from app.ui.main_ui import MainWindow
@@ -107,6 +107,10 @@ def update_filtered_list(
     visible_indices: list,
     snapshot_size: int = 0,
 ):
+    # Flush pending paint events so thumbnails added during loading become visible
+    # before the hide/show cycle suppresses updates.
+    QtWidgets.QApplication.processEvents(QtCore.QEventLoop.ProcessEventsFlag.ExcludeUserInputEvents)
+
     filter_list_widget.setUpdatesEnabled(False)
 
     try:

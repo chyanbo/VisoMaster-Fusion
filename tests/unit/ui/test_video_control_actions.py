@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import os
 import sys
 from types import SimpleNamespace
 from typing import Any
@@ -1201,6 +1202,83 @@ class _FakeProgressDialog:
 
     def close_without_confirmation(self):
         self.closed_without_confirmation += 1
+
+
+class _FakeLineEditText:
+    def __init__(self, value: str):
+        self._value = value
+
+    def text(self):
+        return self._value
+
+
+def test_resolve_output_folder_preserves_source_directory_structure(video_actions_env):
+    main_window = SimpleNamespace(
+        control={
+            "OutputMediaFolder": "E:/output",
+            "OutputToTargetLocationToggle": False,
+            "PreserveOutputDirectoryStructureToggle": True,
+            "ClusterOutputBySourceToggle": False,
+        },
+        targetVideosPathLineEdit=_FakeLineEditText("E:/targets"),
+        last_target_media_folder_path="",
+        merged_embeddings={},
+        cur_selected_target_face_button=None,
+    )
+
+    output_folder = video_actions_env.module.resolve_output_folder(
+        main_window, "E:/targets/set_a/sub_01/image_1.png"
+    )
+
+    assert os.path.normpath(output_folder) == os.path.normpath(
+        "E:/output/set_a/sub_01"
+    )
+
+
+def test_resolve_output_folder_preserve_and_cluster(video_actions_env):
+    main_window = SimpleNamespace(
+        control={
+            "OutputMediaFolder": "E:/output",
+            "OutputToTargetLocationToggle": False,
+            "PreserveOutputDirectoryStructureToggle": True,
+            "ClusterOutputBySourceToggle": True,
+        },
+        targetVideosPathLineEdit=_FakeLineEditText("E:/targets"),
+        last_target_media_folder_path="",
+        merged_embeddings={7: SimpleNamespace(embedding_name="embedding_alice")},
+        cur_selected_target_face_button=SimpleNamespace(
+            assigned_merged_embeddings={7: object()}
+        ),
+    )
+
+    output_folder = video_actions_env.module.resolve_output_folder(
+        main_window, "E:/targets/set_a/sub_01/image_1.png"
+    )
+
+    assert os.path.normpath(output_folder) == os.path.normpath(
+        "E:/output/set_a/sub_01/embedding_alice"
+    )
+
+
+def test_resolve_output_folder_target_location_overrides_preserve(video_actions_env):
+    main_window = SimpleNamespace(
+        control={
+            "OutputMediaFolder": "E:/output",
+            "OutputToTargetLocationToggle": True,
+            "PreserveOutputDirectoryStructureToggle": True,
+            "ClusterOutputBySourceToggle": False,
+        },
+        targetVideosPathLineEdit=_FakeLineEditText("E:/targets"),
+        last_target_media_folder_path="",
+        merged_embeddings={},
+        cur_selected_target_face_button=None,
+    )
+
+    output_folder = video_actions_env.module.resolve_output_folder(
+        main_window, "E:/targets/set_a/sub_01/image_1.png"
+    )
+
+    assert os.path.normpath(output_folder) == os.path.normpath("E:/targets/set_a/sub_01")
 
 
 def _make_batch_main_window(*widgets):
