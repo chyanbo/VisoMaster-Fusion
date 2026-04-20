@@ -1,4 +1,4 @@
-# Quick Start Guide
+# Visomaster Fusion - Quick Start Guide
 
 > Your first successful face swap in a few minutes.
 
