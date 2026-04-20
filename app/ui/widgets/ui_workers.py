@@ -89,7 +89,10 @@ class TargetMediaLoaderWorker(qtc.QThread):
             media_file_path = os.path.join(folder_name, media_file)
             file_type = misc_helpers.get_file_type(media_file_path)
             q_image = common_widget_actions.extract_frame_as_image(
-                self.main_window, media_file_path, file_type
+                self.main_window,
+                media_file_path,
+                file_type,
+                cache_thumbnail=False,
             )
 
             media_id = self.media_ids[i] if self.media_ids else str(uuid.uuid1().int)
@@ -125,7 +128,10 @@ class TargetMediaLoaderWorker(qtc.QThread):
                 continue
             file_type = misc_helpers.get_file_type(media_file_path)
             q_image = common_widget_actions.extract_frame_as_image(
-                self.main_window, media_file_path, file_type=file_type
+                self.main_window,
+                media_file_path,
+                file_type=file_type,
+                cache_thumbnail=False,
             )
             if q_image:
                 # Emit the signal to update GUI
