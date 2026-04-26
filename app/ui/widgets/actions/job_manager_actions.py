@@ -19,6 +19,7 @@ from app.ui.widgets.actions import common_actions as common_widget_actions
 from app.ui.widgets.actions import card_actions
 from app.ui.widgets.actions import list_view_actions
 from app.ui.widgets.actions import video_control_actions
+from app.ui.widgets.actions import control_actions
 from app.ui.widgets.actions import layout_actions
 from app.ui.widgets.actions import save_load_actions
 from app.ui.widgets import ui_workers
@@ -310,6 +311,16 @@ def _load_job_target_media(main_window: "MainWindow", data: dict):
     # .run() is synchronous, ensuring media is loaded before proceeding.
     main_window.video_loader_worker.run()
 
+    # Target media thumbnails are batch-enqueued; wait briefly until target_videos
+    # is populated before trying to re-select saved media.
+    wait_start = time.perf_counter()
+    while list_view_actions._has_pending_target_media_thumbnail_work(main_window):
+        QtWidgets.QApplication.processEvents(QEventLoop.AllEvents, 5)
+        if (time.perf_counter() - wait_start) > 2.0:
+            break
+
+    QtWidgets.QApplication.processEvents()
+
     # Select the previously active media
     selected_media_id = data.get("selected_media_id", False)
     if selected_media_id and main_window.target_videos.get(selected_media_id):
@@ -439,8 +450,9 @@ def _load_job_target_faces_and_params(main_window: "MainWindow", data: dict):
                         main_window.merged_embeddings[assigned_id].embedding_store
                     )
 
-            # use TargetFaceCardButton widget to load existing target_face_button hooks
-            target_face_obj.load_target_face()
+            # IMPORTANT: do not call load_target_face() during restore.
+            # That method can clear assigned_input_faces/assigned_merged_embeddings
+            # when KeepInputToggle/AutoSwapToggle are enabled, overwriting saved job data.
 
             # Load assigned input faces
             target_face_obj.assigned_input_faces.clear()
@@ -479,6 +491,10 @@ def _load_job_controls_and_state(
     # Restore swap faces button state
     swap_faces_state = data.get("swap_faces_enabled", True)
     main_window.swapfacesButton.setChecked(swap_faces_state)
+    edit_faces_state = data.get("edit_faces_enabled", False)
+    main_window.editFacesButton.setChecked(edit_faces_state)
+    # Keep LivePortrait model lifecycle in sync when restoring button state.
+    control_actions.handle_face_editor_button_click(main_window)
     # On a batch load, this is harmful and breaks the logic.
     if swap_faces_state and not is_batch_load:
         # This will trigger a frame refresh via its own logic
@@ -808,6 +824,13 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
         progress_dialog.update_progress(3, total_steps, steps[2])
         _load_job_input_faces(main_window, data)
 
+        # Wait for async face loader so assignments can be restored reliably.
+        worker = main_window.input_faces_loader_worker
+        if isinstance(worker, ui_workers.InputFacesLoaderWorker) and worker.isRunning():
+            loop = QEventLoop()
+            worker.finished.connect(loop.quit)
+            loop.exec()
+
         progress_dialog.update_progress(4, total_steps, steps[3])
         _load_job_embeddings(main_window, data)
 
@@ -832,8 +855,13 @@ def load_job_workspace(main_window: "MainWindow", job_name: str):
 
         # After loading, check if any target faces were loaded
         if main_window.target_faces:
-            # Get the ID of the first loaded target face
-            first_face_id = list(main_window.target_faces.keys())[0]
+            # Restore previously selected target face when available.
+            saved_face_id = data.get("selected_target_face_id")
+            first_face_id = (
+                saved_face_id
+                if saved_face_id in main_window.target_faces
+                else list(main_window.target_faces.keys())[0]
+            )
 
             # Ensure this face is marked as selected internally
             main_window.selected_target_face_id = first_face_id
@@ -1000,8 +1028,13 @@ def _restore_workspace_from_snapshot(main_window: "MainWindow", data: dict):
 
         # After restoring, check if any target faces were restored
         if main_window.target_faces:
-            # Get the ID of the first restored target face
-            first_face_id = list(main_window.target_faces.keys())[0]
+            # Restore previously selected target face when available.
+            saved_face_id = data.get("selected_target_face_id")
+            first_face_id = (
+                saved_face_id
+                if saved_face_id in main_window.target_faces
+                else list(main_window.target_faces.keys())[0]
+            )
 
             # Ensure this face is marked as selected internally
             main_window.selected_target_face_id = first_face_id
@@ -1198,7 +1231,9 @@ def _serialize_job_data(main_window: "MainWindow") -> dict:
         },
         "job_marker_pairs": copy.deepcopy(main_window.job_marker_pairs),
         "selected_media_id": selected_media_id,
+        "selected_target_face_id": getattr(main_window, "selected_target_face_id", None),
         "swap_faces_enabled": main_window.swapfacesButton.isChecked(),
+        "edit_faces_enabled": main_window.editFacesButton.isChecked(),
         "last_target_media_folder_path": main_window.last_target_media_folder_path,
         "last_input_media_folder_path": main_window.last_input_media_folder_path,
         "loaded_embedding_filename": main_window.loaded_embedding_filename,

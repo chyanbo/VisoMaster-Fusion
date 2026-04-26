@@ -15,6 +15,7 @@ from app.ui.widgets.actions import common_actions as common_widget_actions
 from app.ui.widgets.actions import card_actions
 from app.ui.widgets.actions import list_view_actions
 from app.ui.widgets.actions import video_control_actions
+from app.ui.widgets.actions import control_actions
 from app.ui.widgets.actions import layout_actions
 from app.ui.widgets.actions import filter_actions
 from app.ui.widgets import ui_workers
@@ -753,7 +754,11 @@ def load_saved_workspace(
             layout_actions.fit_image_to_view_onchange(main_window)
 
             if main_window.target_faces:
-                list(main_window.target_faces.values())[0].click()
+                saved_face_id = data.get("selected_target_face_id")
+                if saved_face_id in main_window.target_faces:
+                    main_window.target_faces[saved_face_id].click()
+                else:
+                    list(main_window.target_faces.values())[0].click()
             else:
                 main_window.current_widget_parameters = data.get(
                     "current_widget_parameters", main_window.default_parameters.copy()
@@ -770,6 +775,13 @@ def load_saved_workspace(
                 common_widget_actions.set_widgets_values_using_face_id_parameters(
                     main_window, face_id=None
                 )
+
+            swap_faces_state = data.get("swap_faces_enabled", False)
+            main_window.swapfacesButton.setChecked(swap_faces_state)
+
+            edit_faces_state = data.get("edit_faces_enabled", False)
+            main_window.editFacesButton.setChecked(edit_faces_state)
+            control_actions.handle_face_editor_button_click(main_window)
 
             # Restore Window State
             window_state = data.get("window_state_data", {})
@@ -1082,6 +1094,9 @@ def save_current_workspace(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
         )
         else False,
+        "selected_target_face_id": getattr(main_window, "selected_target_face_id", None),
+        "swap_faces_enabled": main_window.swapfacesButton.isChecked(),
+        "edit_faces_enabled": main_window.editFacesButton.isChecked(),
         "input_faces_data": input_faces_data,
         "target_faces_data": target_faces_data,
         "embeddings_data": embeddings_data,
