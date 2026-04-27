@@ -22,6 +22,7 @@ from PySide6.QtCore import QObject, QTimer, Signal, Slot
 
 # Internal project imports
 from app.processors.workers.frame_worker import FrameWorker
+from app.processors.video_utils.sequential_detector import SequentialDetector
 from app.ui.widgets.actions import graphics_view_actions
 from app.ui.widgets.actions import common_actions as common_widget_actions
 from app.ui.widgets.actions import video_control_actions
@@ -165,10 +166,8 @@ class VideoProcessor(QObject):
         )
 
         # --- Sequential Detection State ---
-        self.last_detected_faces: list[dict] = []
-        self._smoothed_kps: dict[int, numpy.ndarray] = {}
-        self._smoothed_dense_kps: dict[int, numpy.ndarray] = {}
-        self._smoothed_dense_kps_203: dict[int, numpy.ndarray] = {}
+        # Initialize the decoupled detector state manager
+        self.sequential_detector = SequentialDetector(self.main_window)
 
         # --- Processing State Flags ---
         self.processing = False  # MASTER flag: True if playback, recording, or webcam stream is active
@@ -638,476 +637,6 @@ class VideoProcessor(QObject):
                     return "Issue scans are not supported while VR180 mode is enabled."
         return None
 
-    def _run_sequential_detection(
-        self,
-        frame_rgb: numpy.ndarray,
-        local_control_for_worker: dict,
-        local_params_for_worker: dict | None = None,
-        frame_tensor: torch.Tensor | None = None,
-        detector_control_override: dict | None = None,
-    ):
-        """
-        Runs face detection sequentially in the feeder thread to guarantee
-        flawless Temporal EMA smoothing and tracking (ByteTrack).
-        Includes a rigorous Sanitization Shield to prevent dtype('O') crashes.
-        """
-        # VR180 requires specialized spherical detection in the FrameWorker, skip sequential here.
-        if local_control_for_worker.get("VR180ModeEnableToggle", False):
-            return None, None, None, None
-
-        import contextlib
-
-        # VRAM Optimization: Get the current global stream instead of a custom one.
-        local_stream = (
-            torch.cuda.current_stream() if torch.cuda.is_available() else None
-        )
-        stream_context = (
-            torch.cuda.stream(local_stream)
-            if local_stream
-            else contextlib.nullcontext()
-        )
-
-        with stream_context:
-            use_landmark = local_control_for_worker.get("LandmarkDetectToggle", True)
-            landmark_mode = local_control_for_worker.get(
-                "LandmarkDetectModelSelection", "203"
-            )
-            from_points = local_control_for_worker.get("DetectFromPointsToggle", False)
-
-            # Check if LivePortrait features are enabled (they strictly require 203 landmarks)
-            master_edit_button = self.main_window.editFacesButton.isChecked()
-
-            requires_203 = False
-            if local_params_for_worker:
-                from collections.abc import Mapping
-
-                for face_id, face_params in local_params_for_worker.items():
-                    if isinstance(face_params, Mapping):
-                        is_face_editor_active = master_edit_button and face_params.get(
-                            "FaceEditorEnableToggle", False
-                        )
-                        is_expression_active = face_params.get(
-                            "FaceExpressionEnableBothToggle", False
-                        )
-                        is_auto_mouth_active = face_params.get(
-                            "AutoMouthExpressionEnableToggle", False
-                        )
-                        is_makeup_active = master_edit_button and (
-                            face_params.get("FaceMakeupEnableToggle", False)
-                            or face_params.get("HairMakeupEnableToggle", False)
-                            or face_params.get("EyeBrowsMakeupEnableToggle", False)
-                            or face_params.get("LipsMakeupEnableToggle", False)
-                        )
-
-                        if (
-                            is_face_editor_active
-                            or is_expression_active
-                            or is_auto_mouth_active
-                            or is_makeup_active
-                        ):
-                            requires_203 = True
-                            break
-
-            # DO NOT override user choice! We preserve use_landmark and landmark_mode.
-            device = self.main_window.models_processor.device
-            owns_frame_tensor = frame_tensor is None
-            if frame_tensor is None:
-                frame_tensor = (
-                    torch.from_numpy(frame_rgb)
-                    .to(device, non_blocking=True)
-                    .permute(2, 0, 1)  # Convert [H, W, C] -> [C, H, W]
-                )
-
-            # 1. Primary Detection (respecting User's UI choice)
-            bboxes, kpss_5, kpss = self.main_window.models_processor.run_detect(
-                frame_tensor,
-                local_control_for_worker.get("DetectorModelSelection", "RetinaFace"),
-                max_num=int(local_control_for_worker.get("MaxFacesToDetectSlider", 20)),
-                score=local_control_for_worker.get("DetectorScoreSlider", 50) / 100.0,
-                input_size=(512, 512),
-                use_landmark_detection=use_landmark,
-                landmark_detect_mode=landmark_mode,
-                landmark_score=local_control_for_worker.get(
-                    "LandmarkDetectScoreSlider", 50
-                )
-                / 100.0,
-                from_points=from_points,
-                rotation_angles=[0]
-                if not local_control_for_worker.get("AutoRotationToggle", False)
-                else [0, 90, 180, 270],
-                use_mean_eyes=local_control_for_worker.get(
-                    "LandmarkMeanEyesToggle", False
-                ),
-                control_override=detector_control_override,
-            )
-
-            # 2. Smart Double-Scan for 203 points
-            kpss_203 = None
-            if requires_203:
-                if use_landmark and landmark_mode == "203":
-                    # OPTIMIZATION: User already selected 203. Duplicate reference. Zero CUDA cost.
-                    kpss_203 = kpss
-                else:
-                    # Execute second pass specifically for advanced features
-                    bboxes_203, _, raw_kpss_203 = (
-                        self.main_window.models_processor.run_detect(
-                            frame_tensor,
-                            local_control_for_worker.get(
-                                "DetectorModelSelection", "RetinaFace"
-                            ),
-                            max_num=int(
-                                local_control_for_worker.get(
-                                    "MaxFacesToDetectSlider", 20
-                                )
-                            ),
-                            score=local_control_for_worker.get(
-                                "DetectorScoreSlider", 50
-                            )
-                            / 100.0,
-                            input_size=(512, 512),
-                            use_landmark_detection=True,
-                            landmark_detect_mode="203",
-                            landmark_score=local_control_for_worker.get(
-                                "LandmarkDetectScoreSlider", 50
-                            )
-                            / 100.0,
-                            from_points=True,  # Force from_points for feature stability
-                            rotation_angles=[0]
-                            if not local_control_for_worker.get(
-                                "AutoRotationToggle", False
-                            )
-                            else [0, 90, 180, 270],
-                            use_mean_eyes=local_control_for_worker.get(
-                                "LandmarkMeanEyesToggle", False
-                            ),
-                            bypass_bytetrack=True,  # Prevent double-incrementing the object tracker
-                            control_override=detector_control_override,
-                        )
-                    )
-
-                    # ByteTrack (Pass 1) sorts/filters bboxes by temporal ID.
-                    # Pass 2 (bypass_bytetrack=True) returns unsorted detections.
-                    # We must align them spatially to prevent mixing up faces.
-                    if isinstance(bboxes, numpy.ndarray) and bboxes.shape[0] > 0:
-                        aligned_kpss_203 = numpy.zeros(
-                            (bboxes.shape[0], 203, 2), dtype=numpy.float32
-                        )
-
-                        if (
-                            isinstance(bboxes_203, numpy.ndarray)
-                            and bboxes_203.shape[0] > 0
-                            and isinstance(raw_kpss_203, numpy.ndarray)
-                        ):
-                            # Calculate centroids for Pass 2 faces
-                            c2_x = (bboxes_203[:, 0] + bboxes_203[:, 2]) / 2.0
-                            c2_y = (bboxes_203[:, 1] + bboxes_203[:, 3]) / 2.0
-
-                            # Track assigned faces to prevent many-to-one mapping
-                            available_mask = numpy.ones(bboxes_203.shape[0], dtype=bool)
-
-                            for i, box in enumerate(bboxes):
-                                # Centroid for Pass 1 face
-                                c_x = (box[0] + box[2]) / 2.0
-                                c_y = (box[1] + box[3]) / 2.0
-
-                                # Dimensions of the current face
-                                face_width = box[2] - box[0]
-                                face_height = box[3] - box[1]
-
-                                # Dynamic tolerance: 30% of the face's largest dimension
-                                dynamic_tolerance = 0.3 * max(face_width, face_height)
-
-                                # Filter distances to only consider UNASSIGNED Pass 2 faces
-                                valid_indices = numpy.where(available_mask)[0]
-                                if len(valid_indices) == 0:
-                                    break  # No more unassigned 203-landmarks available
-
-                                available_c2_x = c2_x[valid_indices]
-                                available_c2_y = c2_y[valid_indices]
-
-                                # Find closest matching face from available Pass 2 faces
-                                dists = numpy.sqrt(
-                                    (available_c2_x - c_x) ** 2
-                                    + (available_c2_y - c_y) ** 2
-                                )
-                                local_best_idx = numpy.argmin(dists)
-
-                                # Validation based on dynamic scale
-                                if dists[local_best_idx] < dynamic_tolerance:
-                                    global_best_idx = valid_indices[local_best_idx]
-                                    aligned_kpss_203[i] = raw_kpss_203[global_best_idx]
-                                    available_mask[global_best_idx] = (
-                                        False  # Mark as consumed
-                                    )
-
-                        kpss_203 = aligned_kpss_203
-                    else:
-                        kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
-
-            # Free up VRAM immediately since the tensor is no longer needed in this thread
-            if owns_frame_tensor:
-                del frame_tensor
-
-            # CUDA Stream Sync: Safely wait for GPU on the current stream
-            if local_stream:
-                local_stream.synchronize()
-
-        # TensorRT and ONNX reuse memory buffers for maximum performance.
-        # If we do not copy these arrays, the feeder thread will overwrite the memory
-        # of the frames waiting in the queue, causing erratic swap loss!
-        if isinstance(bboxes, numpy.ndarray):
-            bboxes = bboxes.copy()
-        if isinstance(kpss_5, numpy.ndarray):
-            kpss_5 = kpss_5.copy()
-        if isinstance(kpss, numpy.ndarray):
-            kpss = kpss.copy()
-        if isinstance(kpss_203, numpy.ndarray):
-            kpss_203 = kpss_203.copy()
-
-        # Ensure 'bboxes' and keypoints are strictly valid float32 arrays and not 'object'.
-        if isinstance(bboxes, numpy.ndarray):
-            if bboxes.dtype == object:
-                try:
-                    bboxes = bboxes.astype(numpy.float32)
-                except Exception:
-                    # If conversion fails (ragged array), purge the corrupted detections
-                    bboxes = numpy.empty((0, 4), dtype=numpy.float32)
-
-            # Filter out NaNs, Infs, and validate shape integrity
-            if bboxes.size > 0 and bboxes.ndim == 2 and bboxes.shape[1] == 4:
-                valid_mask = numpy.isfinite(bboxes).all(axis=1)
-
-                # If there are any corrupted rows, filter them across all arrays
-                if not valid_mask.all():
-                    bboxes = bboxes[valid_mask]
-                    # Safely align kpss_5 if dimensions match
-                    if isinstance(kpss_5, numpy.ndarray) and kpss_5.shape[0] == len(
-                        valid_mask
-                    ):
-                        kpss_5 = kpss_5[valid_mask]
-                    # Safely align dense kpss if dimensions match
-                    if isinstance(kpss, numpy.ndarray) and kpss.shape[0] == len(
-                        valid_mask
-                    ):
-                        kpss = kpss[valid_mask]
-                    # Safely align dense kpss_203 if dimensions match
-                    if isinstance(kpss_203, numpy.ndarray) and kpss_203.shape[0] == len(
-                        valid_mask
-                    ):
-                        kpss_203 = kpss_203[valid_mask]
-            else:
-                bboxes = numpy.empty((0, 4), dtype=numpy.float32)
-        else:
-            bboxes = numpy.empty((0, 4), dtype=numpy.float32)
-
-        # If the sanitization purged the bboxes, we MUST purge the keypoints too.
-        # Otherwise, the FrameWorker receives mismatched arrays and skips the face.
-        if bboxes.shape[0] == 0:
-            if isinstance(kpss_5, numpy.ndarray):
-                kpss_5 = numpy.empty((0, 5, 2), dtype=numpy.float32)
-            if isinstance(kpss, numpy.ndarray):
-                kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)  # Fallback shape
-            if isinstance(kpss_203, numpy.ndarray):
-                kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
-
-        # 2. Update tracking state for the next sequential frame
-        detected_for_state = []
-        # Updated condition to use the sanitized bboxes array instead of checking isinstance again
-        if bboxes.shape[0] > 0:
-            for i in range(len(bboxes)):
-                detected_for_state.append({"bbox": bboxes[i], "score": 1.0})
-        self.last_detected_faces = detected_for_state
-
-        # Get toggle value to enable smoothing
-        is_smoothing_enabled = local_control_for_worker.get(
-            "KPSSmoothingEnableToggle", True
-        )
-
-        # 3. Apply Sequential EMA smoothing perfectly in order
-        if is_smoothing_enabled:
-            img_h_for_kps, img_w_for_kps = frame_rgb.shape[0], frame_rgb.shape[1]
-
-            if isinstance(kpss_5, numpy.ndarray) and kpss_5.shape[0] > 0:
-                kpss_5 = kpss_5.copy()
-                n_faces = kpss_5.shape[0]
-                new_smoothed_kps = {}
-                new_smoothed_dense_kps = {}
-                new_smoothed_dense_kps_203 = {}
-
-                valid_kpss = cast(numpy.ndarray, kpss)
-                valid_kpss_203 = cast(numpy.ndarray, kpss_203)
-
-                dense_kps_count = (
-                    int(kpss.shape[0]) if isinstance(kpss, numpy.ndarray) else 0
-                )
-                has_dense_kps = dense_kps_count > 0
-                if has_dense_kps:
-                    valid_kpss = valid_kpss.copy()
-                    kpss = valid_kpss
-
-                dense_kps_203_count = (
-                    int(kpss_203.shape[0]) if isinstance(kpss_203, numpy.ndarray) else 0
-                )
-                has_dense_kps_203 = dense_kps_203_count > 0
-                if has_dense_kps_203:
-                    valid_kpss_203 = valid_kpss_203.copy()
-                    kpss_203 = valid_kpss_203
-
-                frame_number_for_warning = int(
-                    getattr(self, "current_frame_number", -1)
-                )
-                if isinstance(kpss, numpy.ndarray) and dense_kps_count != n_faces:
-                    print(
-                        f"[WARN] Dense KPS count mismatch on frame {frame_number_for_warning}: "
-                        f"kpss_5={n_faces}, dense_kps={dense_kps_count}. "
-                        "Skipping dense smoothing for missing faces."
-                    )
-                if (
-                    isinstance(kpss_203, numpy.ndarray)
-                    and dense_kps_203_count != n_faces
-                ):
-                    print(
-                        f"[WARN] Dense KPS_203 count mismatch on frame {frame_number_for_warning}: "
-                        f"kpss_5={n_faces}, dense_kps_203={dense_kps_203_count}. "
-                        "Skipping dense 203 smoothing for missing faces."
-                    )
-
-                for _i in range(n_faces):
-                    _raw = kpss_5[_i]
-                    dense_kps_available = has_dense_kps and _i < dense_kps_count
-                    dense_kps_203_available = (
-                        has_dense_kps_203 and _i < dense_kps_203_count
-                    )
-
-                    if (
-                        _raw is None
-                        or _raw.size == 0
-                        or numpy.any(numpy.isnan(_raw))
-                        or numpy.any(numpy.isinf(_raw))
-                    ):
-                        continue
-                    if (
-                        numpy.any(_raw[:, 0] < 0)
-                        or numpy.any(_raw[:, 0] >= img_w_for_kps)
-                        or numpy.any(_raw[:, 1] < 0)
-                        or numpy.any(_raw[:, 1] >= img_h_for_kps)
-                    ):
-                        continue
-
-                    _centroid_raw = numpy.mean(_raw, axis=0)
-                    _best_match_key = None
-                    _min_dist = float("inf")
-
-                    # Calculate adaptive threshold based on face dimensions
-                    # Using 40% of the largest face dimension ensures scale-invariance.
-                    _face_w = bboxes[_i][2] - bboxes[_i][0]
-                    _face_h = bboxes[_i][3] - bboxes[_i][1]
-                    _adaptive_threshold = max(30.0, max(_face_w, _face_h) * 0.4)
-
-                    # Match current face to previous faces spatially
-                    for _k, _prev_kps in self._smoothed_kps.items():
-                        _centroid_prev = numpy.mean(_prev_kps, axis=0)
-                        _dist = numpy.linalg.norm(_centroid_raw - _centroid_prev)
-
-                        # Use the dynamic threshold instead of the hardcoded 50.0
-                        if _dist < _adaptive_threshold and _dist < _min_dist:
-                            _min_dist = float(_dist)
-                            _best_match_key = _k
-
-                    if _best_match_key is not None:
-                        # Adaptive Alpha (Smart EMA) using slider value
-                        base_alpha = (
-                            local_control_for_worker.get("KPSEmaAlphaSlider", 35)
-                            / 100.0
-                        )
-
-                        movement_factor = min(1.0, _min_dist / 15.0)
-                        dynamic_alpha = base_alpha + movement_factor * (
-                            1.0 - base_alpha
-                        )
-
-                        # Smoothing on KPS 5
-                        new_smoothed_kps[_i] = (
-                            dynamic_alpha * _raw
-                            + (1.0 - dynamic_alpha)
-                            * self._smoothed_kps[_best_match_key]
-                        )
-                        del self._smoothed_kps[_best_match_key]
-
-                        # Smoothing on Dense KPS
-                        if dense_kps_available:
-                            if _best_match_key in self._smoothed_dense_kps:
-                                new_smoothed_dense_kps[_i] = (
-                                    dynamic_alpha * valid_kpss[_i]
-                                    + (1.0 - dynamic_alpha)
-                                    * self._smoothed_dense_kps[_best_match_key]
-                                )
-                                del self._smoothed_dense_kps[_best_match_key]
-                            else:
-                                new_smoothed_dense_kps[_i] = valid_kpss[_i].copy()
-
-                        # Smoothing on Dense KPS 203
-                        if has_dense_kps_203:
-                            if dense_kps_203_available:
-                                # Check if landmarks are valid (not just the initialized zeros)
-                                is_valid_203 = not numpy.all(valid_kpss_203[_i] == 0)
-
-                                if is_valid_203:
-                                    if _best_match_key in self._smoothed_dense_kps_203:
-                                        new_smoothed_dense_kps_203[_i] = (
-                                            dynamic_alpha * valid_kpss_203[_i]
-                                            + (1.0 - dynamic_alpha)
-                                            * self._smoothed_dense_kps_203[
-                                                _best_match_key
-                                            ]
-                                        )
-                                        del self._smoothed_dense_kps_203[
-                                            _best_match_key
-                                        ]
-                                    else:
-                                        new_smoothed_dense_kps_203[_i] = valid_kpss_203[
-                                            _i
-                                        ].copy()
-                                else:
-                                    # Pass 2 missed the face. Use last known landmarks to prevent jumping to (0,0)
-                                    if _best_match_key in self._smoothed_dense_kps_203:
-                                        new_smoothed_dense_kps_203[_i] = (
-                                            self._smoothed_dense_kps_203[
-                                                _best_match_key
-                                            ].copy()
-                                        )
-                                        valid_kpss_203[_i] = new_smoothed_dense_kps_203[
-                                            _i
-                                        ]  # Overwrite zeros for downstream
-
-                    else:
-                        new_smoothed_kps[_i] = _raw.copy()
-                        if dense_kps_available:
-                            new_smoothed_dense_kps[_i] = valid_kpss[_i].copy()
-                        if has_dense_kps_203:
-                            if dense_kps_203_available:
-                                new_smoothed_dense_kps_203[_i] = valid_kpss_203[
-                                    _i
-                                ].copy()
-
-                    kpss_5[_i] = new_smoothed_kps[_i]
-                    if dense_kps_available:
-                        valid_kpss[_i] = new_smoothed_dense_kps[_i]
-                    if has_dense_kps_203:
-                        if dense_kps_203_available:
-                            valid_kpss_203[_i] = new_smoothed_dense_kps_203[_i]
-
-                self._smoothed_kps = new_smoothed_kps
-                self._smoothed_dense_kps = new_smoothed_dense_kps
-                self._smoothed_dense_kps_203 = new_smoothed_dense_kps_203
-        else:
-            # Safe Clear if disabled
-            self._smoothed_kps.clear()
-            self._smoothed_dense_kps.clear()
-            self._smoothed_dense_kps_203.clear()
-
-        return bboxes, kpss_5, kpss, kpss_203
-
     def _feed_video_loop(self):
         """
         Unified feeder logic for standard video playback AND segment recording.
@@ -1322,23 +851,23 @@ class VideoProcessor(QObject):
 
                 if len(self.main_window.target_faces) > 0:
                     # If Faces present run detect
-                    bboxes, kpss_5, kpss, kpss_203 = self._run_sequential_detection(
-                        frame_rgb, local_control_for_worker, local_params_for_worker
+                    is_master_edit_active = self.main_window.editFacesButton.isChecked()
+                    bboxes, kpss_5, kpss, kpss_203 = self.sequential_detector.run(
+                        frame_rgb=frame_rgb,
+                        local_control_for_worker=local_control_for_worker,
+                        local_params_for_worker=local_params_for_worker,
+                        is_master_edit_active=is_master_edit_active,
+                        frame_number=self.current_frame_number,
                     )
                 else:
-                    # Bypass : No Faces present, skip with empy arrays
+                    # Bypass : No Faces present, skip with empty arrays
                     bboxes = numpy.empty((0, 4), dtype=numpy.float32)
                     kpss_5 = numpy.empty((0, 5, 2), dtype=numpy.float32)
                     kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
                     kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
 
-                    # Reset the arrays for clean retargeting
-                    if self.last_detected_faces:
-                        self.last_detected_faces.clear()
-                        self._smoothed_kps.clear()
-                        self._smoothed_dense_kps.clear()
-                        self._smoothed_dense_kps_203.clear()
-                        self.main_window.models_processor.face_detectors.reset_tracker()
+                    # Reset the arrays for clean retargeting via the new manager
+                    self.sequential_detector.reset_state()
 
                 # The worker will use the feeder's state *from this exact moment*
                 task = (
@@ -1414,8 +943,13 @@ class VideoProcessor(QObject):
 
                 # --- Inject Sequential Detection ---
                 if len(self.main_window.target_faces) > 0:
-                    bboxes, kpss_5, kpss, kpss_203 = self._run_sequential_detection(
-                        frame_rgb, local_control_for_worker, local_params_for_worker
+                    is_master_edit_active = self.main_window.editFacesButton.isChecked()
+                    bboxes, kpss_5, kpss, kpss_203 = self.sequential_detector.run(
+                        frame_rgb=frame_rgb,
+                        local_control_for_worker=local_control_for_worker,
+                        local_params_for_worker=local_params_for_worker,
+                        is_master_edit_active=is_master_edit_active,
+                        frame_number=0,  # Webcam doesn't have frame numbers
                     )
                 else:
                     # Bypass
@@ -1424,12 +958,8 @@ class VideoProcessor(QObject):
                     kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
                     kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
 
-                    if self.last_detected_faces:
-                        self.last_detected_faces.clear()
-                        self._smoothed_kps.clear()
-                        self._smoothed_dense_kps.clear()
-                        self._smoothed_dense_kps_203.clear()
-                        self.main_window.models_processor.face_detectors.reset_tracker()
+                    # Reset tracking state securely
+                    self.sequential_detector.reset_state()
 
                 # Create the 8-tuple task
                 task = (
@@ -2323,8 +1853,8 @@ class VideoProcessor(QObject):
         self.preroll_timer.stop()
         self.stop_live_sound()
 
-        # Face tracker defaults (use thread-safe reset)
-        self.main_window.models_processor.face_detectors.reset_tracker()
+        # Face tracker defaults (use thread-safe reset from new manager)
+        self.sequential_detector.reset_state()
 
         # 3a. Release the capture object to unblock the feeder.
         # The feeder calls read_frame() in a loop; releasing here causes the next read
@@ -2397,8 +1927,9 @@ class VideoProcessor(QObject):
         self.temp_segment_files = []
         self.current_segment_end_frame = None
         self.playback_display_start_time = 0.0
-        self.last_detected_faces.clear()
-        self._smoothed_kps.clear()
+
+        # We ensure state is completely cleared on full abort
+        self.sequential_detector.reset_state()
 
         # 8. RE-OPEN media capture IMMEDIATELY.
         # VP-34: This is critical. By ensuring media_capture is re-opened before
@@ -3529,10 +3060,7 @@ class VideoProcessor(QObject):
 
     def _reset_issue_scan_sequential_state(self) -> None:
         """Clear scan-local sequential detection state at tracking boundaries."""
-        self.last_detected_faces = []
-        self._smoothed_kps = {}
-        self._smoothed_dense_kps = {}
-        self._smoothed_dense_kps_203 = {}
+        self.sequential_detector.reset_state()
 
     def _prepare_issue_scan_match_context(
         self,
@@ -3758,16 +3286,20 @@ class VideoProcessor(QObject):
                 IssueScanTargetSnapshot,
                 dict(target_faces_snapshot),
             )
+
+        # Snapshot current detector state to restore it safely after the scan
         previous_last_detected_faces = copy.deepcopy(
-            getattr(self, "last_detected_faces", [])
+            self.sequential_detector.last_detected_faces
         )
-        previous_smoothed_kps = copy.deepcopy(getattr(self, "_smoothed_kps", {}))
+        previous_smoothed_kps = copy.deepcopy(self.sequential_detector._smoothed_kps)
         previous_smoothed_dense_kps = copy.deepcopy(
-            getattr(self, "_smoothed_dense_kps", {})
+            self.sequential_detector._smoothed_dense_kps
         )
         previous_smoothed_dense_kps_203 = copy.deepcopy(
-            getattr(self, "_smoothed_dense_kps_203", {})
+            self.sequential_detector._smoothed_dense_kps_203
         )
+        is_master_edit_snapshot = self.main_window.editFacesButton.isChecked()
+
         total_frames_scanned = 0
         tracking_enabled = False
         issue_frames_by_face: dict[str, set[int]] = {
@@ -3902,12 +3434,15 @@ class VideoProcessor(QObject):
                         .permute(2, 0, 1)
                     )
                     self.current_frame_number = frame_number
-                    bboxes, kpss_5, _, _ = self._run_sequential_detection(
-                        frame_rgb,
-                        local_control,
-                        local_params,
+
+                    bboxes, kpss_5, _, _ = self.sequential_detector.run(
+                        frame_rgb=frame_rgb,
+                        local_control_for_worker=local_control,
+                        local_params_for_worker=local_params,
+                        is_master_edit_active=is_master_edit_snapshot,
                         frame_tensor=frame_tensor,
                         detector_control_override=local_control,
+                        frame_number=frame_number,
                     )
                     detected_embeddings: list[numpy.ndarray] = []
                     if (
@@ -3963,10 +3498,14 @@ class VideoProcessor(QObject):
 
             return build_result(False)
         finally:
-            self.last_detected_faces = previous_last_detected_faces
-            self._smoothed_kps = previous_smoothed_kps
-            self._smoothed_dense_kps = previous_smoothed_dense_kps
-            self._smoothed_dense_kps_203 = previous_smoothed_dense_kps_203
+            # Safely restore the original detector state
+            self.sequential_detector.last_detected_faces = previous_last_detected_faces
+            self.sequential_detector._smoothed_kps = previous_smoothed_kps
+            self.sequential_detector._smoothed_dense_kps = previous_smoothed_dense_kps
+            self.sequential_detector._smoothed_dense_kps_203 = (
+                previous_smoothed_dense_kps_203
+            )
+
             if tracking_enabled:
                 self.main_window.models_processor.face_detectors.reset_tracker()
             self.current_frame_number = (
