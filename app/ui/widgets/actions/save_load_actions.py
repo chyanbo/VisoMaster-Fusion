@@ -755,10 +755,49 @@ def load_saved_workspace(
 
             if main_window.target_faces:
                 saved_face_id = data.get("selected_target_face_id")
-                if saved_face_id in main_window.target_faces:
-                    main_window.target_faces[saved_face_id].click()
-                else:
-                    list(main_window.target_faces.values())[0].click()
+                first_face_id = (
+                    saved_face_id
+                    if saved_face_id in main_window.target_faces
+                    else list(main_window.target_faces.keys())[0]
+                )
+
+                main_window.selected_target_face_id = first_face_id
+                first_face_button = main_window.target_faces.get(first_face_id)
+
+                if first_face_button:
+                    first_face_button.setChecked(True)
+                    main_window.cur_selected_target_face_button = first_face_button
+
+                    for target_face_id, target_face_button in main_window.target_faces.items():
+                        if target_face_id != first_face_id:
+                            target_face_button.setChecked(False)
+
+                    card_actions.uncheck_all_input_faces(main_window)
+                    card_actions.uncheck_all_merged_embeddings(main_window)
+
+                    for input_face_id in first_face_button.assigned_input_faces.keys():
+                        input_face_button = main_window.input_faces.get(input_face_id)
+                        if input_face_button:
+                            input_face_button.setChecked(True)
+
+                    for embedding_id in first_face_button.assigned_merged_embeddings.keys():
+                        embed_button = main_window.merged_embeddings.get(embedding_id)
+                        if embed_button:
+                            embed_button.setChecked(True)
+
+                    main_window.current_kv_tensors_map = getattr(
+                        first_face_button, "assigned_kv_map", None
+                    )
+
+                video_control_actions.refresh_issue_frames_for_selected_face(main_window)
+                video_control_actions.update_scan_review_button_states(main_window)
+
+                common_widget_actions.set_widgets_values_using_face_id_parameters(
+                    main_window, face_id=first_face_id
+                )
+                main_window.current_widget_parameters = main_window.parameters[
+                    first_face_id
+                ].copy()
             else:
                 main_window.current_widget_parameters = data.get(
                     "current_widget_parameters", main_window.default_parameters.copy()
