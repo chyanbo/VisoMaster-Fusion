@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Optional, Dict, Any, cast, TypedDict
 import os
 import shutil
 import time
+import hashlib
 from PySide6.QtCore import QThread, Signal, Slot, QMetaObject, Qt, QEventLoop
 from PySide6 import QtWidgets
 from PySide6.QtWidgets import QMessageBox
@@ -1956,6 +1957,18 @@ class JobProcessor(QThread):
             self.job_failed_signal.emit(job_name, f"Failed to load job file: {e}")
             return None
 
+    @staticmethod
+    def _embedding_signature(embedding_data: dict[str, Any]) -> str:
+        """Build a stable signature so equivalent embeddings across jobs are loaded once."""
+        embedding_name = embedding_data.get("embedding_name", embedding_data.get("name", ""))
+        embedding_store = embedding_data.get("embedding_store", {})
+        payload = {
+            "embedding_name": embedding_name,
+            "embedding_store": embedding_store,
+        }
+        serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
     def _analyze_job_batch(self) -> Optional[MasterData]:
         """
         (SMART ANALYSIS & VALIDATION) Reads all job JSONs in the batch.
@@ -1973,6 +1986,7 @@ class JobProcessor(QThread):
         seen_media_ids = set()
         seen_face_ids = set()
         seen_embed_ids = set()
+        seen_embed_signatures = set()
 
         valid_job_data_list = []  # List for jobs that pass validation
         self.skipped_jobs.clear()  # Clear skipped list for this batch
@@ -2032,12 +2046,22 @@ class JobProcessor(QThread):
             # Collect embeddings
             all_embeddings_in_job = data.get("embeddings_data", {})
             for embed_id in required_embed_ids:
-                if embed_id not in seen_embed_ids:
-                    # We know embed_id exists in all_embeddings_in_job from validation
-                    master_data["embeddings_data"][embed_id] = all_embeddings_in_job[
-                        embed_id
-                    ]
+                if embed_id in seen_embed_ids:
+                    continue
+
+                embedding_payload = all_embeddings_in_job.get(embed_id)
+                if not embedding_payload:
+                    continue
+
+                embed_signature = self._embedding_signature(embedding_payload)
+                if embed_signature in seen_embed_signatures:
                     seen_embed_ids.add(embed_id)
+                    continue
+
+                # Keep the first occurrence, skip equivalent duplicates from other jobs.
+                master_data["embeddings_data"][embed_id] = embedding_payload
+                seen_embed_ids.add(embed_id)
+                seen_embed_signatures.add(embed_signature)
 
             # --- 3. Add valid job to processing list ---
             valid_job_data_list.append(data)
