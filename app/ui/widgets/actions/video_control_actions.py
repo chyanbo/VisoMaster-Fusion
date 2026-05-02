@@ -27,6 +27,72 @@ from app.ui.widgets import widget_components
 from app.ui.widgets import ui_workers
 
 
+def _get_selected_embedding_name(main_window: "MainWindow") -> str:
+    target_face_button = getattr(main_window, "cur_selected_target_face_button", None)
+    assigned_embeddings = (
+        getattr(target_face_button, "assigned_merged_embeddings", None)
+        if target_face_button
+        else None
+    )
+    embedding_id = next(iter(assigned_embeddings), None) if assigned_embeddings else None
+    embedding_button = (
+        main_window.merged_embeddings.get(embedding_id)
+        if embedding_id is not None
+        else None
+    )
+    return (
+        str(getattr(embedding_button, "embedding_name", "")).strip()
+        if embedding_button is not None
+        else ""
+    )
+
+
+def _get_target_media_root(main_window: "MainWindow") -> str:
+    target_path_line_edit = getattr(main_window, "targetVideosPathLineEdit", None)
+    if target_path_line_edit is not None and hasattr(target_path_line_edit, "text"):
+        root = str(target_path_line_edit.text() or "").strip()
+        if root:
+            return os.path.abspath(root)
+    fallback = str(getattr(main_window, "last_target_media_folder_path", "") or "").strip()
+    return os.path.abspath(fallback) if fallback else ""
+
+
+def _get_relative_source_parent(media_path: str, source_root: str) -> str:
+    if not media_path or not source_root:
+        return ""
+    try:
+        media_parent = os.path.abspath(os.path.dirname(str(media_path)))
+        root_abs = os.path.abspath(source_root)
+        common = os.path.commonpath([media_parent, root_abs])
+        if os.path.normcase(common) != os.path.normcase(root_abs):
+            return ""
+        relative_parent = os.path.relpath(media_parent, root_abs)
+        if relative_parent in ("", ".") or relative_parent.startswith(".."):
+            return ""
+        return relative_parent
+    except Exception:
+        return ""
+
+
+def resolve_output_folder(main_window: "MainWindow", media_path: str) -> str:
+    output_folder = str(main_window.control.get("OutputMediaFolder", "")).strip()
+
+    if main_window.control.get("OutputToTargetLocationToggle", False):
+        output_folder = os.path.dirname(str(media_path))
+    elif main_window.control.get("PreserveOutputDirectoryStructureToggle", False):
+        source_root = _get_target_media_root(main_window)
+        relative_parent = _get_relative_source_parent(media_path, source_root)
+        if relative_parent:
+            output_folder = os.path.join(output_folder, relative_parent)
+
+    if main_window.control.get("ClusterOutputBySourceToggle", False):
+        embedding_name = _get_selected_embedding_name(main_window)
+        if embedding_name:
+            output_folder = os.path.join(output_folder, embedding_name)
+
+    return output_folder
+
+
 def set_up_video_seek_line_edit(main_window: "MainWindow"):
     """Configures the video seek line-edit widget: centres text and restricts input to valid frame numbers."""
     video_processor = main_window.video_processor
@@ -2420,33 +2486,9 @@ def save_current_frame_to_file(main_window: "MainWindow"):
             main_window,
         )
         return
-    output_folder = str(main_window.control.get("OutputMediaFolder", "")).strip()
-    if main_window.control.get("OutputToTargetLocationToggle", False):
-        output_folder = os.path.dirname(str(main_window.video_processor.media_path))
-    if main_window.control.get("ClusterOutputBySourceToggle", False):
-        target_face_button = getattr(
-            main_window, "cur_selected_target_face_button", None
-        )
-        assigned_embeddings = (
-            getattr(target_face_button, "assigned_merged_embeddings", None)
-            if target_face_button
-            else None
-        )
-        embedding_id = (
-            next(iter(assigned_embeddings), None) if assigned_embeddings else None
-        )
-        embedding_button = (
-            main_window.merged_embeddings.get(embedding_id)
-            if embedding_id is not None
-            else None
-        )
-        embedding_name = (
-            str(getattr(embedding_button, "embedding_name", "")).strip()
-            if embedding_button is not None
-            else ""
-        )
-        if embedding_name:
-            output_folder = os.path.join(output_folder, embedding_name)
+    output_folder = resolve_output_folder(
+        main_window, str(main_window.video_processor.media_path)
+    )
     frame = main_window.video_processor.current_frame.copy()
     image_format = "image"
     if main_window.control["ImageFormatToggle"]:
@@ -2751,39 +2793,7 @@ def process_batch_images(main_window: "MainWindow", process_all_faces: bool):
                     image_format = "image"
                     if main_window.control["ImageFormatToggle"]:
                         image_format = "jpegimage"
-                    output_folder = str(
-                        main_window.control.get("OutputMediaFolder", "")
-                    ).strip()
-                    if main_window.control.get("OutputToTargetLocationToggle", False):
-                        output_folder = os.path.dirname(str(media_path))
-                    if main_window.control.get("ClusterOutputBySourceToggle", False):
-                        target_face_button = getattr(
-                            main_window, "cur_selected_target_face_button", None
-                        )
-                        assigned_embeddings = (
-                            getattr(
-                                target_face_button, "assigned_merged_embeddings", None
-                            )
-                            if target_face_button
-                            else None
-                        )
-                        embedding_id = (
-                            next(iter(assigned_embeddings), None)
-                            if assigned_embeddings
-                            else None
-                        )
-                        embedding_button = (
-                            main_window.merged_embeddings.get(embedding_id)
-                            if embedding_id is not None
-                            else None
-                        )
-                        embedding_name = (
-                            str(getattr(embedding_button, "embedding_name", "")).strip()
-                            if embedding_button is not None
-                            else ""
-                        )
-                        if embedding_name:
-                            output_folder = os.path.join(output_folder, embedding_name)
+                    output_folder = resolve_output_folder(main_window, str(media_path))
                     os.makedirs(output_folder, exist_ok=True)
                     save_filename = misc_helpers.get_output_file_path(
                         media_path,

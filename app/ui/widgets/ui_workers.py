@@ -34,6 +34,7 @@ class TargetMediaLoaderWorker(qtc.QThread):
         folder_name=False,
         files_list=None,
         media_ids=None,
+        sort_files_list_by_name=True,
         webcam_mode=False,
         parent=None,
     ):
@@ -42,6 +43,7 @@ class TargetMediaLoaderWorker(qtc.QThread):
         self.folder_name = folder_name
         self.files_list = files_list or []
         self.media_ids = media_ids or []
+        self.sort_files_list_by_name = sort_files_list_by_name
         self.webcam_mode = webcam_mode
         self._running = True  # Flag to control the running state
 
@@ -54,6 +56,14 @@ class TargetMediaLoaderWorker(qtc.QThread):
             self.load_webcams()
         self.finished.emit()
 
+    def _iter_sorted_recursive_media_files(self, folder_name: str):
+        for dirpath, dirnames, filenames in os.walk(folder_name, topdown=True):
+            dirnames.sort(key=str.lower)
+            for filename in sorted(filenames, key=str.lower):
+                media_file_path = os.path.abspath(os.path.join(dirpath, filename))
+                if misc_helpers.get_file_type(media_file_path):
+                    yield media_file_path
+
     def load_videos_and_images_from_folder(self, folder_name):
         # Initially hide the placeholder text
         self.main_window.placeholder_update_signal.emit(
@@ -62,13 +72,16 @@ class TargetMediaLoaderWorker(qtc.QThread):
         recursive_toggle = self.main_window.control.get(
             "TargetMediaFolderRecursiveToggle", False
         )
-        video_files = misc_helpers.get_video_files(folder_name, recursive_toggle)
-        image_files = misc_helpers.get_image_files(folder_name, recursive_toggle)
 
         i = 0
-        media_files = video_files + image_files
-        # Sorting the list
-        media_files.sort(key=lambda x: os.path.basename(str(x)).lower())
+        if recursive_toggle:
+            media_files = self._iter_sorted_recursive_media_files(folder_name)
+        else:
+            video_files = misc_helpers.get_video_files(folder_name, recursive_toggle)
+            image_files = misc_helpers.get_image_files(folder_name, recursive_toggle)
+            media_files = video_files + image_files
+            # Sorting the list
+            media_files.sort(key=lambda x: os.path.basename(str(x)).lower())
 
         for media_file in media_files:
             if not self._running:  # Check if the thread is still running
@@ -76,7 +89,10 @@ class TargetMediaLoaderWorker(qtc.QThread):
             media_file_path = os.path.join(folder_name, media_file)
             file_type = misc_helpers.get_file_type(media_file_path)
             q_image = common_widget_actions.extract_frame_as_image(
-                self.main_window, media_file_path, file_type
+                self.main_window,
+                media_file_path,
+                file_type,
+                cache_thumbnail=False,
             )
 
             media_id = self.media_ids[i] if self.media_ids else str(uuid.uuid1().int)
@@ -101,8 +117,9 @@ class TargetMediaLoaderWorker(qtc.QThread):
             m_id = self.media_ids[idx] if self.media_ids else str(uuid.uuid1().int)
             paired_files_ids.append((path, m_id))
 
-        # Alphabetical sorting on filename only
-        paired_files_ids.sort(key=lambda x: os.path.basename(str(x[0])).lower())
+        # Keep existing behavior by default; allow callers to preserve original order.
+        if self.sort_files_list_by_name:
+            paired_files_ids.sort(key=lambda x: os.path.basename(str(x[0])).lower())
 
         for media_file_path, media_id in paired_files_ids:
             if not self._running:  # Check if the thread is still running
@@ -111,7 +128,10 @@ class TargetMediaLoaderWorker(qtc.QThread):
                 continue
             file_type = misc_helpers.get_file_type(media_file_path)
             q_image = common_widget_actions.extract_frame_as_image(
-                self.main_window, media_file_path, file_type=file_type
+                self.main_window,
+                media_file_path,
+                file_type=file_type,
+                cache_thumbnail=False,
             )
             if q_image:
                 # Emit the signal to update GUI

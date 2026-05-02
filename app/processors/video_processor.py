@@ -1338,41 +1338,9 @@ class VideoProcessor(QObject):
 
         # 4. Setup Recording (if applicable)
         if self.recording:
-            output_folder = str(
-                self.main_window.control.get("OutputMediaFolder", "")
-            ).strip()
-            if self.main_window.control.get("OutputToTargetLocationToggle", False):
-                output_folder = os.path.dirname(str(self.media_path))
-            if self.main_window.control.get("ClusterOutputBySourceToggle", False):
-                target_face_button = getattr(
-                    self.main_window, "cur_selected_target_face_button", None
-                )
-                assigned_embeddings = (
-                    getattr(target_face_button, "assigned_merged_embeddings", None)
-                    if target_face_button
-                    else None
-                )
-                embedding_id = (
-                    next(iter(assigned_embeddings), None)
-                    if assigned_embeddings
-                    else None
-                )
-                embedding_button = (
-                    self.main_window.merged_embeddings.get(embedding_id)
-                    if embedding_id is not None
-                    else None
-                )
-                embedding_name = (
-                    str(getattr(embedding_button, "embedding_name", "")).strip()
-                    if embedding_button is not None
-                    else ""
-                )
-                if embedding_name:
-                    output_folder = os.path.join(output_folder, embedding_name)
-                else:
-                    print(
-                        "[WARN] ClusterOutputBySourceToggle enabled but embedding_name is falsy"
-                    )
+            output_folder = video_control_actions.resolve_output_folder(
+                self.main_window, str(self.media_path)
+            )
             self.active_output_folder = output_folder
             # Disable UI elements
             if not self.main_window.control["KeepControlsToggle"]:
@@ -4640,35 +4608,9 @@ class VideoProcessor(QObject):
         self.current_segment_index = -1
         self.temp_segment_files = []
         self.segment_temp_dir = None
-        output_folder = str(
-            self.main_window.control.get("OutputMediaFolder", "")
-        ).strip()
-        if self.main_window.control.get("OutputToTargetLocationToggle", False):
-            output_folder = os.path.dirname(str(self.media_path))
-        if self.main_window.control.get("ClusterOutputBySourceToggle", False):
-            target_face_button = getattr(
-                self.main_window, "cur_selected_target_face_button", None
-            )
-            assigned_embeddings = (
-                getattr(target_face_button, "assigned_merged_embeddings", None)
-                if target_face_button
-                else None
-            )
-            embedding_id = (
-                next(iter(assigned_embeddings), None) if assigned_embeddings else None
-            )
-            embedding_button = (
-                self.main_window.merged_embeddings.get(embedding_id)
-                if embedding_id is not None
-                else None
-            )
-            embedding_name = (
-                str(getattr(embedding_button, "embedding_name", "")).strip()
-                if embedding_button is not None
-                else ""
-            )
-            if embedding_name:
-                output_folder = os.path.join(output_folder, embedding_name)
+        output_folder = video_control_actions.resolve_output_folder(
+            self.main_window, str(self.media_path)
+        )
         self.active_output_folder = output_folder
 
         # 3. Disable UI
