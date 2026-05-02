@@ -563,6 +563,7 @@ def extract_frame_as_image(
     file_type,
     webcam_index=False,
     webcam_backend=False,
+    cache_thumbnail=True,
 ):
     """
     Extracts a frame from a media file and converts it to a QImage for thumbnails.
@@ -655,7 +656,7 @@ def extract_frame_as_image(
 
     if isinstance(frame, np.ndarray):
         # Create a new thumbnail in the cache for next time.
-        if file_type != "webcam":
+        if file_type != "webcam" and cache_thumbnail:
             main_window.thumbnail_manager.create_thumbnail(frame, media_file_path)
 
         # Return the generated thread-safe QImage.

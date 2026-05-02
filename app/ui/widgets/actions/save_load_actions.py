@@ -15,6 +15,7 @@ from app.ui.widgets.actions import common_actions as common_widget_actions
 from app.ui.widgets.actions import card_actions
 from app.ui.widgets.actions import list_view_actions
 from app.ui.widgets.actions import video_control_actions
+from app.ui.widgets.actions import control_actions
 from app.ui.widgets.actions import layout_actions
 from app.ui.widgets.actions import filter_actions
 from app.ui.widgets import ui_workers
@@ -470,6 +471,7 @@ def load_saved_workspace(
                 folder_name=False,
                 files_list=target_medias_files_list,
                 media_ids=target_media_ids,
+                sort_files_list_by_name=False,
             )
             main_window.video_loader_worker.thumbnail_ready.connect(
                 partial(
@@ -752,7 +754,50 @@ def load_saved_workspace(
             layout_actions.fit_image_to_view_onchange(main_window)
 
             if main_window.target_faces:
-                list(main_window.target_faces.values())[0].click()
+                saved_face_id = data.get("selected_target_face_id")
+                first_face_id = (
+                    saved_face_id
+                    if saved_face_id in main_window.target_faces
+                    else list(main_window.target_faces.keys())[0]
+                )
+
+                main_window.selected_target_face_id = first_face_id
+                first_face_button = main_window.target_faces.get(first_face_id)
+
+                if first_face_button:
+                    first_face_button.setChecked(True)
+                    main_window.cur_selected_target_face_button = first_face_button
+
+                    for target_face_id, target_face_button in main_window.target_faces.items():
+                        if target_face_id != first_face_id:
+                            target_face_button.setChecked(False)
+
+                    card_actions.uncheck_all_input_faces(main_window)
+                    card_actions.uncheck_all_merged_embeddings(main_window)
+
+                    for input_face_id in first_face_button.assigned_input_faces.keys():
+                        input_face_button = main_window.input_faces.get(input_face_id)
+                        if input_face_button:
+                            input_face_button.setChecked(True)
+
+                    for embedding_id in first_face_button.assigned_merged_embeddings.keys():
+                        embed_button = main_window.merged_embeddings.get(embedding_id)
+                        if embed_button:
+                            embed_button.setChecked(True)
+
+                    main_window.current_kv_tensors_map = getattr(
+                        first_face_button, "assigned_kv_map", None
+                    )
+
+                video_control_actions.refresh_issue_frames_for_selected_face(main_window)
+                video_control_actions.update_scan_review_button_states(main_window)
+
+                common_widget_actions.set_widgets_values_using_face_id_parameters(
+                    main_window, face_id=first_face_id
+                )
+                main_window.current_widget_parameters = main_window.parameters[
+                    first_face_id
+                ].copy()
             else:
                 main_window.current_widget_parameters = data.get(
                     "current_widget_parameters", main_window.default_parameters.copy()
@@ -769,6 +814,13 @@ def load_saved_workspace(
                 common_widget_actions.set_widgets_values_using_face_id_parameters(
                     main_window, face_id=None
                 )
+
+            swap_faces_state = data.get("swap_faces_enabled", False)
+            main_window.swapfacesButton.setChecked(swap_faces_state)
+
+            edit_faces_state = data.get("edit_faces_enabled", False)
+            main_window.editFacesButton.setChecked(edit_faces_state)
+            control_actions.handle_face_editor_button_click(main_window)
 
             # Restore Window State
             window_state = data.get("window_state_data", {})
@@ -1081,6 +1133,9 @@ def save_current_workspace(
             main_window.selected_video_button, widget_components.TargetMediaCardButton
         )
         else False,
+        "selected_target_face_id": getattr(main_window, "selected_target_face_id", None),
+        "swap_faces_enabled": main_window.swapfacesButton.isChecked(),
+        "edit_faces_enabled": main_window.editFacesButton.isChecked(),
         "input_faces_data": input_faces_data,
         "target_faces_data": target_faces_data,
         "embeddings_data": embeddings_data,

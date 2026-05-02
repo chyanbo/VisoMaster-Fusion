@@ -116,6 +116,12 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
             "default": False,
             "help": "Save processed output next to the current target media instead of the global output folder.",
         },
+        "PreserveOutputDirectoryStructureToggle": {
+            "level": 1,
+            "label": "Preserve Source Directory Structure",
+            "default": False,
+            "help": "When loading targets from a folder recursively, mirror each target's parent subfolder path inside the output folder.",
+        },
         "ClusterOutputBySourceToggle": {
             "level": 1,
             "label": "Cluster Output by Source Name",
