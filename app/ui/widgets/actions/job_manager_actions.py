@@ -1986,7 +1986,8 @@ class JobProcessor(QThread):
         seen_media_ids = set()
         seen_face_ids = set()
         seen_embed_ids = set()
-        seen_embed_signatures = set()
+        seen_embed_signature_to_id: dict[str, str] = {}
+        embed_id_alias_map: dict[str, str] = {}
 
         valid_job_data_list = []  # List for jobs that pass validation
         self.skipped_jobs.clear()  # Clear skipped list for this batch
@@ -2054,14 +2055,34 @@ class JobProcessor(QThread):
                     continue
 
                 embed_signature = self._embedding_signature(embedding_payload)
-                if embed_signature in seen_embed_signatures:
+                if embed_signature in seen_embed_signature_to_id:
+                    canonical_embed_id = seen_embed_signature_to_id[embed_signature]
+                    embed_id_alias_map[embed_id] = canonical_embed_id
                     seen_embed_ids.add(embed_id)
                     continue
 
                 # Keep the first occurrence, skip equivalent duplicates from other jobs.
                 master_data["embeddings_data"][embed_id] = embedding_payload
                 seen_embed_ids.add(embed_id)
-                seen_embed_signatures.add(embed_signature)
+                seen_embed_signature_to_id[embed_signature] = embed_id
+
+            # Rewrite per-job embedding assignments to canonical IDs so lookups
+            # succeed even when equivalent embeddings were de-duplicated.
+            for target_face in data.get("target_faces_data", {}).values():
+                assigned_embed_ids = target_face.get("assigned_merged_embeddings", [])
+                if not isinstance(assigned_embed_ids, list):
+                    continue
+
+                remapped_ids = []
+                seen_ids_for_face = set()
+                for assigned_id in assigned_embed_ids:
+                    mapped_id = embed_id_alias_map.get(assigned_id, assigned_id)
+                    if mapped_id in seen_ids_for_face:
+                        continue
+                    seen_ids_for_face.add(mapped_id)
+                    remapped_ids.append(mapped_id)
+
+                target_face["assigned_merged_embeddings"] = remapped_ids
 
             # --- 3. Add valid job to processing list ---
             valid_job_data_list.append(data)
