@@ -459,7 +459,30 @@ class FrameWorker(threading.Thread):
                 )
 
         except Exception as e:
-            print(f"[ERROR] Error in {self.name} (frame {self.frame_number}): {e}")
+            # FW-CUDA-LOG: Distinguish CUDA / TensorRT errors so they are loud and
+            # actionable, since they typically mean the entire CUDA context is
+            # corrupted and continuing to process will produce more cryptic crashes
+            # downstream. The visible message points users at the launcher's
+            # Update / Maintenance page where they can switch the provider.
+            _err_msg = str(e)
+            _is_cuda_error = (
+                "CUDA" in _err_msg
+                or "cuda" in _err_msg.lower()
+                or "TensorRT" in _err_msg
+                or "tensorrt" in _err_msg.lower()
+                or e.__class__.__name__ == "AcceleratorError"
+            )
+            if _is_cuda_error:
+                print(
+                    f"[FATAL] CUDA error in {self.name} (frame {self.frame_number}): {e}"
+                )
+                print(
+                    "[FATAL] CUDA context may be corrupted. If this persists, open "
+                    "Launcher → Update / Maintenance → switch provider (TensorRT ↔ CUDA) "
+                    "or rebuild the TensorRT engines."
+                )
+            else:
+                print(f"[ERROR] Error in {self.name} (frame {self.frame_number}): {e}")
             traceback.print_exc()
             # Emit the original (unprocessed) frame as a fallback so the recording
             # metronome is never blocked waiting for a frame that will never arrive.
@@ -1494,8 +1517,16 @@ class FrameWorker(threading.Thread):
             # projection: true angular width ≈ equirect_width / cos(phi_radians)
             phi_radians = math.radians(phi)
             cos_phi = math.cos(phi_radians)
-            # Avoid division by near-zero at poles; clamp cos_phi to at least 0.1
-            angular_width_deg_corrected = angular_width_deg / max(cos_phi, 0.1)
+            # Clamp cos_phi to 0.35 (≈70° latitude) to cap the correction at ~2.9×.
+            # The previous clamp of 0.1 allowed up to ×10 amplification near the poles,
+            # which produced extreme FOVs causing landmark coordinates to be garbage
+            # ("eye sideways, mouth near ear") for faces near the top/bottom of the frame.
+            # Secondary cap: never let the correction exceed 2× the raw angular width,
+            # ensuring continuity with non-corrected detection for near-pole detections.
+            angular_width_deg_corrected = angular_width_deg / max(cos_phi, 0.35)
+            angular_width_deg_corrected = min(
+                angular_width_deg_corrected, angular_width_deg * 2.0
+            )
             # Improvement C: use VR180MaxFOVSlider instead of the previous hard-cap of
             # 100°.  Near-camera faces can subtend >100° and were being clipped.
             _vr_max_fov = float(control.get("VR180MaxFOVSlider", 120))
@@ -2409,6 +2440,13 @@ class FrameWorker(threading.Thread):
             ratio_h_down = img_h / new_h
 
             for fface in det_faces_data_for_display:
+                # Idempotency guard: the same fface dict can survive into a follow-up
+                # refresh-frame call (e.g., when the user toggles a setting that
+                # triggers refresh_frame). Re-applying the downscale would
+                # double-shrink the bbox/kps and produce out-of-frame coordinates
+                # that broke auto-mouth detection on stopped frames.
+                if fface.get("_displayspace_rescaled"):
+                    continue
                 if fface.get("bbox") is not None:
                     fface["bbox"][0] *= ratio_w_down
                     fface["bbox"][2] *= ratio_w_down
@@ -2423,6 +2461,7 @@ class FrameWorker(threading.Thread):
                 if fface.get("kps_203") is not None:
                     fface["kps_203"][:, 0] *= ratio_w_down
                     fface["kps_203"][:, 1] *= ratio_h_down
+                fface["_displayspace_rescaled"] = True
 
         processed_tensor_rgb_uint8 = img
 
@@ -3918,6 +3957,30 @@ class FrameWorker(threading.Thread):
             y1 = float(face_bbox[1])
             x2 = float(face_bbox[2])
             y2 = float(face_bbox[3])
+
+            # FW-MOUTH-1: For sub-512px input frames, _process_frame_standard
+            # upscales the working tensor and scales the bboxes UP to match.
+            # `self.frame` is the ORIGINAL (un-upscaled) numpy frame. Using
+            # upscaled-space bbox coordinates against the original frame produces
+            # an out-of-bounds crop → mouth-action detector returns None →
+            # auto-mouth never fires for low-resolution videos.
+            #
+            # Detect the mismatch (bbox extending well past the frame's actual
+            # dimensions) and rescale the bbox back to original-frame space.
+            _bbox_max = max(x2, y2)
+            if _bbox_max > max(fw, fh) + 8 and (fw < 512 or fh < 512):
+                if fw <= fh:
+                    _new_w = 512
+                    _new_h = int(512 * fh / fw)
+                else:
+                    _new_h = 512
+                    _new_w = int(512 * fw / fh)
+                _ratio_w_down = fw / float(_new_w)
+                _ratio_h_down = fh / float(_new_h)
+                x1 *= _ratio_w_down
+                x2 *= _ratio_w_down
+                y1 *= _ratio_h_down
+                y2 *= _ratio_h_down
             cx = (x1 + x2) / 2.0
             cy = (y1 + y2) / 2.0
             half_w = x2 - x1  # 2× scale → full bbox width as half-extent
@@ -3981,7 +4044,16 @@ class FrameWorker(threading.Thread):
             target_fb.mouth_openness_state = MouthOpennessState()
             _state = target_fb.mouth_openness_state
 
-        _auto_active, _ema_value = _state.update(_ratio, _alpha, _threshold)
+        # FW-MOUTH-2: When the worker is servicing a stopped-frame preview
+        # (single-frame mode), every refresh re-evaluates the SAME underlying
+        # frame. None-ratios from transient bbox/setting toggles must not accrue
+        # an occlusion penalty — otherwise toggling color transfer on a stopped
+        # frame slowly decays the EMA past the deactivate threshold and the user
+        # cannot re-enable auto-mouth without resuming playback.
+        _single_frame_mode = bool(getattr(self, "is_single_frame", False))
+        _auto_active, _ema_value = _state.update(
+            _ratio, _alpha, _threshold, single_frame_mode=_single_frame_mode
+        )
 
         if not _auto_active:
             return params

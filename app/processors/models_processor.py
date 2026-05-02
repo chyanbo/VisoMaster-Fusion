@@ -10,7 +10,25 @@ from typing import Dict, TYPE_CHECKING, Optional
 from PIL import Image
 from packaging import version
 import numpy as np
-import onnxruntime
+
+try:
+    import onnxruntime
+except ImportError as _ort_err:
+    print("\n" + "=" * 70)
+    print("[FATAL] onnxruntime failed to import.")
+    print(f"  Error: {_ort_err}")
+    print()
+    print("  COMMON FIXES:")
+    print("  1. Install Visual C++ Redistributable 2019 (x64) from Microsoft.")
+    print("     Download: https://aka.ms/vs/17/release/vc_redist.x64.exe")
+    print("  2. Ensure CUDA 12.x runtime DLLs are present (cudart64_12.dll etc.).")
+    print(
+        "     Install CUDA Toolkit 12.x from https://developer.nvidia.com/cuda-downloads"
+    )
+    print("  3. On Windows 10 older than 1903: update Windows or install KB4571756.")
+    print("  4. Portable install: run 'Check / Update Dependencies' in the Launcher.")
+    print("=" * 70 + "\n")
+    raise
 import torch
 import onnx
 from torchvision.transforms import v2
