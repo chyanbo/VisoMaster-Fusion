@@ -168,6 +168,10 @@ class VideoProcessor(QObject):
         # --- Sequential Detection State ---
         # Initialize the decoupled detector state manager
         self.sequential_detector = SequentialDetector(self.main_window)
+        # Transition flags: reset tracker only when target-face presence changes,
+        # not on every frame — prevents ByteTrack reinitialization per frame (webcam FPS fix).
+        self._video_had_targets: bool = False
+        self._webcam_had_targets: bool = False
 
         # --- Processing State Flags ---
         self.processing = False  # MASTER flag: True if playback, recording, or webcam stream is active
@@ -851,6 +855,7 @@ class VideoProcessor(QObject):
 
                 if len(self.main_window.target_faces) > 0:
                     # If Faces present run detect
+                    self._video_had_targets = True
                     is_master_edit_active = self.main_window.editFacesButton.isChecked()
                     bboxes, kpss_5, kpss, kpss_203 = self.sequential_detector.run(
                         frame_rgb=frame_rgb,
@@ -866,8 +871,12 @@ class VideoProcessor(QObject):
                     kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
                     kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
 
-                    # Reset the arrays for clean retargeting via the new manager
-                    self.sequential_detector.reset_state()
+                    # Reset tracker only on the transition from "had targets" → "no targets".
+                    # Calling reset_state() on every frame reinitialised ByteTrack continuously,
+                    # wasting CPU and preventing stable tracking when faces reappeared.
+                    if self._video_had_targets:
+                        self.sequential_detector.reset_state()
+                        self._video_had_targets = False
 
                 # The worker will use the feeder's state *from this exact moment*
                 task = (
@@ -943,6 +952,7 @@ class VideoProcessor(QObject):
 
                 # --- Inject Sequential Detection ---
                 if len(self.main_window.target_faces) > 0:
+                    self._webcam_had_targets = True
                     is_master_edit_active = self.main_window.editFacesButton.isChecked()
                     bboxes, kpss_5, kpss, kpss_203 = self.sequential_detector.run(
                         frame_rgb=frame_rgb,
@@ -958,8 +968,13 @@ class VideoProcessor(QObject):
                     kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
                     kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
 
-                    # Reset tracking state securely
-                    self.sequential_detector.reset_state()
+                    # Reset tracker only on the transition from "had targets" → "no targets".
+                    # Resetting ByteTrack on every frame without targets was causing webcam FPS
+                    # degradation by reinitialising the tracker's internal state structures
+                    # on every captured frame.
+                    if self._webcam_had_targets:
+                        self.sequential_detector.reset_state()
+                        self._webcam_had_targets = False
 
                 # Create the 8-tuple task
                 task = (
@@ -1339,8 +1354,12 @@ class VideoProcessor(QObject):
 
         # 6b. START WORKER POOL
         print(f"[INFO] Starting {self.num_threads} persistent worker thread(s)...")
-        # Ensure old workers are cleared (from a previous run)
-        self.join_and_clear_threads()
+        # Ensure old workers are cleared (from a previous run).
+        # Pass clear_module_caches=False so the warm VR caches (perspective grids,
+        # rotation matrices, feathered masks) survive the pool restart — they are
+        # geometric data independent of the previous job and rebuilding them on the
+        # first new frame is wasted work.
+        self.join_and_clear_threads(clear_module_caches=False)
         self.worker_threads = []
         # Clear any stale tasks or poison pills left from the previous session.
         # join_and_clear_threads() returns early when worker_threads is empty,
@@ -2015,11 +2034,18 @@ class VideoProcessor(QObject):
 
         return True  # Processing was stopped
 
-    def join_and_clear_threads(self):
+    def join_and_clear_threads(self, clear_module_caches: bool = True):
         """
         Stops and waits for all pool worker threads to finish.
         This function's *only* job is to set events, send pills, and join.
         It does NOT clear the queue.
+
+        Args:
+            clear_module_caches: When True (default — used at job stop), also clear
+                module-level VR caches (perspective grids, rotation matrices,
+                feathered masks). Pass False at job *start* (`process_video()` calls
+                this before launching a new pool) so the warm caches built up by
+                previous workers survive the pool restart.
         """
         active_threads = self.worker_threads
         if not active_threads:
@@ -2073,6 +2099,40 @@ class VideoProcessor(QObject):
         _gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+        # 6. Release module-level VR caches that hold CPU/GPU tensors across jobs.
+        #    Without this, equirect perspective grids and feathered stitch masks
+        #    accumulate in RAM across multiple recording sessions (memory leak).
+        #    Skipped when called from process_video() at session start, so the warm
+        #    caches built up by the previous pool survive the worker-pool restart.
+        if clear_module_caches:
+            try:
+                from app.processors.external.Equirec2Perspec_vr import clear_persp_cache
+                from app.helpers.vr_utils import clear_feathered_mask_cache
+
+                clear_persp_cache()
+                clear_feathered_mask_cache()
+            except Exception:
+                pass  # Non-fatal — VR caches simply persist until next GC cycle
+
+    def _log_hevc_thumbnail_hint_once(self) -> None:
+        """Print a one-time hint about HEVC thumbnail rendering on Windows 10.
+
+        Default recording codec is HEVC (hevc_nvenc / libx265). Windows 10 does
+        not generate File Explorer thumbnails for HEVC files unless the user
+        installs the "HEVC Video Extensions" package from the Microsoft Store.
+        This hint surfaces the workaround so users don't think VisoMaster broke
+        their thumbnails.
+        """
+        if getattr(self, "_hevc_hint_logged", False):
+            return
+        self._hevc_hint_logged = True
+        if os.name == "nt":
+            print(
+                "[INFO] Recording finished as HEVC (H.265). "
+                "Windows Explorer thumbnails for HEVC require the "
+                "'HEVC Video Extensions' from the Microsoft Store."
+            )
 
     def _reopen_video_capture(self, seek_frame: int = 0) -> bool:
         """
@@ -4110,6 +4170,11 @@ class VideoProcessor(QObject):
                         f"[ERROR] Error waiting for FFmpeg subprocess during finalization: {e}"
                     )
                 self.recording_sp = None
+                # VP-HEVC-INFO: Notify the user about Windows Explorer thumbnail
+                # support for HEVC outputs. Default codec is hevc_nvenc / libx265,
+                # both produce H.265 streams that Windows 10 does NOT thumbnail
+                # natively without the "HEVC Video Extensions" Store package.
+                self._log_hevc_thumbnail_hint_once()
 
             # 7. Calculate audio segment times
             end_frame_for_calc = min(

@@ -1249,6 +1249,11 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
             "level": 1,
             "label": "AutoColor Transfer",
             "default": False,
+            # Toggling color transfer must NOT trigger a single-frame refresh.
+            # The refresh path mutates det_faces_data_for_display bboxes in place,
+            # which corrupted the bbox passed to _detect_mouth_action_score on the
+            # next refresh and broke the auto-mouth state machine on stopped frames.
+            "enable_refresh_frame": False,
             "help": "Enable AutoColor Transfer: 1. Hans Test without mask, 2. Hans Test with mask, 3. DFL Method without mask, 4. DFL Original Method.",
         },
         "AutoColorTransferTypeSelection": {
@@ -1281,6 +1286,11 @@ SWAPPER_LAYOUT_DATA: Any = {  # noqa: F811
             "level": 1,
             "label": "Enable Ending Color Transfer",
             "default": False,
+            # Toggling color transfer must NOT trigger a single-frame refresh.
+            # See AutoColorEnableToggle above for the same rationale — refresh
+            # corrupted bboxes broke auto-mouth on stopped frames after color
+            # transfer was toggled.
+            "enable_refresh_frame": False,
             "help": "Enables a final color transfer pass after face restoration to match original skin tone.",
         },
         "EndingColorTransferTypeSelection": {

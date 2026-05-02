@@ -13,6 +13,44 @@ from app.processors.models_data import models_dir
 from app.processors.utils import faceutil
 
 
+def _kps5_is_degenerate(kps5) -> bool:
+    """Return True when the 5 keypoints are too collinear to define a stable
+    affine warp.
+
+    With ``from_points=True``, landmark detectors warp the source crop using a
+    5-point similarity transform (``warp_face_by_face_landmark_5``). For full
+    profile / extreme-yaw faces the 5 points (left eye, right eye, nose, two
+    mouth corners) are nearly collinear or have an occluded eye reflected onto
+    the visible side. The resulting warp is degenerate — landmarks come back
+    in wildly wrong positions ("eye sideways, mouth near the ear" symptom).
+
+    Detection: if the height of the triangle (left_eye, right_eye, nose),
+    measured as area÷base, is small relative to the eye-distance (< 10%),
+    treat as degenerate. The caller should fall back to the bbox-based warp
+    path (``from_points=False``).
+
+    Returns True when ``kps5`` is None, has fewer than 5 points, or is
+    geometrically degenerate.
+    """
+    if kps5 is None:
+        return True
+    try:
+        kps5 = np.asarray(kps5, dtype=np.float32)
+    except (ValueError, TypeError):
+        return True
+    if kps5.ndim != 2 or kps5.shape[0] < 5:
+        return True
+    le, re, nose = kps5[0], kps5[1], kps5[2]
+    eye_vec = re - le
+    eye_dist = float(np.linalg.norm(eye_vec))
+    if eye_dist < 1e-3:
+        return True  # both eyes coincide — definitely degenerate
+    # 2× area of triangle (LE, RE, nose) via cross product magnitude
+    cross = abs(eye_vec[0] * (nose[1] - le[1]) - eye_vec[1] * (nose[0] - le[0]))
+    triangle_h = cross / eye_dist  # perpendicular nose-to-eye-line distance
+    return (triangle_h / eye_dist) < 0.10
+
+
 class FaceLandmarkDetectors:
     """
     Manages and executes various face landmark detection models.
@@ -142,9 +180,24 @@ class FaceLandmarkDetectors:
         if detect_mode == "5":
             self._ensure_landmark_5_anchors()
 
+        # FLD-DEGENERATE-1: For extreme-yaw faces (full side angle), the 5-point
+        # similarity transform used by `from_points=True` collapses to a
+        # near-singular matrix and produces wildly wrong landmarks ("eye sideways,
+        # mouth near the ear" symptom from user reports). Detect the degenerate
+        # geometry and force the bbox-based warp path instead — it is less
+        # accurate on aligned faces but produces sane output for side angles
+        # where the keypoint-based warp simply cannot work.
+        effective_from_points = from_points
+        if from_points and _kps5_is_degenerate(det_kpss):
+            effective_from_points = False
+
         # Call the specific detection function with kwargs
         kpss_5, kpss, scores = detection_function(
-            img, bbox=bbox, det_kpss=det_kpss, from_points=from_points, **kwargs
+            img,
+            bbox=bbox,
+            det_kpss=det_kpss,
+            from_points=effective_from_points,
+            **kwargs,
         )
 
         # --- Filtering Logic ---
