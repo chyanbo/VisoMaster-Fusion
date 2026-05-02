@@ -76,15 +76,36 @@ def apply_theme_to_app(app: QtWidgets.QApplication):
 # ---------- Subprocess Helpers ----------
 
 
-def run_python(script_path: Path):
-    """Run a Python script using the portable Python interpreter."""
-    subprocess.run(
-        [str(PATHS["PYTHON_EXE"]), str(script_path)], cwd=PATHS["APP_DIR"], shell=False
-    )
+def run_python(script_path: Path, args: list | None = None):
+    """Run a Python script using the portable Python interpreter.
+
+    The working directory is always set to APP_DIR (the repo root) so that
+    `python -m app.ui.launcher` and similar module invocations find the `app/`
+    package regardless of where the caller's cwd is.
+    """
+    cmd = [str(PATHS["PYTHON_EXE"]), str(script_path)] + (args or [])
+    subprocess.run(cmd, cwd=str(PATHS["APP_DIR"]), shell=False)
+
+
+# UV network tuning defaults.
+# These can be overridden by setting environment variables before launching.
+# UV_TIMEOUT: per-request HTTP timeout in seconds (default 120 s).
+#   Increase if large wheels (torch, onnxruntime) time out on slow connections.
+# UV_RETRIES: number of retry attempts on transient network errors (default 5).
+# UV_CONCURRENT_DOWNLOADS: parallel download slots (default 4).
+#   Reduce to 1 on very slow / metered connections to avoid overloading the pipe.
+_UV_TIMEOUT = "120"
+_UV_RETRIES = "5"
+_UV_CONCURRENT_DOWNLOADS = "4"
 
 
 def uv_pip_install():
-    """Run dependency installation using the portable uv executable."""
+    """Run dependency installation using the portable uv executable.
+
+    Passes explicit timeout, retry, and concurrency flags so that slow or
+    unstable connections (common in portable installs) do not abort mid-install
+    with a cryptic timeout error.
+    """
     subprocess.run(
         [
             str(PATHS["UV_EXE"]),
@@ -94,7 +115,13 @@ def uv_pip_install():
             str(PATHS["REQ_FILE"]),
             "--python",
             str(PATHS["PYTHON_EXE"]),
+            "--timeout",
+            _UV_TIMEOUT,
+            "--retries",
+            _UV_RETRIES,
+            "--concurrent-downloads",
+            _UV_CONCURRENT_DOWNLOADS,
         ],
-        cwd=PATHS["APP_DIR"],
+        cwd=str(PATHS["APP_DIR"]),
         shell=False,
     )

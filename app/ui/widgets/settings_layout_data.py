@@ -326,8 +326,14 @@ SETTINGS_LAYOUT_DATA: Any = {  # noqa: F811
         "VR180TileDetectionToggle": {
             "level": 1,
             "label": "VR Tiled Face Detection",
-            "default": False,
-            "help": "Run face detection on a grid of 24 undistorted perspective crops to catch faces missed by standard detection (faces near poles, the ±180° seam, or very close to the camera). OFF by default — adds ~24 extra detector runs per keyframe. Enable only when standard detection misses faces.",
+            # Default flipped to True to address the user-reported "head tilted
+            # back / near pole" detection failures. Tiled detection adds extra
+            # detector runs per keyframe but is the only way to find faces at
+            # high latitudes where equirectangular projection severely compresses
+            # horizontal resolution. Power users can disable for max throughput
+            # in scenes that don't need it.
+            "default": True,
+            "help": "Run face detection on a grid of 24 undistorted perspective crops to catch faces missed by standard detection (faces near poles, the ±180° seam, head tilted back, or very close to the camera). Default ON — recommended for most VR content. Disable only when you are certain the standard detector finds every face you need.",
             "parentToggle": "VR180ModeEnableToggle",
             "requiredToggleValue": True,
         },

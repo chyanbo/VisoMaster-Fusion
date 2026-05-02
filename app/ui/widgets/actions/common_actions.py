@@ -591,6 +591,21 @@ def extract_frame_as_image(
             media_file_path
         )
 
+        # Freshness check: if the source file has been modified more recently
+        # than the cached thumbnail (e.g., the user re-recorded over the same
+        # filename), force regeneration. Without this guard a stale thumbnail
+        # is served indefinitely.
+        if thumbnail_path:
+            try:
+                import os as _os
+
+                if _os.path.getmtime(thumbnail_path) < _os.path.getmtime(
+                    media_file_path
+                ):
+                    thumbnail_path = None
+            except OSError:
+                pass  # source file missing — fall through to regeneration
+
         if thumbnail_path:
             frame = misc_helpers.read_image_file(thumbnail_path)
             if frame is not None:
@@ -603,16 +618,34 @@ def extract_frame_as_image(
     elif file_type == "video":
         # Get rotation for thumbnail
         rotation_angle = get_video_rotation(media_file_path)
-        cap = cv2.VideoCapture(media_file_path)
-        if cap.isOpened():
-            # Explicitly enable OpenCV's auto-rotation ---
-            if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
-                cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
-            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-            middle_frame_no = total_frames // 2
-            cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_no)
-            ret, frame = misc_helpers.read_frame(cap, rotation_angle)
-            cap.release()
+        # Retry up to 3 times with a 500 ms backoff.  Freshly recorded output files
+        # may still be held open by ffmpeg or the OS write cache when the media panel
+        # first tries to generate a thumbnail, causing cap.isOpened() to fail or
+        # CAP_PROP_FRAME_COUNT to return 0.  This is especially common on Windows 10.
+        import time as _time
+
+        for _attempt in range(3):
+            cap = cv2.VideoCapture(media_file_path)
+            if cap.isOpened():
+                # Explicitly enable OpenCV's auto-rotation
+                if hasattr(cv2, "CAP_PROP_ORIENTATION_AUTO"):
+                    cap.set(cv2.CAP_PROP_ORIENTATION_AUTO, 1)
+                total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+                if total_frames > 0:
+                    middle_frame_no = total_frames // 2
+                    cap.set(cv2.CAP_PROP_POS_FRAMES, middle_frame_no)
+                    ret, frame = misc_helpers.read_frame(cap, rotation_angle)
+                    cap.release()
+                    if ret:
+                        break  # success — exit retry loop
+                    cap = None  # mark for next attempt
+                else:
+                    cap.release()
+                    cap = None
+            else:
+                cap = None
+            if _attempt < 2:
+                _time.sleep(0.5)  # wait before retry (file may still be flushed)
     elif file_type == "webcam":
         camera = cv2.VideoCapture(webcam_index, webcam_backend)
         if camera.isOpened():

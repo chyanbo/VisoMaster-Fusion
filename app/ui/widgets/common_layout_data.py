@@ -686,15 +686,18 @@ COMMON_LAYOUT_DATA: Any = {
             "label": "Confidence Threshold",
             "min_value": "0.01",
             "max_value": "0.99",
-            "default": "0.80",
+            "default": "0.50",
             "decimals": 2,
             "step": 0.01,
             "parentToggle": "AutoMouthExpressionEnableToggle",
             "requiredToggleValue": True,
             "enable_refresh_frame": False,
             "help": (
-                "Minimum detection confidence required to trigger auto-mouth activation. "
-                "Higher values require a more confident detection before activating."
+                "Minimum lip-open ratio required to activate the auto-mouth feature. "
+                "The ratio is vertical_gap / horizontal_span of the mouth. "
+                "Typical conversational values are 0.20–0.50; "
+                "above 0.60 only fires for a very wide-open mouth. "
+                "Lower values are more sensitive; higher values require a larger opening."
             ),
         },
         "AutoMouthEMAAlphaDecimalSlider": {
