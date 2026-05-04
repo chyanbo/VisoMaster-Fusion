@@ -3,7 +3,7 @@ name: Bump Version on Merge
 on:
   pull_request:
     types: [closed]
-    branches: [dev, main]
+    branches: [dev]
 
 concurrency:
   group: bump-version
