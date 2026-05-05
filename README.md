@@ -10,6 +10,11 @@ The project builds on the original VisoMaster work by **@argenspin** and **@Aluc
 
 *All faces shown in the screenshot are synthetic demo images used for illustration.*
 
+> [!CAUTION]
+> VisoMaster Fusion is only distributed through this repository.<br>
+> Do not download or pay for VisoMaster / VisoMaster Fusion from third-party websites.<br>
+> Sites like `visomaster.com` and `visomaster.org` are not affiliated with the maintainers.
+
 ## 🔗 Quick Links
 
 - [Download Portable Launcher](https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/download/v2.0.0/start_portable.bat)
