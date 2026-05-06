@@ -92,7 +92,7 @@ The app can run on CPU, but AI processing is much slower. Most users should use 
 
 Download **only** the portable launcher from the release page:
 
-- [Download - Start_Portable.bat](https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/download/v2.0.0/start_portable.bat)
+- [Download - Start_Portable.bat](https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/latest/download/Start_Portable.bat)
 
 Place it in a new folder and run it. The launcher installs everything into that folder, including Python 3.12, Git, FFmpeg, PyTorch, CUDA Toolkit , TensorRT, cuDNN, ONNX Runtime GPU, and the required model files.
 
