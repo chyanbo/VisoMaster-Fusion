@@ -10,6 +10,11 @@ The project builds on the original VisoMaster work by **@argenspin** and **@Aluc
 
 *All faces shown in the screenshot are synthetic demo images used for illustration.*
 
+> [!CAUTION]
+> VisoMaster Fusion is only distributed through this repository.<br>
+> Do not download or pay for VisoMaster / VisoMaster Fusion from third-party websites.<br>
+> Sites like `visomaster.com` and `visomaster.org` are not affiliated with the maintainers.
+
 ## 🔗 Quick Links
 
 - [Download Portable Launcher](https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/download/v2.0.0/start_portable.bat)
@@ -92,9 +97,9 @@ The app can run on CPU, but AI processing is much slower. Most users should use 
 
 Download **only** the portable launcher from the release page:
 
-- [Download - Start_Portable.bat](https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/download/v2.0.0/start_portable.bat)
+- [Download - Start_Portable.bat](https://github.com/VisoMasterFusion/VisoMaster-Fusion/releases/latest/download/Start_Portable.bat)
 
-Place it in a new folder and run it. The launcher installs everything into that folder, including Python 3.11, Git, FFmpeg, PyTorch `2.8.0+cu129`, CUDA Toolkit `12.9.1`, TensorRT `10.9.0.34`, cuDNN `9.13.1.26`, ONNX Runtime GPU `1.22.0`, and the required model files.
+Place it in a new folder and run it. The launcher installs everything into that folder, including Python 3.12, Git, FFmpeg, PyTorch, CUDA Toolkit , TensorRT, cuDNN, ONNX Runtime GPU, and the required model files.
 
 **You do not need any of the non-portable steps below for the portable version.**
 
@@ -116,7 +121,7 @@ Most users should use the `main` branch. The `dev` branch contains newer or in-p
 Using Anaconda:
 
 ```sh
-conda create -n visomaster python=3.11 -y
+conda create -n visomaster python=3.12 -y
 conda activate visomaster
 pip install uv
 ```
@@ -124,14 +129,14 @@ pip install uv
 Using uv directly:
 
 ```sh
-uv venv --python 3.11
+uv venv --python 3.12
 .venv\Scripts\activate
 ```
 
 **3. Install requirements**
 
 ```sh
-uv pip install -r requirements_cu129.txt
+uv pip install -r requirements_cu13.txt
 ```
 
 **4. Download required models**
@@ -159,7 +164,7 @@ To update a non-portable checkout:
 
 ```sh
 git pull
-uv pip install -r requirements_cu129.txt
+uv pip install -r requirements_cu13.txt
 python download_models.py
 ```
 
@@ -188,11 +193,11 @@ The project has a test suite covering core pipeline logic such as VR math, face 
 ```sh
 uv venv --python 3.12 .venv-test
 .venv-test\Scripts\activate
-uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+uv pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 uv pip install numpy scipy scikit-image opencv-python pillow pytest pytest-mock
 ```
 
-If you already have a `.venv` with the full `requirements_cu129.txt` installed, you can run tests directly in it.
+If you already have a `.venv` with the full `requirements_cu13.txt` installed, you can run tests directly in it.
 
 **Run tests**
 
