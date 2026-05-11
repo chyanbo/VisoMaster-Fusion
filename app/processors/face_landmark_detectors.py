@@ -98,7 +98,7 @@ def _kps5_is_degenerate(kps5: np.ndarray, detect_mode: str = "203") -> bool:
 
     # --- HORIZONTAL TOLERANCE (YAW) ---
     # Kept relatively wide (0.70) by default to ensure smooth video tracking.
-    # Model '478' is extremely sensitive to affine squashing on profiles. 
+    # Model '478' is extremely sensitive to affine squashing on profiles.
     # We tighten its tolerance to force the BBox fallback earlier.
     tol_x = 0.40 if detect_mode == "478" else 0.65
 

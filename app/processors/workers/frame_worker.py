@@ -5800,20 +5800,24 @@ class FrameWorker(threading.Thread):
         # Colors: mouth(11+12+13)=green, teeth-keep=cyan.
         if parameters.get("AutoMouthShowDebugOutlineToggle", False):
             _debug_layers = [
-                (mouth_debug_512,       [  0, 255,   0]),  # mouth region: green
-                (mouth_debug_teeth_512, [  0, 255, 255]),  # teeth keep:   cyan
+                (mouth_debug_512, [0, 255, 0]),  # mouth region: green
+                (mouth_debug_teeth_512, [0, 255, 255]),  # teeth keep:   cyan
             ]
             for _mask_512, _color in _debug_layers:
                 if _mask_512 is None:
                     continue
-                _mf = kgm.warp_affine(
-                    _mask_512.unsqueeze(0).unsqueeze(0).float(),
-                    M_inv,
-                    dsize=dsize,
-                    mode="bilinear",
-                    padding_mode="zeros",
-                    align_corners=True,
-                ).squeeze(0).squeeze(0)
+                _mf = (
+                    kgm.warp_affine(
+                        _mask_512.unsqueeze(0).unsqueeze(0).float(),
+                        M_inv,
+                        dsize=dsize,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=True,
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
                 _bin = (_mf > 0.5).float().unsqueeze(0).unsqueeze(0)
                 _dil = F.max_pool2d(_bin, kernel_size=3, stride=1, padding=1)
                 _ero = -F.max_pool2d(-_bin, kernel_size=3, stride=1, padding=1)
