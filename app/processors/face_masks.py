@@ -711,7 +711,9 @@ class FaceMasks:
 
             if upper_teeth_keep_mask is not None:
                 result["mouth_debug_teeth"] = (
-                    resize_to_target(upper_teeth_keep_mask.unsqueeze(0)).clamp(0, 1).squeeze()
+                    resize_to_target(upper_teeth_keep_mask.unsqueeze(0))
+                    .clamp(0, 1)
+                    .squeeze()
                 )
 
             for cls, pname in face_classes.items():
@@ -749,14 +751,20 @@ class FaceMasks:
 
             # Recompute mouth-only dilated mask to reflect actual slider values in debug outline.
             _fp_mouth = torch.zeros((512, 512), device=device, dtype=torch.float32)
-            for _cls, _pname in [(11, "MouthParserSlider"), (12, "UpperLipParserSlider"), (13, "LowerLipParserSlider")]:
+            for _cls, _pname in [
+                (11, "MouthParserSlider"),
+                (12, "UpperLipParserSlider"),
+                (13, "LowerLipParserSlider"),
+            ]:
                 _val = int(parameters.get(_pname, 0))
                 if _val > 0:
                     _m = self._mask_from_labels_lut(labels_swap, [_cls])
                     _m = self._dilate_binary(_m, _val, mode)
                     _fp_mouth = torch.maximum(_fp_mouth, _m)
             if _fp_mouth.sum() > 0:
-                result["mouth_debug"] = resize_to_target(_fp_mouth.unsqueeze(0)).clamp(0, 1).squeeze()
+                result["mouth_debug"] = (
+                    resize_to_target(_fp_mouth.unsqueeze(0)).clamp(0, 1).squeeze()
+                )
 
             if parameters.get("FaceBlurParserSlider", 0) > 0:
                 b = parameters["FaceBlurParserSlider"]
@@ -950,14 +958,23 @@ class FaceMasks:
         # Find the widest row in keep_core; hard-fill inner_swap upward from there
         # to close the dark gap between teeth surface and the cavity boundary.
         widest_row = int(keep_core.sum(dim=1).argmax().item())
-        gap_fill = ((inner_swap > 0.5) & (y_grid < widest_row).expand_as(inner_swap)).float()
+        gap_fill = (
+            (inner_swap > 0.5) & (y_grid < widest_row).expand_as(inner_swap)
+        ).float()
         keep = torch.maximum(keep_core, gap_fill)
 
         # Dilate vertically ±2 rows to cover dark edge pixels at the bottom of
         # the teeth, then clip to inner_swap so we never bleed into tongue rows.
-        keep = F.max_pool2d(
-            keep.unsqueeze(0).unsqueeze(0), kernel_size=(5, 1), stride=1, padding=(2, 0)
-        ).squeeze(0).squeeze(0)
+        keep = (
+            F.max_pool2d(
+                keep.unsqueeze(0).unsqueeze(0),
+                kernel_size=(5, 1),
+                stride=1,
+                padding=(2, 0),
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
         keep = torch.minimum(keep, inner_swap)
 
         return keep
