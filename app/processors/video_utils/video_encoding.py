@@ -2,9 +2,9 @@ import os
 import math
 import json
 import subprocess
-from pathlib import Path
 from typing import Dict, Any, Optional, Mapping, Tuple, List
 import numpy
+
 
 class FFmpegEncoder:
     """
@@ -55,10 +55,14 @@ class FFmpegEncoder:
         try:
             args = [
                 "ffprobe",
-                "-v", "quiet",
-                "-print_format", "json",
-                "-select_streams", "v:0",
-                "-show_entries", "stream=codec_type,codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate:format=bit_rate",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-select_streams",
+                "v:0",
+                "-show_entries",
+                "stream=codec_type,codec_name,width,height,bit_rate,avg_frame_rate,r_frame_rate:format=bit_rate",
                 file_path,
             ]
             result = subprocess.run(args, capture_output=True, text=True, timeout=30)
@@ -67,7 +71,11 @@ class FFmpegEncoder:
 
             probe_data = json.loads(result.stdout)
             video_stream = next(
-                (s for s in probe_data.get("streams", []) if s.get("codec_type") == "video"),
+                (
+                    s
+                    for s in probe_data.get("streams", [])
+                    if s.get("codec_type") == "video"
+                ),
                 None,
             )
             if not isinstance(video_stream, dict):
@@ -76,7 +84,9 @@ class FFmpegEncoder:
             width = int(video_stream.get("width") or 0)
             height = int(video_stream.get("height") or 0)
 
-            bit_rate_raw = video_stream.get("bit_rate") or probe_data.get("format", {}).get("bit_rate")
+            bit_rate_raw = video_stream.get("bit_rate") or probe_data.get(
+                "format", {}
+            ).get("bit_rate")
             bit_rate = float(bit_rate_raw) if bit_rate_raw else 0.0
 
             fps = self._parse_ffprobe_fps(video_stream.get("avg_frame_rate"))
@@ -125,11 +135,16 @@ class FFmpegEncoder:
         output_fps: Optional[float] = None,
     ) -> int:
         """Auto-compute CQ/CRF from source metrics to keep perceived quality close."""
-        if not (control.get("FFMpegOptionsToggle", False) and control.get("FFAutoMatchSourceQualityToggle", False)):
+        if not (
+            control.get("FFMpegOptionsToggle", False)
+            and control.get("FFAutoMatchSourceQualityToggle", False)
+        ):
             return quality_value
 
         if not source_metrics:
-            print("[INFO] Source-quality auto match enabled, but probe failed. Using manual Quality unchanged.")
+            print(
+                "[INFO] Source-quality auto match enabled, but probe failed. Using manual Quality unchanged."
+            )
             return quality_value
 
         src_w = max(1.0, source_metrics["width"])
@@ -156,16 +171,26 @@ class FFmpegEncoder:
             down_steps = math.log2(1.0 / max(scale_ratio, 1e-6))
             target_bpppf *= max(0.70, 1.0 - 0.20 * down_steps)
 
-        if target_bpppf >= 0.25: auto_quality = 14
-        elif target_bpppf >= 0.16: auto_quality = 16
-        elif target_bpppf >= 0.11: auto_quality = 18
-        elif target_bpppf >= 0.08: auto_quality = 20
-        elif target_bpppf >= 0.055: auto_quality = 22
-        elif target_bpppf >= 0.038: auto_quality = 24
-        elif target_bpppf >= 0.028: auto_quality = 26
-        elif target_bpppf >= 0.020: auto_quality = 28
-        elif target_bpppf >= 0.014: auto_quality = 30
-        else: auto_quality = 33
+        if target_bpppf >= 0.25:
+            auto_quality = 14
+        elif target_bpppf >= 0.16:
+            auto_quality = 16
+        elif target_bpppf >= 0.11:
+            auto_quality = 18
+        elif target_bpppf >= 0.08:
+            auto_quality = 20
+        elif target_bpppf >= 0.055:
+            auto_quality = 22
+        elif target_bpppf >= 0.038:
+            auto_quality = 24
+        elif target_bpppf >= 0.028:
+            auto_quality = 26
+        elif target_bpppf >= 0.020:
+            auto_quality = 28
+        elif target_bpppf >= 0.014:
+            auto_quality = 30
+        else:
+            auto_quality = 33
 
         adapted_quality = max(12, min(36, int(auto_quality)))
 
@@ -204,7 +229,13 @@ class FFmpegEncoder:
             if enhancer_type in ("RealEsrgan-x2-Plus", "BSRGan-x2"):
                 frame_height *= 2
                 frame_width *= 2
-            elif enhancer_type in ("RealEsrgan-x4-Plus", "BSRGan-x4", "UltraSharp-x4", "UltraMix-x4", "RealEsr-General-x4v3"):
+            elif enhancer_type in (
+                "RealEsrgan-x4-Plus",
+                "BSRGan-x4",
+                "UltraSharp-x4",
+                "UltraMix-x4",
+                "RealEsr-General-x4v3",
+            ):
                 frame_height *= 4
                 frame_width *= 4
 
@@ -217,12 +248,18 @@ class FFmpegEncoder:
                 frame_width_down = 1920
 
         # Quality Adaptation
-        source_metrics = self.probe_source_video_metrics(media_path) if media_path else None
+        source_metrics = (
+            self.probe_source_video_metrics(media_path) if media_path else None
+        )
         ffquality = self.get_adaptive_recording_quality(
             control=control,
             quality_value=int(control.get("FFQualitySlider", 20)),
-            output_width=frame_width_down if control.get("FrameEnhancerDownToggle") else frame_width,
-            output_height=frame_height_down if control.get("FrameEnhancerDownToggle") else frame_height,
+            output_width=frame_width_down
+            if control.get("FrameEnhancerDownToggle")
+            else frame_width,
+            output_height=frame_height_down
+            if control.get("FrameEnhancerDownToggle")
+            else frame_height,
             source_metrics=source_metrics,
             output_fps=fps,
         )
@@ -230,67 +267,110 @@ class FFmpegEncoder:
         args = [
             "ffmpeg",
             "-hide_banner",
-            "-loglevel", "error",
-            "-f", "rawvideo",
-            "-pix_fmt", "bgr24",
-            "-s", f"{frame_width}x{frame_height}",
-            "-r", str(fps),
-            "-i", "pipe:0",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "bgr24",
+            "-s",
+            f"{frame_width}x{frame_height}",
+            "-r",
+            str(fps),
+            "-i",
+            "pipe:0",
         ]
 
         if is_segment and media_path:
-            args.extend([
-                "-ss", str(start_time_sec),
-                "-to", str(end_time_sec),
-                "-i", media_path,
-                "-map", "0:v:0",
-                "-map", "1:a:0?",
-                "-c:a", "aac",
-                "-shortest",
-            ])
+            args.extend(
+                [
+                    "-ss",
+                    str(start_time_sec),
+                    "-to",
+                    str(end_time_sec),
+                    "-i",
+                    media_path,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0?",
+                    "-c:a",
+                    "aac",
+                    "-shortest",
+                ]
+            )
 
         # Video codec args
         if control.get("HDREncodeToggle"):
-            args.extend([
-                "-c:v", "libx265",
-                "-profile:v", "main10",
-                "-preset", str(control.get("FFPresetsHDRSelection", "medium")),
-                "-pix_fmt", "yuv420p10le",
-                "-x265-params",
-                f"crf={ffquality}:vbv-bufsize=10000:vbv-maxrate=10000:selective-sao=0:no-sao=1:strong-intra-smoothing=0:rect=0:aq-mode={int(control.get('FFSpatialAQToggle', 0))}:t-aq={int(control.get('FFTemporalAQToggle', 0))}:hdr-opt=1:repeat-headers=1:colorprim=bt2020:range=limited:transfer=smpte2084:colormatrix=bt2020nc:master-display='G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)':max-cll=1000,400",
-            ])
+            args.extend(
+                [
+                    "-c:v",
+                    "libx265",
+                    "-profile:v",
+                    "main10",
+                    "-preset",
+                    str(control.get("FFPresetsHDRSelection", "medium")),
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-x265-params",
+                    f"crf={ffquality}:vbv-bufsize=10000:vbv-maxrate=10000:selective-sao=0:no-sao=1:strong-intra-smoothing=0:rect=0:aq-mode={int(control.get('FFSpatialAQToggle', 0))}:t-aq={int(control.get('FFTemporalAQToggle', 0))}:hdr-opt=1:repeat-headers=1:colorprim=bt2020:range=limited:transfer=smpte2084:colormatrix=bt2020nc:master-display='G(13250,34500)B(7500,3000)R(34000,16000)WP(15635,16450)L(10000000,1)':max-cll=1000,400",
+                ]
+            )
         else:
-            args.extend([
-                "-c:v", "hevc_nvenc",
-                "-preset", str(control.get("FFPresetsSDRSelection", "p4")),
-                "-profile:v", "main10",
-                "-cq", str(ffquality),
-                "-pix_fmt", "yuv420p10le",
-                "-colorspace", "rgb",
-                "-color_primaries", "bt709",
-                "-color_trc", "bt709",
-                "-spatial-aq", str(int(control.get("FFSpatialAQToggle", 0))),
-                "-temporal-aq", str(int(control.get("FFTemporalAQToggle", 0))),
-                "-tier", "high",
-                "-tag:v", "hvc1",
-            ])
+            args.extend(
+                [
+                    "-c:v",
+                    "hevc_nvenc",
+                    "-preset",
+                    str(control.get("FFPresetsSDRSelection", "p4")),
+                    "-profile:v",
+                    "main10",
+                    "-cq",
+                    str(ffquality),
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-colorspace",
+                    "rgb",
+                    "-color_primaries",
+                    "bt709",
+                    "-color_trc",
+                    "bt709",
+                    "-spatial-aq",
+                    str(int(control.get("FFSpatialAQToggle", 0))),
+                    "-temporal-aq",
+                    str(int(control.get("FFTemporalAQToggle", 0))),
+                    "-tier",
+                    "high",
+                    "-tag:v",
+                    "hvc1",
+                ]
+            )
 
         target_matrix = "bt2020nc" if control.get("HDREncodeToggle") else "bt709"
         scale_params = f"in_range=pc:out_range=tv:out_color_matrix={target_matrix}"
 
         if control.get("FrameEnhancerDownToggle"):
-            args.extend(["-vf", f"scale={frame_width_down}x{frame_height_down}:{scale_params}:flags=lanczos+accurate_rnd+full_chroma_int"])
+            args.extend(
+                [
+                    "-vf",
+                    f"scale={frame_width_down}x{frame_height_down}:{scale_params}:flags=lanczos+accurate_rnd+full_chroma_int",
+                ]
+            )
         else:
             args.extend(["-vf", f"scale={scale_params}"])
 
         args.append(output_filename)
 
         try:
-            self.recording_sp = subprocess.Popen(args, stdin=subprocess.PIPE, bufsize=-1)
+            self.recording_sp = subprocess.Popen(
+                args, stdin=subprocess.PIPE, bufsize=-1
+            )
             self.frames_written = 0
             return True
         except FileNotFoundError:
-            print("[ERROR] FFmpeg command not found. Ensure FFmpeg is installed and in system PATH.")
+            print(
+                "[ERROR] FFmpeg command not found. Ensure FFmpeg is installed and in system PATH."
+            )
             return False
         except Exception as e:
             print(f"[ERROR] Failed to start FFmpeg subprocess: {e}")
@@ -298,7 +378,11 @@ class FFmpegEncoder:
 
     def write_frame(self, frame: numpy.ndarray) -> bool:
         """Writes a BGR numpy array to the FFmpeg stdin pipe."""
-        if self.recording_sp and self.recording_sp.stdin and not self.recording_sp.stdin.closed:
+        if (
+            self.recording_sp
+            and self.recording_sp.stdin
+            and not self.recording_sp.stdin.closed
+        ):
             try:
                 self.recording_sp.stdin.write(frame.tobytes())
                 self.frames_written += 1
@@ -326,8 +410,10 @@ class FFmpegEncoder:
             # Crucial for 4K/8K/VR180 where I/O flushing takes time.
             self.recording_sp.wait(timeout=timeout)
         except subprocess.TimeoutExpired:
-            print(f"[WARN] FFmpeg subprocess timed out after {timeout}s. Attempting graceful terminate...")
-            
+            print(
+                f"[WARN] FFmpeg subprocess timed out after {timeout}s. Attempting graceful terminate..."
+            )
+
             # 3. Escalation Step 1: SIGTERM (Polite request to stop)
             self.recording_sp.terminate()
             try:
@@ -336,18 +422,21 @@ class FFmpegEncoder:
                 print("[INFO] FFmpeg closed cleanly after terminate signal.")
             except subprocess.TimeoutExpired:
                 # 4. Escalation Step 2: SIGKILL (Forceful destruction)
-                print("[ERROR] FFmpeg ignored terminate signal and is hanging. Forcing kill (SIGKILL).")
+                print(
+                    "[ERROR] FFmpeg ignored terminate signal and is hanging. Forcing kill (SIGKILL)."
+                )
                 self.recording_sp.kill()
                 self.recording_sp.wait()
         except Exception as e:
             print(f"[ERROR] Error waiting for FFmpeg subprocess: {e}")
-            
+
         self.recording_sp = None
 
     def is_running(self) -> bool:
         """Check if the subprocess is currently active."""
         return self.recording_sp is not None and self.recording_sp.poll() is None
-    
+
+
 class FFmpegPostProcessor:
     """
     Handles stateless post-processing operations via FFmpeg:
@@ -363,8 +452,14 @@ class FFmpegPostProcessor:
 
         try:
             args = [
-                "ffprobe", "-v", "quiet", "-print_format", "json",
-                "-show_format", "-show_streams", audio_file_path,
+                "ffprobe",
+                "-v",
+                "quiet",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+                audio_file_path,
             ]
             result = subprocess.run(args, capture_output=True, text=True, timeout=30)
             if result.returncode != 0:
@@ -372,8 +467,12 @@ class FFmpegPostProcessor:
                 return False
 
             probe_data = json.loads(result.stdout)
-            audio_streams = [s for s in probe_data.get("streams", []) if s.get("codec_type") == "audio"]
-            
+            audio_streams = [
+                s
+                for s in probe_data.get("streams", [])
+                if s.get("codec_type") == "audio"
+            ]
+
             if not audio_streams:
                 print(f"[WARN] No audio stream found in {audio_file_path}")
                 return False
@@ -399,7 +498,10 @@ class FFmpegPostProcessor:
 
     @staticmethod
     def extract_audio_segments(
-        media_path: str, fps: float, segments: List[Tuple[int, int]], temp_audio_dir: str
+        media_path: str,
+        fps: float,
+        segments: List[Tuple[int, int]],
+        temp_audio_dir: str,
     ) -> Tuple[bool, List[str]]:
         """Extract audio from the original media for each frame segment."""
         audio_files = []
@@ -414,39 +516,70 @@ class FFmpegPostProcessor:
             audio_files.append(audio_file)
 
             args = [
-                "ffmpeg", "-hide_banner", "-loglevel", "warning", "-err_detect", "ignore_err",
-                "-i", media_path, "-ss", str(start_time), "-to", str(end_time),
-                "-vn", "-map", "0:a:0?", "-af", "aresample=async=1:first_pts=0",
-                "-c:a", "aac", "-b:a", "192k", "-y", audio_file,
+                "ffmpeg",
+                "-hide_banner",
+                "-loglevel",
+                "warning",
+                "-err_detect",
+                "ignore_err",
+                "-i",
+                media_path,
+                "-ss",
+                str(start_time),
+                "-to",
+                str(end_time),
+                "-vn",
+                "-map",
+                "0:a:0?",
+                "-af",
+                "aresample=async=1:first_pts=0",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-y",
+                audio_file,
             ]
 
             try:
-                print(f"[INFO] Extracting audio segment {idx + 1}/{len(segments)}: {start_time:.3f}s → {end_time:.3f}s")
+                print(
+                    f"[INFO] Extracting audio segment {idx + 1}/{len(segments)}: {start_time:.3f}s → {end_time:.3f}s"
+                )
                 subprocess.run(args, check=True, capture_output=True, text=True)
 
                 if not FFmpegPostProcessor.validate_audio_file(audio_file):
-                    print(f"[WARN] Validation failed for segment {idx + 1}, retrying extraction once")
+                    print(
+                        f"[WARN] Validation failed for segment {idx + 1}, retrying extraction once"
+                    )
                     subprocess.run(args, check=True, capture_output=True, text=True)
                     if not FFmpegPostProcessor.validate_audio_file(audio_file):
-                        print(f"[ERROR] Retried segment {idx + 1} is still invalid after validation")
+                        print(
+                            f"[ERROR] Retried segment {idx + 1} is still invalid after validation"
+                        )
                         for audio in audio_files:
-                            try: os.remove(audio)
-                            except OSError: pass
+                            try:
+                                os.remove(audio)
+                            except OSError:
+                                pass
                         return False, []
 
                 print(f"[INFO] Segment {idx + 1} extracted successfully")
             except Exception as e:
                 print(f"[ERROR] Failed to extract audio segment {idx + 1}: {e}")
                 for audio in audio_files:
-                    try: os.remove(audio)
-                    except OSError: pass
+                    try:
+                        os.remove(audio)
+                    except OSError:
+                        pass
                 return False, []
 
         print(f"[INFO] All {len(segments)} audio segment(s) extracted successfully")
         return True, audio_files
 
     @staticmethod
-    def concatenate_audio_segments(audio_files: List[str], temp_audio_dir: str) -> Optional[str]:
+    def concatenate_audio_segments(
+        audio_files: List[str], temp_audio_dir: str
+    ) -> Optional[str]:
         """Concatenate multiple audio files into a single audio file."""
         if not audio_files:
             return None
@@ -466,9 +599,25 @@ class FFmpegPostProcessor:
 
         output_audio = os.path.join(temp_audio_dir, "audio_concatenated.m4a")
         args = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat",
-            "-safe", "0", "-i", concat_file, "-vn",
-            "-af", "aresample=async=1:first_pts=0", "-c:a", "aac", "-b:a", "192k", "-y", output_audio,
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            concat_file,
+            "-vn",
+            "-af",
+            "aresample=async=1:first_pts=0",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-y",
+            output_audio,
         ]
 
         try:
@@ -488,34 +637,67 @@ class FFmpegPostProcessor:
             return False
 
         if output_video and os.path.exists(output_video):
-            try: os.remove(output_video)
-            except OSError: pass
+            try:
+                os.remove(output_video)
+            except OSError:
+                pass
 
         args = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-i", source_video,
-            "-map", "0:v:0", "-c:v", "copy", "-an", "-y", output_video,
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            source_video,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            "-y",
+            output_video,
         ]
 
         try:
             subprocess.run(args, check=True)
-            print(f"[WARN] Audio processing failed; emitted video-only output: {output_video}")
+            print(
+                f"[WARN] Audio processing failed; emitted video-only output: {output_video}"
+            )
             return True
         except Exception as e:
             print(f"[ERROR] Video-only remux fallback failed: {e}")
             return False
 
     @staticmethod
-    def concatenate_segments_video_only(list_file_path: str, final_file_path: str) -> bool:
+    def concatenate_segments_video_only(
+        list_file_path: str, final_file_path: str
+    ) -> bool:
         """Fallback concatenation for segment mode when audio concat fails."""
         args = [
-            "ffmpeg", "-hide_banner", "-loglevel", "error", "-f", "concat",
-            "-safe", "0", "-i", list_file_path, "-map", "0:v:0",
-            "-c:v", "copy", "-an", "-y", final_file_path,
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "concat",
+            "-safe",
+            "0",
+            "-i",
+            list_file_path,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            "-an",
+            "-y",
+            final_file_path,
         ]
 
         try:
             subprocess.run(args, check=True)
-            print(f"[WARN] Segment audio concat failed; emitted video-only output: {final_file_path}")
+            print(
+                f"[WARN] Segment audio concat failed; emitted video-only output: {final_file_path}"
+            )
             return True
         except Exception as e:
             print(f"[ERROR] Segment video-only fallback concat failed: {e}")

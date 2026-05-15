@@ -1765,11 +1765,20 @@ class VideoProcessor(QObject):
             return prev
 
     def process_current_frame(
-        self, synchronous: bool = False, fit_on_complete: bool = False
-    ):
+        self,
+        synchronous: bool = False,
+        fit_on_complete: bool = False,
+        suppress_raw_preview: bool = False,
+    ) -> "FrameWorker | None":
         """
         Process the single, currently selected frame (e.g., after seek or for image).
         This is a one-shot operation, not part of the metronome.
+
+        Args:
+            synchronous: If True, blocks until processing is done.
+            fit_on_complete: If True, auto-fits the view after generation.
+            suppress_raw_preview: If True, skips displaying the unprocessed raw frame
+                                  while waiting for the AI worker. Prevents UI flashing.
         """
         if self.processing or self.is_processing_segments:
             print("[INFO] Stopping active processing to process single frame.")
@@ -1920,7 +1929,20 @@ class VideoProcessor(QObject):
 
         # --- Process if read was successful ---
         if read_successful and frame_to_process is not None:
-            if frame_changed:
+            # Check if the UI is currently simulating a navigation step
+            is_stepping = getattr(self.main_window, "_is_stepping_media", False)
+            is_compare_active = getattr(
+                self.main_window, "view_face_compare_enabled", False
+            )
+            is_mask_active = getattr(self.main_window, "view_face_mask_enabled", False)
+
+            # Block the raw image preview IF explicitly requested (e.g., Stop button)
+            # OR IF we are actively stepping through navigation with a special preview mode active
+            force_suppression = suppress_raw_preview or (
+                is_stepping and (is_compare_active or is_mask_active)
+            )
+
+            if frame_changed and not force_suppression:
                 frame_bgr_preview = numpy.ascontiguousarray(frame_to_process[..., ::-1])
                 self.display_current_frame(
                     generation=0,
@@ -2170,10 +2192,11 @@ class VideoProcessor(QObject):
             was_recording_default_style or was_processing_segments
         ):
             print(
-                "[INFO] Stop Processing: Triggering final frame refresh to match UI state."
+                "[INFO] Stop Processing: Triggering final frame refresh to match UI state (raw preview suppressed)."
             )
-            # We call this asynchronously to let the UI finish its current state cleanup first
-            self.process_current_frame(synchronous=False)
+            # We call this asynchronously to let the UI finish its current state cleanup first.
+            # suppress_raw_preview=True ensures the UI doesn't flash the original image while computing.
+            self.process_current_frame(synchronous=False, suppress_raw_preview=True)
 
         self.processing_stopped_signal.emit()
 
