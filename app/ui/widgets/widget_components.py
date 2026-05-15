@@ -100,6 +100,27 @@ class CardButton(QPushButton):
         self.main_window: "MainWindow" = kwargs.get("main_window", False)
         self.list_item = None
         self.list_widget: QtWidgets.QListWidget = None
+        self.popMenu: QtWidgets.QMenu | None = None
+
+    def _release_context_menu(self, *action_attrs: str) -> None:
+        for attr in action_attrs:
+            action = getattr(self, attr, None)
+            if action is not None:
+                try:
+                    action.deleteLater()
+                except RuntimeError:
+                    pass
+                setattr(self, attr, None)
+        if self.popMenu is not None:
+            try:
+                self.popMenu.deleteLater()
+            except RuntimeError:
+                pass
+            self.popMenu = None
+
+    def _exec_context_menu(self, point) -> None:
+        if self.popMenu is not None:
+            self.popMenu.exec_(self.mapToGlobal(point))
 
     def _restore_pre_click_checked_state(self):
         self.blockSignals(True)
@@ -225,7 +246,6 @@ class TargetMediaCardButton(CardButton):
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
 
     def set_thumbnail_pixmap(self, pixmap: QtGui.QPixmap) -> None:
         self._thumbnail_pixmap = pixmap
@@ -563,13 +583,22 @@ class TargetMediaCardButton(CardButton):
 
     def on_context_menu(self, point):
         # show context menu
-        scan_active = video_control_actions.is_issue_scan_active(self.main_window)
-        self.remove_action.setEnabled(not scan_active)
-        self.delete_action.setEnabled(not scan_active)
-        self.clear_all_media_action.setEnabled(
-            bool(self.main_window.target_videos) and not scan_active
-        )
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            self.remove_action.setEnabled(not scan_active)
+            self.delete_action.setEnabled(not scan_active)
+            self.clear_all_media_action.setEnabled(
+                bool(self.main_window.target_videos) and not scan_active
+            )
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "remove_action",
+                "delete_action",
+                "open_path_action",
+                "clear_all_media_action",
+            )
 
 
 class TargetFaceCardButton(CardButton):
@@ -637,7 +666,6 @@ class TargetFaceCardButton(CardButton):
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
 
         # Create parameter dict for the target
         if not self.main_window.parameters.get(self.face_id):
@@ -1054,18 +1082,33 @@ class TargetFaceCardButton(CardButton):
 
     def on_context_menu(self, point):
         # show context menu
-        scan_active = video_control_actions.is_issue_scan_active(self.main_window)
-        current_face_size = getattr(
-            self.main_window, "face_thumbnail_button_size", None
-        )
-        self.face_header_action.setText(self.get_display_label())
-        self.parameters_paste_action.setEnabled(not scan_active)
-        self.load_parameters_action.setEnabled(not scan_active)
-        self.load_parameters_and_settings_action.setEnabled(not scan_active)
-        self.remove_action.setEnabled(not scan_active)
-        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
-        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            current_face_size = getattr(
+                self.main_window, "face_thumbnail_button_size", None
+            )
+            self.face_header_action.setText(self.get_display_label())
+            self.parameters_paste_action.setEnabled(not scan_active)
+            self.load_parameters_action.setEnabled(not scan_active)
+            self.load_parameters_and_settings_action.setEnabled(not scan_active)
+            self.remove_action.setEnabled(not scan_active)
+            self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+            self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "face_header_action",
+                "parameters_copy_action",
+                "parameters_paste_action",
+                "save_parameters_action",
+                "load_parameters_action",
+                "load_parameters_and_settings_action",
+                "thumbnail_size_action_group",
+                "small_thumbnails_action",
+                "large_thumbnails_action",
+                "remove_action",
+            )
 
     def remove_target_face_from_list(self):
         main_window = self.main_window
@@ -1130,7 +1173,9 @@ class TargetFaceCardButton(CardButton):
     def refresh_display_label(self):
         display_label = self.get_display_label()
         self.display_label.setText(display_label)
-        self.face_header_action.setText(display_label)
+        face_header_action = getattr(self, "face_header_action", None)
+        if face_header_action is not None:
+            face_header_action.setText(display_label)
 
     def remove_assigned_input_face(self, input_face_id):
         if self.assigned_input_faces.get(input_face_id):
@@ -1180,7 +1225,6 @@ class InputFaceCardButton(CardButton):
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
 
     def set_embedding(self, embedding_swap_model: str, embedding: np.ndarray):
         self.embedding_store[embedding_swap_model] = embedding
@@ -1458,19 +1502,32 @@ class InputFaceCardButton(CardButton):
 
     def on_context_menu(self, point):
         # show context menu
-        scan_active = video_control_actions.is_issue_scan_active(self.main_window)
-        current_face_size = getattr(
-            self.main_window, "face_thumbnail_button_size", None
-        )
-        self.create_embed_action.setEnabled(not scan_active)
-        self.remove_action.setEnabled(not scan_active)
-        self.delete_action.setEnabled(not scan_active)
-        self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
-        self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
-        self.clear_all_faces_action.setEnabled(
-            bool(self.main_window.input_faces) and not scan_active
-        )
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            current_face_size = getattr(
+                self.main_window, "face_thumbnail_button_size", None
+            )
+            self.create_embed_action.setEnabled(not scan_active)
+            self.remove_action.setEnabled(not scan_active)
+            self.delete_action.setEnabled(not scan_active)
+            self.small_thumbnails_action.setChecked(current_face_size == (70, 70))
+            self.large_thumbnails_action.setChecked(current_face_size == (96, 96))
+            self.clear_all_faces_action.setEnabled(
+                bool(self.main_window.input_faces) and not scan_active
+            )
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "create_embed_action",
+                "remove_action",
+                "delete_action",
+                "open_path_action",
+                "thumbnail_size_action_group",
+                "small_thumbnails_action",
+                "large_thumbnails_action",
+                "clear_all_faces_action",
+            )
 
     def create_embedding_from_selected_faces(self):
         if video_control_actions.block_if_issue_scan_active(
@@ -1529,7 +1586,6 @@ class EmbeddingCardButton(CardButton):
         self.setContextMenuPolicy(QtCore.Qt.CustomContextMenu)
         # Connect the custom context menu request signal to the custom slot
         self.customContextMenuRequested.connect(self.on_context_menu)
-        self.create_context_menu()
 
     # --- Property definitions to intercept when a K/V map is assigned ---
     @property
@@ -1626,12 +1682,19 @@ class EmbeddingCardButton(CardButton):
 
     def on_context_menu(self, point):
         # show context menu
-        scan_active = video_control_actions.is_issue_scan_active(self.main_window)
-        self.remove_action.setEnabled(not scan_active)
-        self.clear_all_embeddings_action.setEnabled(
-            bool(self.main_window.merged_embeddings) and not scan_active
-        )
-        self.popMenu.exec_(self.mapToGlobal(point))
+        self.create_context_menu()
+        try:
+            scan_active = video_control_actions.is_issue_scan_active(self.main_window)
+            self.remove_action.setEnabled(not scan_active)
+            self.clear_all_embeddings_action.setEnabled(
+                bool(self.main_window.merged_embeddings) and not scan_active
+            )
+            self._exec_context_menu(point)
+        finally:
+            self._release_context_menu(
+                "remove_action",
+                "clear_all_embeddings_action",
+            )
 
     def remove_embedding_from_list(self):
         if video_control_actions.block_if_issue_scan_active(
