@@ -311,7 +311,8 @@ class FrameEdits:
             ) -> torch.Tensor:
                 """
                 Helper to calculate motion with 'Smart Dynamic Boost' and 'Neutral Factor'.
-                Encapsulates Z-Axis Gaze Lock with Automated Perceptual Pitch Compensation.
+                Encapsulates Z-Axis Gaze Lock with Automated Perceptual Pitch Compensation
+                and Eyelid Compensation (Anti-Bulging Fix).
                 """
                 delta_local = x_s_info["exp"].clone()
                 force_camera_gaze = parameters.get(
@@ -400,7 +401,7 @@ class FrameEdits:
                                 else 0.0
                             )
 
-                            # 6. Horizontal Overwrite & Vertical Safe Addition
+                            # 6. Horizontal Overwrite & Vertical Safe Addition (Pupils)
                             delta_local[:, 11, 0] = safe_gaze_x
                             delta_local[:, 15, 0] = safe_gaze_x
 
@@ -414,6 +415,23 @@ class FrameEdits:
                                 + diff[:, idx_15, 1]
                                 + safe_gaze_y
                             )
+
+                            # 7. EYELID COMPENSATION (Anti-Bulging Fix)
+                            # Eyelids must follow the pupil's vertical shift to prevent sclera over-exposure.
+                            if 13 in indices and 16 in indices:
+                                idx_13, idx_16 = indices.index(13), indices.index(16)
+                                eyelid_comp = safe_gaze_y * 0.60  # 60% follow-through ratio
+                                
+                                delta_local[:, 13, 1] = (
+                                    x_s_info["exp"][:, 13, 1]
+                                    + diff[:, idx_13, 1]
+                                    + eyelid_comp
+                                )
+                                delta_local[:, 16, 1] = (
+                                    x_s_info["exp"][:, 16, 1]
+                                    + diff[:, idx_16, 1]
+                                    + eyelid_comp
+                                )
 
                         else:
                             # Standard Dampening
@@ -482,12 +500,20 @@ class FrameEdits:
                                 else 0.0
                             )
 
-                            # Absolute Overwrite & Safe Addition
+                            # Absolute Overwrite & Safe Addition (Pupils)
                             delta_local[:, 11, 0] = safe_gaze_x
                             delta_local[:, 15, 0] = safe_gaze_x
 
                             delta_local[:, 11, 1] = delta_local[:, 11, 1] + safe_gaze_y
                             delta_local[:, 15, 1] = delta_local[:, 15, 1] + safe_gaze_y
+
+                            # EYELID COMPENSATION (Anti-Bulging Fix for Absolute Mode)
+                            if 13 in indices and 16 in indices:
+                                idx_13, idx_16 = indices.index(13), indices.index(16)
+                                eyelid_comp = safe_gaze_y * 0.60
+                                
+                                delta_local[:, 13, 1] = delta_local[:, 13, 1] + eyelid_comp
+                                delta_local[:, 16, 1] = delta_local[:, 16, 1] + eyelid_comp
 
                         else:
                             # Standard Blend
@@ -678,34 +704,22 @@ class FrameEdits:
                 eyes_normalize_max = parameters.get(
                     "FaceExpressionNormalizeEyesMaxBothDecimalSlider", 0.50
                 )
-                combined_eyes_ratio_normalize = None
 
+                # --- EYE NORMALIZATION PRE-PROCESSING ---
+                # Default baseline is the raw driving ratio
+                eyes_target_array = c_d_eyes_lst  
+                
                 if flag_normalize_eyes and source_lmk is not None:
-                    c_d_eyes_normalize = c_d_eyes_lst
-                    eyes_ratio = np.array([c_d_eyes_normalize[0][0]], dtype=np.float32)
-                    eyes_ratio_normalize = max(eyes_ratio, 0.10)
-                    eyes_ratio_l = min(c_d_eyes_normalize[0][0], eyes_normalize_max)
-                    eyes_ratio_r = min(c_d_eyes_normalize[0][1], eyes_normalize_max)
-                    eyes_ratio_max = np.array(
-                        [[eyes_ratio_l, eyes_ratio_r]], dtype=np.float32
-                    )
-
-                    if eyes_ratio_normalize > eyes_normalize_threshold:
-                        combined_eyes_ratio_normalize = (
-                            faceutil.calc_combined_eye_ratio_norm(
-                                eyes_ratio_max,
-                                source_lmk,
-                                device=self.models_processor.device,
-                            )
-                        )
-                    else:
-                        combined_eyes_ratio_normalize = (
-                            faceutil.calc_combined_eye_ratio(
-                                eyes_ratio_max,
-                                source_lmk,
-                                device=self.models_processor.device,
-                            )
-                        )
+                    # Check if the overall eye openness exceeds the user's threshold
+                    current_max_openness = max(c_d_eyes_lst[0][0], c_d_eyes_lst[0][1])
+                    
+                    if current_max_openness > eyes_normalize_threshold:
+                        # Clamp both eyes independently to the max allowed value 
+                        # This prevents the "surprised" look while preserving winks
+                        eyes_target_array = np.array([
+                            [min(c_d_eyes_lst[0][0], eyes_normalize_max),
+                             min(c_d_eyes_lst[0][1], eyes_normalize_max)]
+                        ], dtype=np.float32)
 
                 if flag_activate_eyes:
                     eyes_retarget_delta = 0
@@ -715,21 +729,23 @@ class FrameEdits:
                             1.0,
                         )
 
-                        if (
-                            flag_normalize_eyes
-                            and combined_eyes_ratio_normalize is not None
-                        ):
-                            target_eye_ratio = combined_eyes_ratio_normalize
-                        else:
-                            target_eye_ratio = faceutil.calc_combined_eye_ratio(
-                                c_d_eyes_lst,
-                                source_lmk,
-                                device=self.models_processor.device,
-                            )
-
-                        eyes_retarget_delta = self.models_processor.lp_retarget_eye(
-                            x_s, target_eye_ratio * eye_mult, face_editor_type
+                        # 1. Get Independent Tensors for each eye to feed into the MLPs
+                        ratio_left, ratio_right = faceutil.calc_independent_eye_ratios(
+                            eyes_target_array, source_lmk, device=self.models_processor.device
                         )
+
+                        # 2. Double MLP Inference
+                        delta_left_sym = self.models_processor.lp_retarget_eye(
+                            x_s, ratio_left * eye_mult, face_editor_type
+                        )
+                        delta_right_sym = self.models_processor.lp_retarget_eye(
+                            x_s, ratio_right * eye_mult, face_editor_type
+                        )
+
+                        # 3. Latent Splicing: Stitch Left and Right expressions
+                        # Indices: 15 (Right pupil/center), 16 (Right eyelid)
+                        eyes_retarget_delta = delta_left_sym.clone()
+                        eyes_retarget_delta[:, [15, 16], :] = delta_right_sym[:, [15, 16], :]
 
                     if (
                         flag_stable_gaze_eyes

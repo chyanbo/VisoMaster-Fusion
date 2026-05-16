@@ -2403,40 +2403,59 @@ def update_delta_new_mov_y(mov_y, delta_new, **kwargs):
 
 # imported from https://github.com/KwaiVGI/LivePortrait/blob/main/src/utils/live_portrait_wrapper.py
 def calc_combined_eye_ratio(c_d_eyes_i, source_lmk, device="cuda"):
+    """
+    FIX: Averages the driving eye ratios to prevent left-eye dominance bias.
+    Ensures symmetric baseline retargeting for the LivePortrait generator.
+    """
     c_s_eyes = calc_eye_close_ratio(source_lmk[None])
     c_s_eyes_tensor = torch.from_numpy(c_s_eyes).float().to(device)
-    # c_d_eyes_i_tensor = torch.Tensor([c_d_eyes_i[0][0]]).reshape(1, 1).to(device)
-    c_d_eyes_i_numpy_m = np.array(
-        [c_d_eyes_i[0][0]], dtype=np.float32
-    )  # Assicurati che sia un array NumPy
-    c_d_eyes_i_numpy = np.array(
-        [max(c_d_eyes_i_numpy_m, 0.08)], dtype=np.float32
-    )  # Mini 0.08 otherwise eyelids overlap
+
+    # Safely extract left and right eye ratios
+    left_eye_ratio = c_d_eyes_i[0][0]
+    right_eye_ratio = c_d_eyes_i[0][1] if len(c_d_eyes_i[0]) > 1 else left_eye_ratio
+
+    # Calculate the mean to harmonize the retargeting delta
+    mean_eye_ratio = (left_eye_ratio + right_eye_ratio) / 2.0
+
+    c_d_eyes_i_numpy_m = np.array([mean_eye_ratio], dtype=np.float32)
+
+    # Minimum 0.08 clamp to prevent eyelid mesh overlapping (Z-fighting)
+    c_d_eyes_i_numpy = np.array([max(c_d_eyes_i_numpy_m[0], 0.08)], dtype=np.float32)
     c_d_eyes_i_tensor = torch.from_numpy(c_d_eyes_i_numpy).reshape(1, 1).to(device)
-    # [c_s,eyes, c_d,eyes,i]
+
+    # Format: [c_s,eyes, c_d,eyes,i]
     combined_eye_ratio_tensor = torch.cat([c_s_eyes_tensor, c_d_eyes_i_tensor], dim=1)
 
     return combined_eye_ratio_tensor
 
-
-def calc_combined_eye_ratio_norm(c_d_eyes_i, source_lmk, device="cuda"):
+def calc_independent_eye_ratios(
+    c_d_eyes_i: np.ndarray, source_lmk: np.ndarray, device: str = "cuda"
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Calculates separate retargeting tensors for Left and Right eyes.
+    Enables the 'Split-Eye' asymmetric blink (winking) trick.
+    """
     c_s_eyes = calc_eye_close_ratio(source_lmk[None])
     c_s_eyes_tensor = torch.from_numpy(c_s_eyes).float().to(device)
-    # c_d_eyes_i_tensor = torch.Tensor([c_d_eyes_i[0][0]]).reshape(1, 1).to(device)
-    c_d_eyes_i_numpy_l = np.array(
-        [c_d_eyes_i[0][0]], dtype=np.float32
-    )  # Assicurati che sia un array NumPy
-    c_d_eyes_i_numpy_r = np.array(
-        [c_d_eyes_i[0][1]], dtype=np.float32
-    )  # Assicurati che sia un array NumPy
-    c_d_eyes_i_numpy = np.array(
-        [max(min(c_d_eyes_i_numpy_l, c_d_eyes_i_numpy_r), 0.08)], dtype=np.float32
-    )  # Mini 0.08 otherwise eyelids overlap
-    c_d_eyes_i_tensor = torch.from_numpy(c_d_eyes_i_numpy).reshape(1, 1).to(device)
-    # [c_s,eyes, c_d,eyes,i]
-    combined_eye_ratio_tensor = torch.cat([c_s_eyes_tensor, c_d_eyes_i_tensor], dim=1)
 
-    return combined_eye_ratio_tensor
+    # Safely extract left and right eye ratios
+    left_eye_ratio = float(c_d_eyes_i[0][0])
+    right_eye_ratio = (
+        float(c_d_eyes_i[0][1]) if len(c_d_eyes_i[0]) > 1 else left_eye_ratio
+    )
+
+    # Clamp to 0.08 minimum to avoid 3D mesh overlap (Z-fighting on eyelids)
+    left_val = np.array([max(left_eye_ratio, 0.08)], dtype=np.float32)
+    right_val = np.array([max(right_eye_ratio, 0.08)], dtype=np.float32)
+
+    left_tensor = torch.from_numpy(left_val).reshape(1, 1).to(device)
+    right_tensor = torch.from_numpy(right_val).reshape(1, 1).to(device)
+
+    # Format: [c_s_left, c_s_right, target_specific_eye]
+    ratio_left_target = torch.cat([c_s_eyes_tensor, left_tensor], dim=1)
+    ratio_right_target = torch.cat([c_s_eyes_tensor, right_tensor], dim=1)
+
+    return ratio_left_target, ratio_right_target
 
 
 # imported from https://github.com/KwaiVGI/LivePortrait/blob/main/src/utils/live_portrait_wrapper.py
