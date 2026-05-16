@@ -2428,6 +2428,7 @@ def calc_combined_eye_ratio(c_d_eyes_i, source_lmk, device="cuda"):
 
     return combined_eye_ratio_tensor
 
+
 def calc_independent_eye_ratios(
     c_d_eyes_i: np.ndarray, source_lmk: np.ndarray, device: str = "cuda"
 ) -> tuple[torch.Tensor, torch.Tensor]:

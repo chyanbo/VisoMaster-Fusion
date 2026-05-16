@@ -420,8 +420,10 @@ class FrameEdits:
                             # Eyelids must follow the pupil's vertical shift to prevent sclera over-exposure.
                             if 13 in indices and 16 in indices:
                                 idx_13, idx_16 = indices.index(13), indices.index(16)
-                                eyelid_comp = safe_gaze_y * 0.60  # 60% follow-through ratio
-                                
+                                eyelid_comp = (
+                                    safe_gaze_y * 0.60
+                                )  # 60% follow-through ratio
+
                                 delta_local[:, 13, 1] = (
                                     x_s_info["exp"][:, 13, 1]
                                     + diff[:, idx_13, 1]
@@ -511,9 +513,13 @@ class FrameEdits:
                             if 13 in indices and 16 in indices:
                                 idx_13, idx_16 = indices.index(13), indices.index(16)
                                 eyelid_comp = safe_gaze_y * 0.60
-                                
-                                delta_local[:, 13, 1] = delta_local[:, 13, 1] + eyelid_comp
-                                delta_local[:, 16, 1] = delta_local[:, 16, 1] + eyelid_comp
+
+                                delta_local[:, 13, 1] = (
+                                    delta_local[:, 13, 1] + eyelid_comp
+                                )
+                                delta_local[:, 16, 1] = (
+                                    delta_local[:, 16, 1] + eyelid_comp
+                                )
 
                         else:
                             # Standard Blend
@@ -707,19 +713,24 @@ class FrameEdits:
 
                 # --- EYE NORMALIZATION PRE-PROCESSING ---
                 # Default baseline is the raw driving ratio
-                eyes_target_array = c_d_eyes_lst  
-                
+                eyes_target_array = c_d_eyes_lst
+
                 if flag_normalize_eyes and source_lmk is not None:
                     # Check if the overall eye openness exceeds the user's threshold
                     current_max_openness = max(c_d_eyes_lst[0][0], c_d_eyes_lst[0][1])
-                    
+
                     if current_max_openness > eyes_normalize_threshold:
-                        # Clamp both eyes independently to the max allowed value 
+                        # Clamp both eyes independently to the max allowed value
                         # This prevents the "surprised" look while preserving winks
-                        eyes_target_array = np.array([
-                            [min(c_d_eyes_lst[0][0], eyes_normalize_max),
-                             min(c_d_eyes_lst[0][1], eyes_normalize_max)]
-                        ], dtype=np.float32)
+                        eyes_target_array = np.array(
+                            [
+                                [
+                                    min(c_d_eyes_lst[0][0], eyes_normalize_max),
+                                    min(c_d_eyes_lst[0][1], eyes_normalize_max),
+                                ]
+                            ],
+                            dtype=np.float32,
+                        )
 
                 if flag_activate_eyes:
                     eyes_retarget_delta = 0
@@ -731,7 +742,9 @@ class FrameEdits:
 
                         # 1. Get Independent Tensors for each eye to feed into the MLPs
                         ratio_left, ratio_right = faceutil.calc_independent_eye_ratios(
-                            eyes_target_array, source_lmk, device=self.models_processor.device
+                            eyes_target_array,
+                            source_lmk,
+                            device=self.models_processor.device,
                         )
 
                         # 2. Double MLP Inference
@@ -745,7 +758,9 @@ class FrameEdits:
                         # 3. Latent Splicing: Stitch Left and Right expressions
                         # Indices: 15 (Right pupil/center), 16 (Right eyelid)
                         eyes_retarget_delta = delta_left_sym.clone()
-                        eyes_retarget_delta[:, [15, 16], :] = delta_right_sym[:, [15, 16], :]
+                        eyes_retarget_delta[:, [15, 16], :] = delta_right_sym[
+                            :, [15, 16], :
+                        ]
 
                     if (
                         flag_stable_gaze_eyes
