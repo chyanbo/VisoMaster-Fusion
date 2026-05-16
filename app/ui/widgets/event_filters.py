@@ -62,29 +62,31 @@ class VideoSeekSliderEventFilter(QtCore.QObject):
 
     def eventFilter(self, slider, event):
         if event.type() == QtCore.QEvent.Type.KeyPress:
-            if event.key() in {QtCore.Qt.Key_Left, QtCore.Qt.Key_Right}:
-                # Allow default slider movement
-                result = super().eventFilter(slider, event)
-
-                # After the slider moves, call the custom processing function
-                QtCore.QTimer.singleShot(
-                    0, self.main_window.video_processor.process_current_frame
+            if event.key() == QtCore.Qt.Key_Right:
+                # Force strictly 1 frame advance through our controlled pipeline
+                video_control_actions.advance_video_slider_by_n_frames(
+                    self.main_window, 1
                 )
+                return True  # Stop QT from applying default values
 
-                return result  # Return the result of the default handling
+            elif event.key() == QtCore.Qt.Key_Left:
+                # Force strictly 1 frame rewind through our controlled pipeline
+                video_control_actions.rewind_video_slider_by_n_frames(
+                    self.main_window, 1
+                )
+                return True  # Stop QT from applying default values
 
         elif event.type() == QtCore.QEvent.Type.Wheel:
-            # Intercept mousewheel to force FrameSkipStepSlider
+            # Intercept mousewheel to use FrameSkipStepSlider logic
             delta = event.angleDelta().y()
             if delta > 0:
                 # If wheel up (Advance)
                 video_control_actions.advance_video_slider_by_n_frames(self.main_window)
             elif delta < 0:
-                # If wheel up (Rewind)
+                # If wheel down (Rewind)
                 video_control_actions.rewind_video_slider_by_n_frames(self.main_window)
 
-            # Return True to stop QT from applying default values
-            return True
+            return True  # Stop QT from applying default values
 
         # For other events, use the default behavior
         return super().eventFilter(slider, event)

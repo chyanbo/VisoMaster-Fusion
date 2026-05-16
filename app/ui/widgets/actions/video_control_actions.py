@@ -1541,17 +1541,31 @@ def advance_video_slider_by_n_frames(main_window: "MainWindow", n=None):
         if new_position > video_processor.max_frame_number:
             new_position = video_processor.max_frame_number
 
-        # 1. Setting the value triggers 'on_change_video_seek_slider' automatically.
-        # Since the slider is not being dragged (isSliderDown() == False),
-        # that slot will naturally execute 'run_post_seek_actions' ONCE.
-        main_window.videoSeekSlider.setValue(new_position)
+        # --- CONTEXT-AWARE NAVIGATION (STEPPING) ---
+        is_compare_active = getattr(main_window, "view_face_compare_enabled", False)
+        is_mask_active = getattr(main_window, "view_face_mask_enabled", False)
+        suppress_flash = is_compare_active or is_mask_active
+
+        # Raise the flag to prevent raw frame rendering during slider update
+        if suppress_flash:
+            main_window._is_stepping_media = True
+
+        try:
+            # 1. Setting the value triggers 'on_change_video_seek_slider' automatically.
+            # Since the slider is not being dragged (isSliderDown() == False),
+            # that slot will naturally execute 'run_post_seek_actions' ONCE.
+            main_window.videoSeekSlider.setValue(new_position)
+        finally:
+            # Always drop the flag safely
+            if suppress_flash:
+                main_window._is_stepping_media = False
 
         # 2. Check if this is a single frame step (like 'V' key)
         is_single_frame_step = n == 1
 
-        # 3. Run AI models. Runs synchronously only for single steps to prevent "flash".
+        # 3. Run AI models. Explicitly suppress raw preview if special mode is active!
         main_window.video_processor.process_current_frame(
-            synchronous=is_single_frame_step
+            synchronous=is_single_frame_step, suppress_raw_preview=suppress_flash
         )
 
 
@@ -1572,16 +1586,30 @@ def rewind_video_slider_by_n_frames(main_window: "MainWindow", n=None):
         if new_position < 0:
             new_position = 0
 
-        # 1. Setting the value triggers 'on_change_video_seek_slider' automatically.
-        # Prevents double execution of heavy Face Detection.
-        main_window.videoSeekSlider.setValue(new_position)
+        # --- CONTEXT-AWARE NAVIGATION (STEPPING) ---
+        is_compare_active = getattr(main_window, "view_face_compare_enabled", False)
+        is_mask_active = getattr(main_window, "view_face_mask_enabled", False)
+        suppress_flash = is_compare_active or is_mask_active
+
+        # Raise the flag to prevent raw frame rendering during slider update
+        if suppress_flash:
+            main_window._is_stepping_media = True
+
+        try:
+            # 1. Setting the value triggers 'on_change_video_seek_slider' automatically.
+            # Prevents double execution of heavy Face Detection.
+            main_window.videoSeekSlider.setValue(new_position)
+        finally:
+            # Always drop the flag safely
+            if suppress_flash:
+                main_window._is_stepping_media = False
 
         # 2. Check if this is a single frame step (like 'C' key)
         is_single_frame_step = n == 1
 
-        # 3. Run AI models. Runs synchronously only for single steps to prevent "flash".
+        # 3. Run AI models. Explicitly suppress raw preview if special mode is active!
         main_window.video_processor.process_current_frame(
-            synchronous=is_single_frame_step
+            synchronous=is_single_frame_step, suppress_raw_preview=suppress_flash
         )
 
 
@@ -2250,15 +2278,25 @@ def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
             # Cache the raw frame so process_current_frame() can use it as a
             # fallback when the near-EOF re-read fails (OpenCV reliability issue).
             video_processor._seek_cached_frame = (new_position, frame)
-            # For preview, show the raw frame immediately.
-            # The processed frame will be shown when the slider is released.
-            pixmap = common_widget_actions.get_pixmap_from_frame(main_window, frame)
-            graphics_view_actions.update_graphics_view(
-                main_window,
-                pixmap,
-                new_position,
-                size_mode="native_pixmap_size",
-            )
+
+            # --- HYBRID NAVIGATION PREVIEW ---
+            is_stepping = getattr(main_window, "_is_stepping_media", False)
+            is_compare_active = getattr(main_window, "view_face_compare_enabled", False)
+            is_mask_active = getattr(main_window, "view_face_mask_enabled", False)
+
+            # Suppress raw frame display ONLY if we are stepping via actions/shortcuts
+            # AND a special preview mode (Compare/Mask) is currently active.
+            suppress_flash = is_stepping and (is_compare_active or is_mask_active)
+
+            if not suppress_flash:
+                # Standard scrubbing: push the raw frame to the UI immediately for fast response
+                pixmap = common_widget_actions.get_pixmap_from_frame(main_window, frame)
+                graphics_view_actions.update_graphics_view(
+                    main_window,
+                    pixmap,
+                    new_position,
+                    size_mode="native_pixmap_size",
+                )
 
         else:
             # VP-34: Read failed. Trigger a stop/reopen cycle to recover from silent handle failures.
@@ -2268,6 +2306,7 @@ def on_change_video_seek_slider(main_window: "MainWindow", new_position=0):
             video_processor._seek_cached_frame = None
             main_window.last_seek_read_failed = True
             video_processor.stop_processing()
+
     # Only update parameters and widgets if the slider is NOT being actively dragged.
     # This ensures playback, clicks, and button presses update the UI,
     # but fast scrubbing does not cause lag or skip marker updates.
