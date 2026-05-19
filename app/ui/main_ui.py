@@ -797,8 +797,9 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
         if self.build_progress_dialog:
             self.build_progress_dialog.close()
 
-    def __init__(self):
+    def __init__(self, gpu_id=0):
         super(MainWindow, self).__init__()
+        self.gpu_id = gpu_id
         self.setupUi(self)
         self._base_window_title = self.windowTitle()
         self.initialize_variables()
@@ -1290,6 +1291,8 @@ class MainWindow(QtWidgets.QMainWindow, Ui_MainWindow):
 
         face_compare_action = QtGui.QAction("Face Compare", self.menuView)
         face_compare_action.setCheckable(True)
+        face_compare_action.setShortcut(QtGui.QKeySequence("X"))
+        face_compare_action.setShortcutContext(QtCore.Qt.ShortcutContext.WindowShortcut)
         face_compare_action.triggered.connect(
             lambda checked: (
                 self._set_compare_mode("compare", checked),

@@ -13,42 +13,103 @@ from app.processors.models_data import models_dir
 from app.processors.utils import faceutil
 
 
-def _kps5_is_degenerate(kps5) -> bool:
-    """Return True when the 5 keypoints are too collinear to define a stable
-    affine warp.
-
-    With ``from_points=True``, landmark detectors warp the source crop using a
-    5-point similarity transform (``warp_face_by_face_landmark_5``). For full
-    profile / extreme-yaw faces the 5 points (left eye, right eye, nose, two
-    mouth corners) are nearly collinear or have an occluded eye reflected onto
-    the visible side. The resulting warp is degenerate — landmarks come back
-    in wildly wrong positions ("eye sideways, mouth near the ear" symptom).
-
-    Detection: if the height of the triangle (left_eye, right_eye, nose),
-    measured as area÷base, is small relative to the eye-distance (< 10%),
-    treat as degenerate. The caller should fall back to the bbox-based warp
-    path (``from_points=False``).
-
-    Returns True when ``kps5`` is None, has fewer than 5 points, or is
-    geometrically degenerate.
+def _kps5_is_degenerate(kps5: np.ndarray, detect_mode: str = "203") -> bool:
     """
-    if kps5 is None:
+    Detects if the 5 keypoints form a degenerate geometry (extreme profile or severe pitch)
+    that would cause a 5-point affine warp matrix to collapse or produce distorted "monster" faces.
+
+    EVOLUTION & VIDEO OPTIMIZATION:
+    Earlier versions relied on rigid thresholds or triangle areas, which failed because AI models
+    often "hallucinate" occluded eyes on profiles. This version uses a Continuous Elliptical
+    Deformation Energy model based on the nose's deviation from the face's central axis.
+    Tolerances are deliberately relaxed to prevent temporal flickering (jitter) during video
+    playback. It only triggers a fallback to bounding-box on absolute worst-case scenarios.
+
+    HOW TO TUNE TOLERANCES:
+    Do NOT change the `> 1.0` cutoff (it represents the exact boundary of the safe 3D sphere).
+    Instead, adjust the `tol_` variables:
+      - tol_x (Yaw): Increase to allow more extreme side-profiles before fallback.
+      - tol_y (Pitch UP, dev_y_raw < 0): Increase to allow the head to tilt further back
+        (nose crossing the eye line) before fallback.
+      - tol_y (Pitch DOWN, dev_y_raw >= 0): Increase to allow the head to tilt further forward
+        (nose dropping below the mouth) before fallback.
+    """
+    if kps5 is None or len(kps5) < 5:
         return True
-    try:
-        kps5 = np.asarray(kps5, dtype=np.float32)
-    except (ValueError, TypeError):
+
+    # 1. Extract Keypoints
+    le = kps5[0]  # Left eye
+    re = kps5[1]  # Right eye
+    nose = kps5[2]  # Nose
+    mouth_l = kps5[3]  # Left mouth corner
+    mouth_r = kps5[4]  # Right mouth corner
+
+    # 2. Base Distances
+    eye_dist = np.linalg.norm(le - re)
+
+    eye_mid = (le + re) / 2.0
+    mouth_mid = (mouth_l + mouth_r) / 2.0
+
+    face_axis = mouth_mid - eye_mid
+    axis_length = np.linalg.norm(face_axis)
+
+    # Prevent division by zero on corrupted data
+    if axis_length < 1e-5 or eye_dist < 1e-5:
         return True
-    if kps5.ndim != 2 or kps5.shape[0] < 5:
+
+    # 3. Extreme 2D Compression Failsafe
+    # Triggers if eyes are mashed together (severe profile). Slightly stricter for 478.
+    compression_limit = 0.30 if detect_mode == "478" else 0.25
+    if (eye_dist / axis_length) < compression_limit:
         return True
-    le, re, nose = kps5[0], kps5[1], kps5[2]
-    eye_vec = re - le
-    eye_dist = float(np.linalg.norm(eye_vec))
-    if eye_dist < 1e-3:
-        return True  # both eyes coincide — definitely degenerate
-    # 2× area of triangle (LE, RE, nose) via cross product magnitude
-    cross = abs(eye_vec[0] * (nose[1] - le[1]) - eye_vec[1] * (nose[0] - le[0]))
-    triangle_h = cross / eye_dist  # perpendicular nose-to-eye-line distance
-    return (triangle_h / eye_dist) < 0.10
+
+    # 4. ELLIPTICAL DEFORMATION ENERGY
+    face_axis_normalized = face_axis / axis_length
+    nose_vector = nose - eye_mid
+
+    # Y-Axis (Pitch): Projection along the face axis
+    nose_proj_y = np.dot(nose_vector, face_axis_normalized)
+
+    # Ratio: 0.0 = eye level, 1.0 = mouth level
+    nose_vertical_ratio = nose_proj_y / axis_length
+
+    # X-Axis (Yaw): Orthogonal distance from the face axis
+    nose_perp = nose_vector - (nose_proj_y * face_axis_normalized)
+    nose_offset = np.linalg.norm(nose_perp)
+
+    # Raw Y-axis deviation (no absolute value, to determine pitch direction)
+    # A standard human nose sits roughly at 55% (0.55) down the eye-mouth axis.
+    dev_y_raw = nose_vertical_ratio - 0.55
+
+    # --- ASYMMETRIC VERTICAL TOLERANCES (PITCH) ---
+    if dev_y_raw < 0:
+        # Nose moves UP (Head tilted back).
+        # tol_y = 0.65 allows the nose to reach or slightly pass the eye line (ratio -0.10)
+        # without breaking the affine matrix. Slightly stricter for 478.
+        tol_y = 0.50 if detect_mode == "478" else 0.65
+    else:
+        # Nose moves DOWN (Head tilted forward). Geometry remains naturally robust.
+        # tol_y = 0.70 allows the nose to drop WELL BELOW the mouth (up to a ratio of 1.25).
+        # Slightly stricter for 478.
+        tol_y = 0.55 if detect_mode == "478" else 0.70
+
+    dev_y = abs(dev_y_raw)
+    dev_x = nose_offset / eye_dist
+
+    # --- HORIZONTAL TOLERANCE (YAW) ---
+    # Kept relatively wide (0.70) by default to ensure smooth video tracking.
+    # Model '478' is extremely sensitive to affine squashing on profiles.
+    # We tighten its tolerance to force the BBox fallback earlier.
+    tol_x = 0.40 if detect_mode == "478" else 0.65
+
+    # Deformation Ellipse Equation
+    deformation_energy = (dev_y / tol_y) ** 2 + (dev_x / tol_x) ** 2
+
+    # If energy exceeds 1.0, the nose is outside the safe 3D sphere.
+    if deformation_energy > 1.0:
+        return True
+
+    return False
 
 
 class FaceLandmarkDetectors:
@@ -187,8 +248,16 @@ class FaceLandmarkDetectors:
         # geometry and force the bbox-based warp path instead — it is less
         # accurate on aligned faces but produces sane output for side angles
         # where the keypoint-based warp simply cannot work.
+        is_degenerate = False
+        if det_kpss is not None and len(det_kpss) >= 5:
+            try:
+                is_degenerate = _kps5_is_degenerate(det_kpss, detect_mode=detect_mode)
+            except TypeError:
+                is_degenerate = _kps5_is_degenerate(det_kpss)
+
+        # Fallback to BBox if the face angle is too extreme for the template
         effective_from_points = from_points
-        if from_points and _kps5_is_degenerate(det_kpss):
+        if from_points and is_degenerate:
             effective_from_points = False
 
         # Call the specific detection function with kwargs
@@ -279,17 +348,27 @@ class FaceLandmarkDetectors:
         Prepares a cropped and warped face image for a landmark detector.
         This helper centralizes the repetitive pre-processing logic of aligning a face
         based on either a bounding box or existing keypoints.
-
         Returns:
             Tuple[torch.Tensor, np.ndarray, np.ndarray]: The cropped image, the forward transform matrix (M),
                                                           and the inverse transform matrix (IM).
         """
+        import math
+
         if not from_points:
             # Align the face using the bounding box center and size.
             w, h = (bbox[2] - bbox[0]), (bbox[3] - bbox[1])
             center = (bbox[2] + bbox[0]) / 2, (bbox[3] + bbox[1]) / 2
             _scale = target_size / (max(w, h) * scale)
-            aimg, M = faceutil.transform(img, center, target_size, _scale, 0)
+
+            # Correct math implementation to upright tilted faces in fallback mode.
+            angle = 0.0
+            if det_kpss is not None and len(det_kpss) >= 2:
+                dx = det_kpss[1][0] - det_kpss[0][0]
+                dy = det_kpss[1][1] - det_kpss[0][1]
+                if math.hypot(dx, dy) > 1e-3:
+                    angle = math.degrees(math.atan2(-dy, dx))
+
+            aimg, M = faceutil.transform(img, center, target_size, _scale, angle)
             IM = faceutil.invertAffineTransform(M)
         else:
             if det_kpss is None or len(det_kpss) == 0:
@@ -353,8 +432,8 @@ class FaceLandmarkDetectors:
         for name, tensor in input_bindings.items():
             io_binding.bind_input(
                 name=name,
-                device_type=self.models_processor.device,
-                device_id=0,
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
                 element_type=np.float32,
                 shape=tensor.size(),
                 buffer_ptr=tensor.data_ptr(),
@@ -362,7 +441,11 @@ class FaceLandmarkDetectors:
 
         # Bind outputs. The device will allocate memory for them.
         for name in output_names:
-            io_binding.bind_output(name, self.models_processor.device)
+            io_binding.bind_output(
+                name,
+                self.models_processor.device_type,
+                self.models_processor.binding_device_id,
+            )
 
         # --- LAZY BUILD CHECK ---
         is_lazy_build = self.models_processor.check_and_clear_pending_build(model_name)
@@ -376,9 +459,9 @@ class FaceLandmarkDetectors:
         try:
             # PRE-INFERENCE SYNC: Ensure PyTorch has finished preparing the memory
             # before ONNX Runtime starts reading from the IOBinding pointers.
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             # Run inference
@@ -387,9 +470,9 @@ class FaceLandmarkDetectors:
             # POST-INFERENCE SYNC : Ensure the GPU has completed all
             # calculations before ONNX Runtime attempts to copy the result back to CPU RAM.
             # Without this, copy_outputs_to_cpu() might grab an incomplete tensor.
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             # Copy results back to CPU safely

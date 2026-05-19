@@ -76,16 +76,16 @@ class FaceMasks:
         io = ort_session.io_binding()
         io.bind_input(
             "input",
-            self.models_processor.device,
-            0,
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
             np.float32,
             (1, 3, 512, 512),
             x.data_ptr(),
         )
         io.bind_output(
             "output",
-            self.models_processor.device,
-            0,
+            self.models_processor.device_type,
+            self.models_processor.binding_device_id,
             np.float32,
             (1, 19, 512, 512),
             out.data_ptr(),
@@ -101,9 +101,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC: Ensure PyTorch memory is ready
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io)
@@ -183,15 +183,31 @@ class FaceMasks:
             )
             enhanced_swap_img[:, ymin:ymax, xmin:xmax] = sharpened_mouth
 
-        # --- Alignment Logic (Stable Center of Mass) ---
+        # --- Alignment Logic (Statistical Anchoring) ---
         y_s_full, x_s_full = torch.where(mouth_swap)
-        y_s_inner, _ = torch.where(inner_swap)
 
-        # Use Mean (Center of Mass) instead of min/max to avoid temporal jittering
+        # X-axis centroid of the entire mouth (highly stable spatial reference)
         cx_s = x_s_full.float().mean()
-        # Keep the top of the inner mouth as Y anchor (but average the top 5% to avoid 1-pixel noise)
-        top_y_k = max(1, int(y_s_inner.shape[0] * 0.01))
-        cy_s = torch.topk(y_s_inner.float(), k=top_y_k, largest=False).values.mean()
+
+        # FW-PERF-FIX: Pure GPU control flow (CUDA Sync Avoidance)
+        # Using pure boolean tensor logic avoids CPU-GPU synchronization.
+        mask_upper = labels_swap == 12
+        has_upper = mask_upper.any()
+
+        # Dynamically select the mask: if upper lip exists, use it. Otherwise, fallback to inner_swap.
+        target_mask = mask_upper | (inner_swap & ~has_upper)
+        y_s_target, _ = torch.where(target_mask)
+
+        # FW-BUG-FIX: "Statistical Boundary" anchoring.
+        # Calculates the teeth line by averaging all pixels of the target mask.
+        mean_ys = y_s_target.float().mean()
+        std_ys = y_s_target.float().std()
+
+        # Gracefully handle NaN strictly on the GPU (e.g., if only 1 pixel is found, std is NaN)
+        std_ys = torch.nan_to_num(std_ys, nan=0.0)
+
+        # The center of the reference region + 1.5x its standard deviation = optimal teeth alignment line
+        cy_s = mean_ys + 1.5 * std_ys
 
         mouthzoom = parameters.get("MouthParserStretchDecimalSlider", 1.05)
 
@@ -262,15 +278,19 @@ class FaceMasks:
         Creates an aligned mouth overlay from the original image to the swap image.
         Strictly limited to the INNER mouth (class 11) to avoid overriding swapped lips.
         """
-        inner_orig = labels_orig == 11
+        # Cleared original mouth from obstacle
+        clear_mask = self._get_obstacle_mask(img_orig, parameters)
+        inner_orig = (labels_orig == 11) & clear_mask
         inner_swap = labels_swap == 11
 
         # We strictly require the inner mouth.
-        # If the mouth is closed, we cannot restore original teeth/tongue.
+        # If the mouth is closed (or completely covered), we cannot restore original teeth/tongue.
         if inner_orig.sum() == 0 or inner_swap.sum() == 0:
             return None, None
 
-        mouth_orig = (labels_orig == 11) | (labels_orig == 12) | (labels_orig == 13)
+        mouth_orig = (
+            (labels_orig == 11) | (labels_orig == 12) | (labels_orig == 13)
+        ) & clear_mask
         mouth_swap = (labels_swap == 11) | (labels_swap == 12) | (labels_swap == 13)
 
         enhanced_img_orig = img_orig.clone()
@@ -306,32 +326,60 @@ class FaceMasks:
             )
             enhanced_img_orig[:, ymin:ymax, xmin:xmax] = sharpened_mouth
 
-        # --- Alignment Logic (Stable Center of Mass) ---
+        # --- Alignment Logic (Statistical Anchoring) ---
         y_o_full, x_o_full = torch.where(mouth_orig)
         y_s_full, x_s_full = torch.where(mouth_swap)
 
-        w_o = (x_o_full.max() - x_o_full.min()).float()
-        w_s = (x_s_full.max() - x_s_full.min()).float()
+        # 1. SCALE (Width Standard Deviation)
+        # Width is calculated based on spatial dispersion. Even if the mask jitters,
+        # the scale factor will remain completely stable over time.
+        std_x_o = x_o_full.float().std()
+        std_x_s = x_s_full.float().std()
 
-        if w_o <= 0.0 or w_s <= 0.0:
+        if (
+            std_x_o <= 0.0
+            or std_x_s <= 0.0
+            or torch.isnan(std_x_o)
+            or torch.isnan(std_x_s)
+        ):
             return None, None
 
+        mouthzoom = parameters.get("MouthParserStretchDecimalSlider", 1.05)
+        scale_factor = (std_x_s / std_x_o) * mouthzoom
+
+        # 2. X-AXIS CENTROID
         cx_o = x_o_full.float().mean()
         cx_s = x_s_full.float().mean()
 
-        y_anchor_orig = torch.where(inner_orig)[0]
-        y_anchor_swap = torch.where(inner_swap)[0]
+        # 3. Y-AXIS ANCHORING (Statistical Boundary of the upper lip)
+        # FW-PERF-FIX: Pure GPU control flow (CUDA Sync Avoidance)
+        # Replaced CPU-side 'len()' checks with pure boolean tensor logic.
 
-        top_o_k = max(1, int(y_anchor_orig.shape[0] * 0.01))
-        top_s_k = max(1, int(y_anchor_swap.shape[0] * 0.01))
-        cy_o = torch.topk(y_anchor_orig.float(), k=top_o_k, largest=False).values.mean()
-        cy_s = torch.topk(y_anchor_swap.float(), k=top_s_k, largest=False).values.mean()
+        # --- Original Mouth Anchoring ---
+        mask_o_upper = labels_orig == 12
+        has_o_upper = mask_o_upper.any()
 
-        mouthzoom = parameters.get("MouthParserStretchDecimalSlider", 1.05)
-        scale_factor = (w_s / w_o) * mouthzoom
+        # Fallback to the entire original mouth if no upper lip is detected
+        target_mask_o = mask_o_upper | (mouth_orig & ~has_o_upper)
+        y_o_target, _ = torch.where(target_mask_o)
 
-        if scale_factor <= 0.0:
-            return None, None
+        mean_yo = y_o_target.float().mean()
+        std_yo = y_o_target.float().std()
+        std_yo = torch.nan_to_num(std_yo, nan=0.0)
+        cy_o = mean_yo + 1.5 * std_yo
+
+        # --- Swapped Mouth Anchoring ---
+        mask_s_upper = labels_swap == 12
+        has_s_upper = mask_s_upper.any()
+
+        # Fallback to the entire swapped mouth if no upper lip is detected
+        target_mask_s = mask_s_upper | (mouth_swap & ~has_s_upper)
+        y_s_target, _ = torch.where(target_mask_s)
+
+        mean_ys = y_s_target.float().mean()
+        std_ys = y_s_target.float().std()
+        std_ys = torch.nan_to_num(std_ys, nan=0.0)
+        cy_s = mean_ys + 1.5 * std_ys
 
         translate_x = cx_s - cx_o
         translate_y = cy_s - cy_o
@@ -363,6 +411,8 @@ class FaceMasks:
         content_mask_blurred = v2.functional.gaussian_blur(
             content_mask.unsqueeze(0), kernel_size=5, sigma=1.0
         ).squeeze(0)
+
+        w_s = (x_s_full.max() - x_s_full.min()).float()
 
         # 2. Destroy the fake teeth with blur (Controlled by UI Slider)
         cavity_blur_pct = parameters.get("MouthOriginalCavityBlurSlider", 15) / 100.0
@@ -436,6 +486,63 @@ class FaceMasks:
             return self._enhance_and_align_swapped_mouth(
                 swap_img, labels_swap, parameters
             )
+
+    def _get_obstacle_mask(
+        self, img_512: torch.Tensor, parameters: dict
+    ) -> torch.Tensor:
+        """
+        Executes the Occluder and/or XSeg models on the original image to identify obstacles (e.g., hands, microphones).
+        Returns a boolean mask (512x512) where True = Clear area (face), False = Obstacle.
+        """
+        device = img_512.device
+
+        need_occluder = parameters.get("OccluderEnableToggle", False)
+        need_xseg = parameters.get("DFLXSegEnableToggle", False)
+
+        # Early exit: If no occlusion models are enabled, allocate and return a full clear mask.
+        # This saves VRAM allocation and prevents unnecessary tensor creation when unused.
+        if not need_occluder and not need_xseg:
+            return torch.ones((512, 512), dtype=torch.bool, device=device)
+
+        # Downscale once to 256x256 since all occlusion models operate at this resolution.
+        img_256 = v2.functional.resize(img_512, [256, 256], antialias=True)
+
+        # We will combine masks at 256x256 first.
+        # Doing boolean math at 256x256 processes 4x fewer pixels than at 512x512.
+        combined_mask_256 = None
+
+        if need_occluder:
+            # apply_occlusion returns 1 for Face, 0 for Obstacle. We keep areas > 0.5.
+            occ_mask = self.apply_occlusion(img_256, amount=1, parameters=parameters)
+            combined_mask_256 = (occ_mask > 0.5).squeeze(0)
+
+        if need_xseg:
+            # Dummy mouth in 3D [1, 256, 256] shape to prevent PyTorch dimension crashes
+            dummy_mouth = torch.zeros((1, 256, 256), device=device)
+
+            # apply_dfl_xseg INVERTS its mask internally (outpred = 1.0 - outpred).
+            # It returns 1 for Obstacle/Background and 0 for Face. We keep areas < 0.5.
+            xseg_mask, _, _, _ = self.apply_dfl_xseg(
+                img_256, amount=1, mouth=dummy_mouth, parameters=parameters
+            )
+            xseg_bool_mask = (xseg_mask < 0.5).squeeze(0)
+
+            # Combine with occluder mask if it exists, otherwise initialize it
+            if combined_mask_256 is None:
+                combined_mask_256 = xseg_bool_mask
+            else:
+                combined_mask_256 = combined_mask_256 & xseg_bool_mask
+        assert combined_mask_256 is not None
+        # Upscale the final combined boolean mask back to 512x512 in one single operation.
+        # NEAREST interpolation is essential here to maintain boolean values (True/False).
+        # We unsqueeze(0) to satisfy torchvision v2 requirements (expects C, H, W) and squeeze(0) after.
+        final_mask_512 = v2.functional.resize(
+            combined_mask_256.unsqueeze(0),
+            [512, 512],
+            interpolation=v2.InterpolationMode.NEAREST,
+        ).squeeze(0)
+
+        return final_mask_512
 
     # --- Main Mask Processing Pipeline ---
 
@@ -543,6 +650,13 @@ class FaceMasks:
                 resize_to_target(m.unsqueeze(0)).clamp(0, 1).squeeze()
             )
 
+        # Debug mouth-region mask (inner mouth + lips), used only for preview contour.
+        if labels_swap is not None:
+            mouth_debug = self._mask_from_labels_lut(labels_swap, [11, 12, 13])
+            result["mouth_debug"] = (
+                resize_to_target(mouth_debug.unsqueeze(0)).clamp(0, 1).squeeze()
+            )
+
         # ---------- 2. MOUTH MASK (Grouped Optimization) ----------
         if need_parser_mouth:
             mouth = torch.zeros((512, 512), device=device, dtype=torch.float32)
@@ -586,6 +700,21 @@ class FaceMasks:
                 17: "HairParserSlider",
             }
             mouth_inside = parameters.get("MouthParserInsideToggle", False)
+            upper_teeth_keep_mask = None
+            if (
+                parameters.get("AutoMouthUpperTeethExcludeActive", False)
+                and labels_swap is not None
+            ):
+                upper_teeth_keep_mask = self._build_upper_teeth_keep_mask(
+                    labels_swap, swap_restorecalc
+                )
+
+            if upper_teeth_keep_mask is not None:
+                result["mouth_debug_teeth"] = (
+                    resize_to_target(upper_teeth_keep_mask.unsqueeze(0))
+                    .clamp(0, 1)
+                    .squeeze()
+                )
 
             for cls, pname in face_classes.items():
                 val = int(parameters.get(pname, 0))
@@ -609,7 +738,33 @@ class FaceMasks:
                         comb = torch.maximum(m1, m2)
                 else:
                     comb = m1
+
+                if upper_teeth_keep_mask is not None and 11 in classes:
+                    comb = comb * (1.0 - upper_teeth_keep_mask)
+
                 fp = torch.maximum(fp, comb)
+
+            # Enforce keep mask after all classes so dilated lips cannot
+            # reclaim the teeth area.
+            if upper_teeth_keep_mask is not None:
+                fp = fp * (1.0 - upper_teeth_keep_mask)
+
+            # Recompute mouth-only dilated mask to reflect actual slider values in debug outline.
+            _fp_mouth = torch.zeros((512, 512), device=device, dtype=torch.float32)
+            for _cls, _pname in [
+                (11, "MouthParserSlider"),
+                (12, "UpperLipParserSlider"),
+                (13, "LowerLipParserSlider"),
+            ]:
+                _val = int(parameters.get(_pname, 0))
+                if _val > 0:
+                    _m = self._mask_from_labels_lut(labels_swap, [_cls])
+                    _m = self._dilate_binary(_m, _val, mode)
+                    _fp_mouth = torch.maximum(_fp_mouth, _m)
+            if _fp_mouth.sum() > 0:
+                result["mouth_debug"] = (
+                    resize_to_target(_fp_mouth.unsqueeze(0)).clamp(0, 1).squeeze()
+                )
 
             if parameters.get("FaceBlurParserSlider", 0) > 0:
                 b = parameters["FaceBlurParserSlider"]
@@ -770,6 +925,60 @@ class FaceMasks:
         labels_safe = labels.clamp(0, 18)
         return lut[labels_safe]
 
+    def _build_upper_teeth_keep_mask(
+        self,
+        labels_swap: torch.Tensor,
+        swap_restorecalc: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Builds a soft keep-mask for upper teeth based on brightness."""
+        inner_swap = (labels_swap == 11).float()
+        if inner_swap.sum() < 16:
+            return None
+
+        y_idx, _ = torch.where(inner_swap > 0.5)
+        if y_idx.numel() == 0:
+            return None
+
+        y_min = int(y_idx.min().item())
+        y_max = int(y_idx.max().item())
+        mouth_h = max(1, y_max - y_min + 1)
+
+        H = labels_swap.shape[0]
+        device = labels_swap.device
+        y_grid = torch.arange(H, device=device).view(-1, 1)
+
+        # Detect bright teeth core in top 35 % of inner-mouth.
+        top_limit = y_min + int(max(2, mouth_h * 0.35))
+        top_band = (y_grid <= top_limit).expand(H, labels_swap.shape[1])
+        bright_map = swap_restorecalc.float().div(255.0).mean(dim=0)
+        keep_core = ((inner_swap > 0.5) & top_band & (bright_map >= 0.50)).float()
+        if keep_core.sum() == 0:
+            return None
+
+        # Find the widest row in keep_core; hard-fill inner_swap upward from there
+        # to close the dark gap between teeth surface and the cavity boundary.
+        widest_row = int(keep_core.sum(dim=1).argmax().item())
+        gap_fill = (
+            (inner_swap > 0.5) & (y_grid < widest_row).expand_as(inner_swap)
+        ).float()
+        keep = torch.maximum(keep_core, gap_fill)
+
+        # Dilate vertically ±2 rows to cover dark edge pixels at the bottom of
+        # the teeth, then clip to inner_swap so we never bleed into tongue rows.
+        keep = (
+            F.max_pool2d(
+                keep.unsqueeze(0).unsqueeze(0),
+                kernel_size=(5, 1),
+                stride=1,
+                padding=(2, 0),
+            )
+            .squeeze(0)
+            .squeeze(0)
+        )
+        keep = torch.minimum(keep, inner_swap)
+
+        return keep
+
     # --- Occluder & XSeg ---
 
     def apply_occlusion(self, img, amount, parameters=None, original_face_512=None):
@@ -874,16 +1083,16 @@ class FaceMasks:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="img",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 3, 256, 256),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="output",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 1, 256, 256),
             buffer_ptr=output.data_ptr(),
@@ -898,9 +1107,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io_binding)
@@ -1088,16 +1297,16 @@ class FaceMasks:
         io_binding = ort_session.io_binding()
         io_binding.bind_input(
             name="in_face:0",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=image.size(),
             buffer_ptr=image.data_ptr(),
         )
         io_binding.bind_output(
             name="out_mask:0",
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=(1, 1, 256, 256),
             buffer_ptr=output.data_ptr(),
@@ -1112,9 +1321,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io_binding)
@@ -1141,16 +1350,16 @@ class FaceMasks:
 
         io_binding.bind_input(
             name=input_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=image_tensor.shape,
             buffer_ptr=image_tensor.data_ptr(),
         )
         io_binding.bind_output(
             name=output_name,
-            device_type=self.models_processor.device,
-            device_id=0,
+            device_type=self.models_processor.device_type,
+            device_id=self.models_processor.binding_device_id,
             element_type=np.float32,
             shape=output_tensor.shape,
             buffer_ptr=output_tensor.data_ptr(),
@@ -1165,9 +1374,9 @@ class FaceMasks:
 
         try:
             # PRE-INFERENCE SYNC
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             sess.run_with_iobinding(io_binding)

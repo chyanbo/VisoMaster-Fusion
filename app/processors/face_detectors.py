@@ -236,7 +236,9 @@ class FaceDetectors:
         skip_nms=False,
     ):
         """
-        Performs GPU-accelerated NMS, sorting, and filtering on raw detections from all angles.
+        Performs GPU-accelerated NMS, automatic heuristic sorting, and filtering on raw detections.
+        Designed for fully automated pipelines: filters out bad rotation artifacts via geometric
+        sanity checks and elects the best candidates using a non-linear Confidence/Area heuristic.
 
         Args:
             scores_list (list): List of score arrays (np.ndarray) from each detection angle.
@@ -244,36 +246,33 @@ class FaceDetectors:
             kpss_list (list): List of keypoint arrays (np.ndarray) from each detection angle.
             img_height (int): The *original* height of the source image.
             img_width (int): The *original* width of the source image.
-            det_scale (torch.Tensor): The scaling factor used to resize the image (new_height / original_height).
-            max_num (int): The maximum number of faces to return, sorted by size and centrality.
+            det_scale (torch.Tensor): The scaling factor used to resize the image.
+            max_num (int): The maximum number of faces to return.
             skip_nms (bool): If True, skips the Non-Maximum Suppression step.
 
         Returns:
             tuple: (det, kpss_final, score_values)
-                - det (np.ndarray): Final bounding boxes, scaled to original image size.
-                - kpss_final (np.ndarray): Final keypoints, scaled to original image size.
-                - score_values (np.ndarray): Scores for the final detections.
         """
         if not bboxes_list:
             return None, None, None
 
-        # Convert all raw detection lists to single GPU tensors.
-        scores_tensor = (
-            torch.from_numpy(np.vstack(scores_list))
-            .to(self.models_processor.device)
-            .squeeze()
+        # ----------------------------------------------------------------------
+        # 1. TENSOR CREATION & THREAD SAFETY
+        # ----------------------------------------------------------------------
+        # Direct tensor creation with 'device' forces a strict memory copy to VRAM.
+        # This prevents Race Conditions if numpy arrays are mutated by CPU threads concurrently.
+        device = self.models_processor.device
+
+        scores_tensor = torch.tensor(
+            np.vstack(scores_list), dtype=torch.float32, device=device
+        ).squeeze()
+        bboxes_tensor = torch.tensor(
+            np.vstack(bboxes_list), dtype=torch.float32, device=device
         )
-        bboxes_tensor = torch.from_numpy(np.vstack(bboxes_list)).to(
-            self.models_processor.device
-        )
-        kpss_tensor = torch.from_numpy(np.vstack(kpss_list)).to(
-            self.models_processor.device
+        kpss_tensor = torch.tensor(
+            np.vstack(kpss_list), dtype=torch.float32, device=device
         )
 
-        bboxes_tensor = torch.as_tensor(bboxes_tensor, dtype=torch.float32)
-        scores_tensor = torch.as_tensor(scores_tensor, dtype=torch.float32).reshape(-1)
-
-        # --- Validation Block to ensure tensors are well-formed before NMS ---
         if bboxes_tensor.numel() == 0:
             return None, None, None
         if bboxes_tensor.dim() == 1 and bboxes_tensor.numel() == 4:
@@ -281,81 +280,100 @@ class FaceDetectors:
         if scores_tensor.dim() == 0:
             scores_tensor = scores_tensor.unsqueeze(0)
         if bboxes_tensor.size(0) != scores_tensor.size(0):
-            # Mismatch in tensor sizes, aborting.
             return None, None, None
 
-        # Ensure tensors are contiguous (optimizes NMS)
         bboxes_tensor = bboxes_tensor.contiguous()
         scores_tensor = scores_tensor.contiguous()
 
+        # ----------------------------------------------------------------------
+        # 2. NON-MAXIMUM SUPPRESSION (NMS)
+        # ----------------------------------------------------------------------
         if not skip_nms:
-            # Perform Non-Maximum Suppression on the GPU to remove overlapping boxes.
             nms_thresh = 0.4
+            # NMS must rely strictly on raw network confidence.
+            # Multiplying by area here would allow bloated bad rotations to absorb good ones.
             keep_indices = nms(bboxes_tensor, scores_tensor, iou_threshold=nms_thresh)
-
-            det_boxes, det_kpss, det_scores = (
-                bboxes_tensor[keep_indices],
-                kpss_tensor[keep_indices],
-                scores_tensor[keep_indices],
-            )
+            det_boxes = bboxes_tensor[keep_indices]
+            det_kpss = kpss_tensor[keep_indices]
+            det_scores = scores_tensor[keep_indices]
         else:
-            det_boxes, det_kpss, det_scores = (
-                bboxes_tensor,
-                kpss_tensor,
-                scores_tensor,
-            )
+            det_boxes = bboxes_tensor
+            det_kpss = kpss_tensor
+            det_scores = scores_tensor
 
-        # Sort the remaining detections by their confidence score.
-        sorted_indices = torch.argsort(det_scores, descending=True)
-        det_boxes, det_kpss, det_scores = (
-            det_boxes[sorted_indices],
-            det_kpss[sorted_indices],
-            det_scores[sorted_indices],
-        )
+        # ----------------------------------------------------------------------
+        # 3. GEOMETRIC SANITY CHECK (KPS Boundary Validation)
+        # ----------------------------------------------------------------------
+        # Anomalies from incorrect rotations often produce KPS coordinates that
+        # fall far outside their own bounding box. We filter these geometric impossibilities.
+        if det_boxes.shape[0] > 0:
+            box_widths = det_boxes[:, 2] - det_boxes[:, 0]
+            box_heights = det_boxes[:, 3] - det_boxes[:, 1]
 
-        # If more faces are detected than max_num, select the best ones.
+            # 15% tolerance margin
+            margin_x = box_widths * 0.15
+            margin_y = box_heights * 0.15
+
+            min_x = det_boxes[:, 0] - margin_x
+            min_y = det_boxes[:, 1] - margin_y
+            max_x = det_boxes[:, 2] + margin_x
+            max_y = det_boxes[:, 3] + margin_y
+
+            # Check if all 5 keypoints are within the expanded bounding box
+            valid_kps_mask = (
+                (det_kpss[:, :, 0] >= min_x.unsqueeze(1))
+                & (det_kpss[:, :, 0] <= max_x.unsqueeze(1))
+                & (det_kpss[:, :, 1] >= min_y.unsqueeze(1))
+                & (det_kpss[:, :, 1] <= max_y.unsqueeze(1))
+            ).all(dim=1)
+
+            if valid_kps_mask.any():
+                det_boxes = det_boxes[valid_kps_mask]
+                det_kpss = det_kpss[valid_kps_mask]
+                det_scores = det_scores[valid_kps_mask]
+
+        # ----------------------------------------------------------------------
+        # 4. AUTOMATIC NON-LINEAR SORTING HEURISTIC
+        # ----------------------------------------------------------------------
         if max_num > 0 and det_boxes.shape[0] > max_num:
             if det_boxes.shape[0] > 1:
-                # Score faces based on a combination of their size and proximity to the image center.
-                # This filtering happens on *unscaled* coordinates (relative to the padded detection image).
-                area = (det_boxes[:, 2] - det_boxes[:, 0]) * (
+                areas = (det_boxes[:, 2] - det_boxes[:, 0]) * (
                     det_boxes[:, 3] - det_boxes[:, 1]
                 )
-                # The old logic (img_height / det_scale) was mathematically incorrect and
-                # produced extreme values for non-standard aspect ratios (like VR videos).
-                # The correct logic is to find the center of the *active image area*
-                # on the padded canvas.
-                # new_height_on_canvas = img_height * det_scale
-                # new_width_on_canvas = img_width * det_scale
-                det_img_center_y = (img_height * det_scale) / 2.0
-                det_img_center_x = (img_width * det_scale) / 2.0
+                areas = areas.clamp(min=1.0)
 
-                center_x = (det_boxes[:, 0] + det_boxes[:, 2]) / 2 - det_img_center_x
-                center_y = (det_boxes[:, 1] + det_boxes[:, 3]) / 2 - det_img_center_y
+                # Normalize values to prevent scale dominance
+                norm_scores = det_scores / (det_scores.max() + 1e-6)
+                norm_areas = areas / (areas.max() + 1e-6)
 
-                offset_dist_squared = center_x**2 + center_y**2
-                # This score favors large faces (area) that are close to the center
-                # (low offset_dist_squared).
-                values = area - offset_dist_squared * 2.0
-                bindex = torch.argsort(values, descending=True)[:max_num]
-                det_boxes, det_kpss, det_scores = (
-                    det_boxes[bindex],
-                    det_kpss[bindex],
-                    det_scores[bindex],
-                )
-            else:
-                bindex = torch.arange(
-                    det_boxes.shape[0], device=self.models_processor.device
-                )[:max_num]
+                # Non-linear heuristic. Squaring the confidence drastically punishes
+                # uncertain faces. Only highly confident faces can leverage their 'Area'
+                # to win the sorting battle. This removes the need for manual UI strategies.
+                combined_values = (norm_scores**2) * 0.8 + (norm_areas * 0.2)
+
+                bindex = torch.argsort(combined_values, descending=True)[:max_num]
+
                 det_boxes = det_boxes[bindex]
                 det_kpss = det_kpss[bindex]
                 det_scores = det_scores[bindex]
+            else:
+                det_boxes = det_boxes[:max_num]
+                det_kpss = det_kpss[:max_num]
+                det_scores = det_scores[:max_num]
+        else:
+            # Standard confidence sort if below max_num
+            sorted_indices = torch.argsort(det_scores, descending=True)
+            det_boxes = det_boxes[sorted_indices]
+            det_kpss = det_kpss[sorted_indices]
+            det_scores = det_scores[sorted_indices]
 
-        # Transfer final results back to CPU and scale them to the original image dimensions.
+        # ----------------------------------------------------------------------
+        # 5. CPU TRANSFER & FINAL SCALING
+        # ----------------------------------------------------------------------
         det_scale_val = det_scale.cpu().item()
+
         det = det_boxes.cpu().numpy() / det_scale_val
         kpss_final = det_kpss.cpu().numpy() / det_scale_val
-
         score_values = det_scores.cpu().numpy()
 
         return det, kpss_final, score_values
@@ -402,11 +420,13 @@ class FaceDetectors:
                     landmark_kpss if len(landmark_kpss) > 0 else kpss_5[i]
                 )
                 # If the new landmarks have a higher confidence, replace the old 5-point landmarks.
-                if len(landmark_kpss_5) > 0 and (
-                    len(landmark_scores) == 0
-                    or np.mean(landmark_scores) > np.mean(score_values[i])
-                ):
-                    kpss_5[i] = landmark_kpss_5
+                if len(landmark_kpss_5) > 0:
+                    if (
+                        landmark_detect_mode == "478"
+                        or len(landmark_scores) == 0
+                        or np.mean(landmark_scores) > np.mean(score_values[i])
+                    ):
+                        kpss_5[i] = landmark_kpss_5
             kpss = np.array(refined_kpss, dtype=object)
         return det, kpss_5, kpss, score_values
 
@@ -436,9 +456,9 @@ class FaceDetectors:
         try:
             # PRE-INFERENCE SYNC: Ensure PyTorch has finished preparing the memory
             # before ONNX Runtime starts reading from the IOBinding pointers.
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             ort_session.run_with_iobinding(io_binding)
@@ -446,9 +466,9 @@ class FaceDetectors:
             # POST-INFERENCE SYNC : Ensure the GPU has completed all
             # calculations before ONNX Runtime attempts to copy the result back to CPU RAM.
             # Without this, copy_outputs_to_cpu() might grab an incomplete tensor.
-            if self.models_processor.device == "cuda":
+            if self.models_processor.device_type == "cuda":
                 torch.cuda.current_stream().synchronize()
-            elif self.models_processor.device != "cpu":
+            elif self.models_processor.device_type != "cpu":
                 self.models_processor.syncvec.cpu()
 
             net_outs = io_binding.copy_outputs_to_cpu()
@@ -480,17 +500,6 @@ class FaceDetectors:
         Supports tracking via 'previous_detections'.
         """
         rotation_angles = rotation_angles or [0]
-        use_multi_rotation = len(rotation_angles) > 1
-
-        # Multi-angle detection must run the full detector path. Tracking shortcuts
-        # can reuse stale landmarks from a different orientation and destabilize
-        # swaps on upside-down faces during recording.
-        # Also force from_points=True so the secondary landmark model uses kpss-aligned
-        # crops. Without this, the bbox-only crop path (from_points=False) produces an
-        # upside-down face crop that landmark detectors cannot handle, which corrupts
-        # kpss_5 and causes wrong embeddings / ghost-face artifacts.
-        if use_multi_rotation:
-            from_points = True
 
         control = (
             control_override
@@ -551,7 +560,9 @@ class FaceDetectors:
         args.update(kwargs)
 
         if detect_mode in ["RetinaFace", "SCRFD"]:
-            args["input_size"] = input_size
+            args["input_size"] = (
+                input_size  # Reverted back because some faces are not detected with the auto-resolved size.
+            )
 
         # Run the detector — returns (det, kpss_5, kpss, det_scores)
         det, kpss_5, kpss, det_scores = detection_function(**args)
@@ -798,8 +809,8 @@ class FaceDetectors:
             io_binding = ort_session.io_binding()
             io_binding.bind_input(
                 name="input.1",
-                device_type=self.models_processor.device,
-                device_id=0,
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
                 element_type=np.float32,
                 shape=aimg.size(),
                 buffer_ptr=aimg.data_ptr(),
@@ -815,7 +826,11 @@ class FaceDetectors:
                 "477",
                 "500",
             ]:
-                io_binding.bind_output(i, self.models_processor.device)
+                io_binding.bind_output(
+                    i,
+                    self.models_processor.device_type,
+                    self.models_processor.binding_device_id,
+                )
             # Run the model with lazy build handling
             net_outs = self._run_model_with_lazy_build_check(
                 model_name, ort_session, io_binding
@@ -988,14 +1003,18 @@ class FaceDetectors:
 
             io_binding.bind_input(
                 name=input_name,
-                device_type=self.models_processor.device,
-                device_id=0,
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
                 element_type=np.float32,
                 shape=aimg.size(),
                 buffer_ptr=aimg.data_ptr(),
             )
             for name in output_names:
-                io_binding.bind_output(name, self.models_processor.device)
+                io_binding.bind_output(
+                    name,
+                    self.models_processor.device_type,
+                    self.models_processor.binding_device_id,
+                )
 
             # Run the model with lazy build handling
             net_outs = self._run_model_with_lazy_build_check(
@@ -1171,13 +1190,17 @@ class FaceDetectors:
             io_binding = ort_session.io_binding()
             io_binding.bind_input(
                 name="images",
-                device_type=self.models_processor.device,
-                device_id=0,
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
                 element_type=np.float32,
                 shape=aimg_prepared.size(),  # Use shape of prepared tensor
                 buffer_ptr=aimg_prepared.data_ptr(),  # Use data_ptr of prepared tensor
             )
-            io_binding.bind_output("output0", self.models_processor.device)
+            io_binding.bind_output(
+                "output0",
+                self.models_processor.device_type,
+                self.models_processor.binding_device_id,
+            )
             # Run the model with lazy build handling
             net_outs = self._run_model_with_lazy_build_check(
                 model_name, ort_session, io_binding
@@ -1339,14 +1362,18 @@ class FaceDetectors:
 
             io_binding.bind_input(
                 name=input_name,
-                device_type=self.models_processor.device,
-                device_id=0,
+                device_type=self.models_processor.device_type,
+                device_id=self.models_processor.binding_device_id,
                 element_type=np.float32,
                 shape=aimg_prepared.size(),  # Use shape of prepared tensor
                 buffer_ptr=aimg_prepared.data_ptr(),  # Use data_ptr of prepared tensor
             )
             for name in output_names:
-                io_binding.bind_output(name, self.models_processor.device)
+                io_binding.bind_output(
+                    name,
+                    self.models_processor.device_type,
+                    self.models_processor.binding_device_id,
+                )
 
             # Run the model with lazy build handling
             net_outs = self._run_model_with_lazy_build_check(

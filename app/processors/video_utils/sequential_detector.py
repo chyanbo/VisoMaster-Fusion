@@ -30,6 +30,8 @@ class SequentialDetector:
         self._smoothed_kps: Dict[int, numpy.ndarray] = {}
         self._smoothed_dense_kps: Dict[int, numpy.ndarray] = {}
         self._smoothed_dense_kps_203: Dict[int, numpy.ndarray] = {}
+        # Temporal state to bridge ArcFace gaps (profiles, occlusions)
+        self._temporal_memory: List[Dict[str, Any]] = []
 
     def reset_state(self):
         """
@@ -40,6 +42,12 @@ class SequentialDetector:
         self._smoothed_kps.clear()
         self._smoothed_dense_kps.clear()
         self._smoothed_dense_kps_203.clear()
+
+        # Safely clear the advanced temporal tracking memory
+        if hasattr(self, "_temporal_memory"):
+            self._temporal_memory.clear()
+        else:
+            self._temporal_memory = []
 
         if hasattr(self.main_window, "models_processor") and hasattr(
             self.main_window.models_processor, "face_detectors"
@@ -157,8 +165,9 @@ class SequentialDetector:
             bypass_bytetrack=False,
         )
 
-        # --- STEP 2: SMART FILTERING (ArcFace Recognition) ---
+        # --- STEP 2: SMART FILTERING & TRACKING (Hybrid Architecture) ---
         valid_indices: list = []
+        temporal_memory_this_frame: list = []
 
         # Safely copy the target faces dictionary to avoid concurrent access issues from the UI thread.
         try:
@@ -169,37 +178,23 @@ class SequentialDetector:
         rec_model = str(control.get("RecognitionModelSelection", "ArcFace"))
         default_params = dict(self.main_window.default_parameters.data)
 
-        # 2a. Fast-path: skip ArcFace identity verification when the scene contains exactly
-        # one detected face and the user has configured exactly one target face. This saves
-        # one ArcFace inference per frame at ~5-10 ms each — significant headroom on webcam
-        # at 30 fps. The FrameWorker still re-verifies identity per face before swapping,
-        # so a wrong-identity slip-through is corrected downstream.
-        # Toggle name FastPathSingleFaceToggle (default True). Power users can disable.
-        fast_path_enabled = bool(control.get("FastPathSingleFaceToggle", True))
-        used_fast_path = False
         if (
-            fast_path_enabled
-            and isinstance(bboxes, numpy.ndarray)
-            and bboxes.shape[0] == 1
-            and len(target_faces) == 1
-        ):
-            valid_indices = [0]
-            used_fast_path = True
-
-        # 2b. Strict ArcFace pre-filter (multi-face or multi-target case).
-        if (
-            not used_fast_path
-            and isinstance(bboxes, numpy.ndarray)
+            isinstance(bboxes, numpy.ndarray)
             and bboxes.shape[0] > 0
             and len(target_faces) > 0
         ):
+            unverified_current_indices = []
+            unverified_embeddings = {}
+
             for i in range(len(kpss_5)):
-                # Ultra-fast recognition pass using only the 5 basic keypoints
+                current_bbox = bboxes[i]
+                current_kps5 = kpss_5[i]
+
+                # 1. Strict Identity Anchor Pass
                 face_emb, _ = self.main_window.models_processor.run_recognize_direct(
-                    frame_tensor, kpss_5[i], "Auto", rec_model
+                    frame_tensor, current_kps5, "Auto", rec_model
                 )
 
-                # Verify if the detected face matches any of our targets
                 match, _, _ = find_best_target_match(
                     face_emb,
                     self.main_window.models_processor,
@@ -209,84 +204,94 @@ class SequentialDetector:
                     rec_model,
                 )
 
-                # Keep the index only if it's a target face
                 if match is not None:
+                    # Positive ID confirmed
                     valid_indices.append(i)
-        elif (
-            not used_fast_path
-            and isinstance(bboxes, numpy.ndarray)
-            and bboxes.shape[0] > 0
-        ):
-            # If no specific targets are configured (e.g., pure FaceTracking mode), keep everyone
+                    temporal_memory_this_frame.append(
+                        {"bbox": current_bbox, "emb": face_emb}
+                    )
+                else:
+                    # Failed UI threshold, queue for temporal rescue
+                    unverified_current_indices.append(i)
+                    unverified_embeddings[i] = face_emb
+
+            # 2. Temporal Memory Tracking (Rescue Pass via IoU + Frame-to-Frame Continuity)
+            if (
+                len(unverified_current_indices) > 0
+                and hasattr(self, "_temporal_memory")
+                and len(self._temporal_memory) > 0
+            ):
+                iou_matches = []
+                for curr_idx in unverified_current_indices:
+                    curr_bbox = bboxes[curr_idx]
+                    for prev_idx, prev_data in enumerate(self._temporal_memory):
+                        prev_bbox = prev_data["bbox"]
+
+                        xA = max(curr_bbox[0], prev_bbox[0])
+                        yA = max(curr_bbox[1], prev_bbox[1])
+                        xB = min(curr_bbox[2], prev_bbox[2])
+                        yB = min(curr_bbox[3], prev_bbox[3])
+
+                        interArea = max(0.0, xB - xA) * max(0.0, yB - yA)
+                        boxAArea = (curr_bbox[2] - curr_bbox[0]) * (
+                            curr_bbox[3] - curr_bbox[1]
+                        )
+                        boxBArea = (prev_bbox[2] - prev_bbox[0]) * (
+                            prev_bbox[3] - prev_bbox[1]
+                        )
+
+                        denominator = float(boxAArea + boxBArea - interArea)
+                        iou = interArea / denominator if denominator > 0 else 0.0
+
+                        if iou > 0.40:
+                            iou_matches.append((iou, curr_idx, prev_idx))
+
+                iou_matches.sort(key=lambda x: x[0], reverse=True)
+                used_curr_indices = set()
+                used_prev_indices = set()
+
+                for iou, curr_idx, prev_idx in iou_matches:
+                    if (
+                        curr_idx not in used_curr_indices
+                        and prev_idx not in used_prev_indices
+                    ):
+                        # THE JUMP-CUT SHIELD: Frame-to-Frame Cosine Similarity
+                        curr_emb = unverified_embeddings[curr_idx].flatten()
+                        prev_emb = self._temporal_memory[prev_idx]["emb"].flatten()
+
+                        # Calculate mathematical distance between Face(t) and Face(t-1)
+                        sim = numpy.dot(curr_emb, prev_emb) / (
+                            numpy.linalg.norm(curr_emb) * numpy.linalg.norm(prev_emb)
+                            + 1e-8
+                        )
+
+                        # A continuous physical movement maintains > 0.75 similarity.
+                        # A jump cut to a different person drops heavily.
+                        if sim > 0.75:
+                            valid_indices.append(curr_idx)
+                            temporal_memory_this_frame.append(
+                                {
+                                    "bbox": bboxes[curr_idx],
+                                    "emb": unverified_embeddings[curr_idx],
+                                }
+                            )
+                            used_curr_indices.add(curr_idx)
+                            used_prev_indices.add(prev_idx)
+
+            # Update the temporal memory for the NEXT frame
+            self._temporal_memory = temporal_memory_this_frame
+
+        elif isinstance(bboxes, numpy.ndarray) and bboxes.shape[0] > 0:
             valid_indices = list(range(len(bboxes)))
 
-        # 2c. Relaxed-threshold ArcFace pass — runs only when the strict pass produced no
-        # matches. ArcFace embeddings degrade on side angles, motion blur, and partial
-        # occlusion: the strict pass would discard the actual target and produce flashing
-        # artefacts. We re-test with the per-target SimilarityThresholdSlider halved (and
-        # floored at 20). The FrameWorker performs its own per-face similarity check before
-        # swapping, so a relaxed match that turns out to be wrong is filtered downstream.
-        if (
-            not used_fast_path
-            and len(valid_indices) == 0
-            and isinstance(bboxes, numpy.ndarray)
-            and bboxes.shape[0] > 0
-            and len(target_faces) > 0
-        ):
-            relaxed_local_params: Dict[str, Any] = {}
-            if local_params_for_worker:
-                for _tgt_id, _per in local_params_for_worker.items():
-                    if isinstance(_per, Mapping):
-                        _per_copy = dict(_per)
-                        if "SimilarityThresholdSlider" in _per_copy:
-                            try:
-                                _orig = float(_per_copy["SimilarityThresholdSlider"])
-                                _per_copy["SimilarityThresholdSlider"] = max(
-                                    20.0, _orig * 0.5
-                                )
-                            except (TypeError, ValueError):
-                                pass
-                        relaxed_local_params[_tgt_id] = _per_copy
-                    else:
-                        relaxed_local_params[_tgt_id] = _per
-            relaxed_default = dict(default_params)
-            if "SimilarityThresholdSlider" in relaxed_default:
-                try:
-                    _orig = float(relaxed_default["SimilarityThresholdSlider"])
-                    relaxed_default["SimilarityThresholdSlider"] = max(
-                        20.0, _orig * 0.5
-                    )
-                except (TypeError, ValueError):
-                    pass
+            temporal_memory_this_frame = []
+            for i in range(len(bboxes)):
+                # If no targets, we must generate dummy embeddings to keep the structure intact
+                dummy_emb = numpy.zeros((512,), dtype=numpy.float32)
+                temporal_memory_this_frame.append({"bbox": bboxes[i], "emb": dummy_emb})
+            self._temporal_memory = temporal_memory_this_frame
 
-            for i in range(len(kpss_5)):
-                face_emb, _ = self.main_window.models_processor.run_recognize_direct(
-                    frame_tensor, kpss_5[i], "Auto", rec_model
-                )
-                match, _, _ = find_best_target_match(
-                    face_emb,
-                    self.main_window.models_processor,
-                    target_faces,
-                    relaxed_local_params,
-                    relaxed_default,
-                    rec_model,
-                )
-                if match is not None:
-                    valid_indices.append(i)
-
-        # 2d. Last-resort single-face fallback: if both passes filtered everything out
-        # but only one face was detected, allow it through. This catches the rare case
-        # where ArcFace produces a near-zero similarity (severe motion blur, occlusion).
-        # The FrameWorker still performs identity verification before swapping.
-        if (
-            len(valid_indices) == 0
-            and isinstance(bboxes, numpy.ndarray)
-            and bboxes.shape[0] == 1
-            and len(target_faces) > 0
-        ):
-            valid_indices = [0]
-
-        # Apply the filter to eliminate background extras
+        # Apply the filter to eliminate background extras and non-targets
         filtered_bboxes = (
             bboxes[valid_indices]
             if valid_indices
@@ -298,125 +303,135 @@ class SequentialDetector:
             else numpy.empty((0, 5, 2), dtype=numpy.float32)
         )
 
+        # --- EARLY EXIT OPTIMIZATION ---
+        # If the tracking/filtering rejected everyone, skip all heavy computations immediately.
+        if len(filtered_bboxes) == 0:
+            if owns_frame_tensor and frame_tensor is not None:
+                del frame_tensor
+
+            # Clear smoothing states since target is lost
+            self._smoothed_kps.clear()
+            self._smoothed_dense_kps.clear()
+            self._smoothed_dense_kps_203.clear()
+
+            return (
+                numpy.empty((0, 4), dtype=numpy.float32),
+                numpy.empty((0, 5, 2), dtype=numpy.float32),
+                numpy.empty((0, 68, 2), dtype=numpy.float32),
+                numpy.empty((0, 203, 2), dtype=numpy.float32),
+            )
+
         # --- STEP 3: HEAVY LANDMARK DETECTION (On target faces ONLY) ---
+        num_targets = len(filtered_bboxes)
+
+        # DYNAMIC ALLOCATION: Using lists to handle ANY landmark model dimension (5, 68, 98, 203, 478...)
+        # and to prevent shape mismatch crashes if dense detection fails for a single face.
         filtered_kpss = []
         filtered_kpss_203 = []
 
-        for i in range(len(filtered_bboxes)):
+        for i in range(num_targets):
             current_bbox = filtered_bboxes[i]
             current_kps5 = filtered_kpss_5[i]
 
-            # CRITICAL FALLBACK: Instead of appending None on failure, we use valid arrays
-            # to prevent downstream ".copy()" calls from throwing AttributeError.
+            # Critical fallback: default to 5 points if heavy detection fails
             kps_standard = current_kps5.copy()
+            kps_203_local = numpy.zeros((203, 2), dtype=numpy.float32)
+            has_valid_203 = False
 
-            # Extract standard dense landmarks (68 or 203 depending on UI selection)
-            if use_landmark:
-                _, lm_kpss, _ = self.main_window.models_processor.run_detect_landmark(
-                    frame_tensor,
-                    current_bbox,
-                    current_kps5,
-                    detect_mode=landmark_mode,
-                    score=control.get("LandmarkDetectScoreSlider", 50) / 100.0,
-                    use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
-                    from_points=True,
-                )
-                if len(lm_kpss) > 0:
-                    kps_standard = lm_kpss
-
-            filtered_kpss.append(kps_standard)
-
-            # Extract forced 203 landmarks if advanced editing features demand it
+            # FW-LOGIC-FIX 1: Extract forced 203 landmarks FIRST if required
             if requires_203:
-                kps_203_local = numpy.zeros((203, 2), dtype=numpy.float32)
+                lm_203_5, lm_203, _ = (
+                    self.main_window.models_processor.run_detect_landmark(
+                        frame_tensor,
+                        current_bbox,
+                        current_kps5,
+                        detect_mode="203",
+                        score=0.5,
+                        use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
+                        from_points=True,  # STRICTLY REQUIRED FOR INTERNAL ALIGNMENT
+                    )
+                )
+                if len(lm_203) > 0:
+                    kps_203_local = lm_203
+                    has_valid_203 = True
+                    # If 203 was extracted for fallback, but the user ALSO selected 203
+                    # as their primary UI model, update the Swapper's 5 points immediately.
+                    if landmark_mode == "203" and len(lm_203_5) > 0:
+                        filtered_kpss_5[i] = lm_203_5
 
-                # Optimization: If the user already selected 203 as standard, reuse it to save a CUDA call
-                if use_landmark and landmark_mode == "203" and len(kps_standard) == 203:
-                    kps_203_local = kps_standard.copy()
+                filtered_kpss_203.append(kps_203_local)
+
+            # FW-LOGIC-FIX 2: Extract standard dense landmarks (Dynamic Model)
+            if use_landmark:
+                # OPTIMIZATION: Reuse the 203 landmarks computed above ONLY IF
+                # the user explicitly enabled 'from_points' in the UI.
+                # This effectively prevents a redundant and costly neural network forward pass.
+                if (
+                    landmark_mode == "203"
+                    and requires_203
+                    and has_valid_203
+                    and from_points
+                ):
+                    kps_standard = kps_203_local.copy()
                 else:
-                    _, lm_203, _ = (
+                    lm_std_5, lm_kpss, _ = (
                         self.main_window.models_processor.run_detect_landmark(
                             frame_tensor,
                             current_bbox,
                             current_kps5,
-                            detect_mode="203",
-                            score=0.5,
+                            detect_mode=landmark_mode,
+                            score=control.get("LandmarkDetectScoreSlider", 50) / 100.0,
                             use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
-                            from_points=True,
+                            from_points=from_points,
                         )
                     )
-                    if len(lm_203) > 0:
-                        kps_203_local = lm_203
+                    if len(lm_kpss) > 0:
+                        kps_standard = lm_kpss
+                        if len(lm_std_5) > 0:
+                            filtered_kpss_5[i] = lm_std_5
 
-                filtered_kpss_203.append(kps_203_local)
+            filtered_kpss.append(kps_standard)
 
-        # Reformat output arrays to match the expected pipeline signature (CRITICAL TYPE CASTING)
-        bboxes = numpy.array(filtered_bboxes, dtype=numpy.float32)
-        kpss_5 = numpy.array(filtered_kpss_5, dtype=numpy.float32)
+        # Reassign outputs with dynamic casting
+        bboxes = filtered_bboxes
+        kpss_5 = filtered_kpss_5
 
+        # Safely convert to numpy arrays. We use a try/except to fallback to dtype=object
+        # ONLY if the arrays have mixed dimensions (e.g., Face A = 478 points, Face B = 5 points).
         if len(filtered_kpss) > 0:
-            kpss = numpy.array(filtered_kpss, dtype=object)
+            try:
+                kpss = numpy.array(filtered_kpss, dtype=numpy.float32)
+            except Exception:
+                kpss = numpy.array(filtered_kpss, dtype=object)
         else:
             kpss = numpy.empty((0, 5, 2), dtype=numpy.float32)
 
         if requires_203 and len(filtered_kpss_203) > 0:
-            kpss_203 = numpy.array(filtered_kpss_203, dtype=object)
+            try:
+                kpss_203 = numpy.array(filtered_kpss_203, dtype=numpy.float32)
+            except Exception:
+                kpss_203 = numpy.array(filtered_kpss_203, dtype=object)
         else:
             kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
 
         # Cleanup VRAM
         if owns_frame_tensor:
             del frame_tensor
-
-        # Safely copy arrays before returning to prevent memory corruption when the
-        # arrays are accessed by independent worker threads.
-        if isinstance(bboxes, numpy.ndarray):
-            bboxes = bboxes.copy()
-        if isinstance(kpss_5, numpy.ndarray):
-            kpss_5 = kpss_5.copy()
-        if isinstance(kpss, numpy.ndarray):
-            kpss = kpss.copy()
-        if isinstance(kpss_203, numpy.ndarray):
-            kpss_203 = kpss_203.copy()
+            frame_tensor = None
 
         # --- SANITIZATION SHIELD ---
-        # Ensures only perfectly formatted data passes through to the FrameWorker.
-        # Defends against dimension mismatches, NaNs, and infinite values.
-        if isinstance(bboxes, numpy.ndarray):
-            if bboxes.dtype == object:
-                try:
-                    bboxes = bboxes.astype(numpy.float32)
-                except Exception:
-                    bboxes = numpy.empty((0, 4), dtype=numpy.float32)
-
-            if bboxes.size > 0 and bboxes.ndim == 2 and bboxes.shape[1] == 4:
-                valid_mask = numpy.isfinite(bboxes).all(axis=1)
-                if not valid_mask.all():
-                    bboxes = bboxes[valid_mask]
-                    if isinstance(kpss_5, numpy.ndarray) and kpss_5.shape[0] == len(
-                        valid_mask
-                    ):
-                        kpss_5 = kpss_5[valid_mask]
-                    if isinstance(kpss, numpy.ndarray) and kpss.shape[0] == len(
-                        valid_mask
-                    ):
-                        kpss = kpss[valid_mask]
-                    if isinstance(kpss_203, numpy.ndarray) and kpss_203.shape[0] == len(
-                        valid_mask
-                    ):
-                        kpss_203 = kpss_203[valid_mask]
-            else:
-                bboxes = numpy.empty((0, 4), dtype=numpy.float32)
-        else:
-            bboxes = numpy.empty((0, 4), dtype=numpy.float32)
-
-        if bboxes.shape[0] == 0:
-            if isinstance(kpss_5, numpy.ndarray):
-                kpss_5 = numpy.empty((0, 5, 2), dtype=numpy.float32)
-            if isinstance(kpss, numpy.ndarray):
-                kpss = numpy.empty((0, 68, 2), dtype=numpy.float32)
-            if isinstance(kpss_203, numpy.ndarray):
-                kpss_203 = numpy.empty((0, 203, 2), dtype=numpy.float32)
+        # Protects against NaNs and Infs, works flawlessly with dynamic shapes
+        if bboxes.shape[0] > 0:
+            valid_mask = numpy.isfinite(bboxes).all(axis=1)
+            if not valid_mask.all():
+                bboxes = bboxes[valid_mask]
+                kpss_5 = kpss_5[valid_mask]
+                if isinstance(kpss, numpy.ndarray) and kpss.shape[0] == len(valid_mask):
+                    kpss = kpss[valid_mask]
+                if isinstance(kpss_203, numpy.ndarray) and kpss_203.shape[0] == len(
+                    valid_mask
+                ):
+                    kpss_203 = kpss_203[valid_mask]
 
         # Update global tracker state for UI bounding box rendering
         detected_for_state = []

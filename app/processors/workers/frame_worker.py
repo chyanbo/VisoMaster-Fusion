@@ -127,6 +127,7 @@ class FrameWorker(threading.Thread):
         # FW-MEM-01: Gabor kernel cache as LRU-bounded OrderedDict
         from collections import OrderedDict as _OrderedDict
 
+        self._gabor_kernels_expanded_cache: _OrderedDict = _OrderedDict()
         self._gabor_kernels_cache: _OrderedDict = (
             _OrderedDict()
         )  # keyed by (kernel_size,sigma,lambd,gamma,psi,N,device_str)
@@ -228,26 +229,12 @@ class FrameWorker(threading.Thread):
         # --- OPTIMIZATION: Cached Convolution Kernels (VRAM) ---
         # Pre-allocating mathematical filters prevents massive CPU-to-GPU
         # allocation overheads during the binary search loops (sharpness_score).
-        device = self.models_processor.device
-        self.kernel_lap = torch.tensor(
-            [[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=device, dtype=torch.float32
-        ).view(1, 1, 3, 3)
+        self._kernel_lap = None
+        self._kernel_sobel_x = None
+        self._kernel_sobel_y = None
 
-        self.kernel_sobel_x = torch.tensor(
-            [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=torch.float32
-        ).view(1, 1, 3, 3)
-        self.kernel_sobel_y = self.kernel_sobel_x.transpose(2, 3)
-
-        # FW-CPU-1: Per-worker CUDA stream, otherwise all 8 pool workers share the
-        # default stream and every `current_stream().synchronize()` call inside
-        # _run_model_with_lazy_build_check (face_swappers / face_masks / face_restorers /
-        # frame_enhancers / face_landmark_detectors) waits for *every* worker's
-        # pending GPU work. With CUDA 13's spin-wait scheduler that turns each pool
-        # worker into a 100%-CPU spinner; pinning each worker to its own stream
-        # cuts the sync surface back down to what the worker itself submitted.
-        self.worker_stream = (
-            torch.cuda.Stream() if self.models_processor.device == "cuda" else None
-        )
+        # Do not use local streams here ! Onnxruntime handles independent streams internally for each worker (fixes VRAM explosion)
+        self.worker_stream = None  # (torch.cuda.Stream() if self.models_processor.device_type == "cuda" else None)
 
     def set_scaling_transforms(self, control_params):
         """Initializes the torchvision transforms based on user interpolation settings."""
@@ -343,6 +330,15 @@ class FrameWorker(threading.Thread):
                         except ValueError:
                             # Safe to ignore if queue was cleared externally
                             pass
+                    # --- FIX RAM LEAK: Clear heavy objects while thread sleeps ---
+                    self.frame = None
+                    self.precomputed_bboxes = None
+                    self.precomputed_kpss_5 = None
+                    self.precomputed_kpss = None
+                    self.precomputed_kpss_203 = None
+                    self.parameters = {}
+                    self.local_control_state_from_feeder = {}
+                    task = None
 
         else:
             # --- Single-Frame Mode ---
@@ -567,6 +563,7 @@ class FrameWorker(threading.Thread):
         detected_embedding_np,
         control_global,
         target_faces_snapshot: dict | None = None,
+        is_sequentially_tracked: bool = False,
     ):
         """Finds the best matching source face for a detected target face.
 
@@ -588,11 +585,21 @@ class FrameWorker(threading.Thread):
         with self.lock:
             default_params_dict = dict(self.main_window.default_parameters.data)
 
+        # FW-ARCH-FIX: Trust the Sequential Detector
+        # If the face was already rescued temporally, we bypass the UI threshold
+        current_params = copy.deepcopy(self.parameters)
+        if is_sequentially_tracked:
+            for face_id, p in current_params.items():
+                if isinstance(p, dict):
+                    p["SimilarityThresholdSlider"] = 0.0
+            if "SimilarityThresholdSlider" in default_params_dict:
+                default_params_dict["SimilarityThresholdSlider"] = 0.0
+
         return find_best_target_match(
             detected_embedding_np,
             self.models_processor,
             faces_to_iterate,
-            self.parameters,
+            current_params,
             cast(dict, default_params_dict),
             str(control_global["RecognitionModelSelection"]),
         )
@@ -1995,6 +2002,10 @@ class FrameWorker(threading.Thread):
                             k[:, 1] *= ratio_h
 
         # Manual Rotation
+        # FW-BUG-FIX: Store pre- and post-rotation dimensions to accurately
+        # reverse the affine transform later without accumulating black borders.
+        pre_rot_h, pre_rot_w = img.shape[1], img.shape[2]
+
         if control["ManualRotationEnableToggle"]:
             img = v2.functional.rotate(
                 img,
@@ -2003,11 +2014,18 @@ class FrameWorker(threading.Thread):
                 expand=True,
             )
 
+        post_rot_h, post_rot_w = img.shape[1], img.shape[2]
+
         # --- DETECTION PHASE ---
         # The workers are now "Stateless Render Engines". They no longer track time or state.
         # They consume perfectly sequenced and EMA-smoothed detections from the Feeder thread.
 
-        if self.precomputed_bboxes is not None and self.precomputed_kpss_5 is not None:
+        # FW-ARCH-FIX: Flag to know if faces were vetted by the Sequential Detector
+        is_sequentially_tracked = (
+            self.precomputed_bboxes is not None and self.precomputed_kpss_5 is not None
+        )
+
+        if is_sequentially_tracked:
             # 1. Primary Path (Video/Webcam): Use the sequentially precomputed detections
             bboxes = self.precomputed_bboxes
             kpss_5 = self.precomputed_kpss_5
@@ -2053,7 +2071,10 @@ class FrameWorker(threading.Thread):
                         requires_203 = True
                         break
 
-            # STEP 1: Standard detection respecting User's choice
+            # --- STEP 1: Standard detection (Respect UI Toggle) ---
+            # We pass 'use_landmark_detection=use_landmark' to allow run_detect
+            # to attempt an initial extraction. If Auto-Rotation is enabled,
+            # run_detect may bypass dense landmark extraction if the angle is too extreme.
             bboxes, kpss_5, kpss = self.models_processor.run_detect(
                 img,
                 control.get("DetectorModelSelection", "RetinaFace"),
@@ -2063,7 +2084,7 @@ class FrameWorker(threading.Thread):
                 use_landmark_detection=use_landmark,
                 landmark_detect_mode=landmark_mode,
                 landmark_score=control.get("LandmarkDetectScoreSlider", 50) / 100.0,
-                from_points=from_points,
+                from_points=from_points,  # Respects the UI toggle state
                 rotation_angles=[0]
                 if not control.get("AutoRotationToggle", False)
                 else [0, 90, 180, 270],
@@ -2072,32 +2093,98 @@ class FrameWorker(threading.Thread):
                 bypass_bytetrack=True,
             )
 
-            # STEP 2: Smart Double-Scan for 203 points
+            # FW-LOGIC-FIX: Validate if Step 1 returned actual dense landmarks (> 5 points).
+            # If run_detect aborted dense extraction due to an extreme rotation angle,
+            # 'kpss' will merely contain a fallback copy of the sparse 'kpss_5'.
+            has_valid_dense_kpss = (
+                kpss is not None
+                and len(kpss) == len(bboxes)
+                and len(bboxes) > 0
+                and kpss[0].shape[0] > 5
+            )
+
+            # --- STEP 2: 203-Landmark Extraction (Expression Restorer / Face Editor) ---
             kpss_203 = None
             if requires_203:
-                if use_landmark and landmark_mode == "203":
-                    # OPTIMIZATION: 203 was already extracted by the user's choice. Zero CUDA cost.
-                    kpss_203 = kpss
-                else:
-                    # Extract 203 specifically for advanced features
-                    _, _, kpss_203 = self.models_processor.run_detect(
-                        img,
-                        control.get("DetectorModelSelection", "RetinaFace"),
-                        max_num=control.get("MaxFacesToDetectSlider", 1),
-                        score=control.get("DetectorScoreSlider", 50) / 100.0,
-                        input_size=(512, 512),
-                        use_landmark_detection=True,
-                        landmark_detect_mode="203",
-                        landmark_score=control.get("LandmarkDetectScoreSlider", 50)
-                        / 100.0,
-                        from_points=from_points,
-                        rotation_angles=[0]
-                        if not control.get("AutoRotationToggle", False)
-                        else [0, 90, 180, 270],
-                        use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
-                        previous_detections=None,
-                        bypass_bytetrack=True,
-                    )
+                kpss_203_list = []
+                # LOGIC FIX: We ONLY reuse Step 1 landmarks if they are already in the 203
+                # format AND the user enabled 'from_points'. Otherwise, we MUST re-extract
+                # with 'from_points=True' to ensure geometric alignment for the Expression Restorer.
+                can_reuse_step1_203 = (
+                    has_valid_dense_kpss and landmark_mode == "203" and from_points
+                )
+
+                if bboxes is not None and len(bboxes) > 0:
+                    for idx in range(len(bboxes)):
+                        if can_reuse_step1_203:
+                            kps_203_local = kpss[idx].copy()
+                        else:
+                            # FORCE from_points=True: Strictly required for the geometric
+                            # alignment of advanced tools (FaceEditor, Makeup, Expressions).
+                            lm_203_5, lm_203, _ = (
+                                self.models_processor.run_detect_landmark(
+                                    img,
+                                    bboxes[idx],
+                                    kpss_5[idx],
+                                    detect_mode="203",
+                                    score=0.5,
+                                    use_mean_eyes=control.get(
+                                        "LandmarkMeanEyesToggle", False
+                                    ),
+                                    from_points=True,  # STRICTLY REQUIRED HERE
+                                )
+                            )
+                            kps_203_local = (
+                                lm_203
+                                if len(lm_203) > 0
+                                else np.zeros((203, 2), dtype=np.float32)
+                            )
+
+                            # If Step 1 failed and user actually requested 203 for the swap,
+                            # ensure we update the Swapper's 5 points right now.
+                            if (
+                                landmark_mode == "203"
+                                and not has_valid_dense_kpss
+                                and len(lm_203_5) > 0
+                            ):
+                                kpss_5[idx] = lm_203_5
+
+                        kpss_203_list.append(kps_203_local)
+                kpss_203 = np.array(kpss_203_list, dtype=object)
+
+            # --- STEP 3: Fallback for standard landmarks (UI Display & Swap Alignment) ---
+            if use_landmark and not has_valid_dense_kpss and len(bboxes) > 0:
+                kpss_list = []
+                for idx in range(len(bboxes)):
+                    # Smart reuse: If Step 2 just computed 203 landmarks, use them
+                    # to avoid a redundant neural network forward pass.
+                    if (
+                        landmark_mode == "203"
+                        and kpss_203 is not None
+                        and len(kpss_203) > idx
+                    ):
+                        kpss_list.append(kpss_203[idx])
+                    else:
+                        # Respects the UI toggle state for standard UI landmarks
+                        lm_std_5, lm_std, _ = self.models_processor.run_detect_landmark(
+                            img,
+                            bboxes[idx],
+                            kpss_5[idx],
+                            detect_mode=landmark_mode,
+                            score=control.get("LandmarkDetectScoreSlider", 50) / 100.0,
+                            use_mean_eyes=control.get("LandmarkMeanEyesToggle", False),
+                            from_points=from_points,
+                        )
+
+                        if len(lm_std) > 0:
+                            kpss_list.append(lm_std)
+                            if len(lm_std_5) > 0:
+                                kpss_5[idx] = lm_std_5
+                        else:
+                            kpss_list.append(
+                                np.zeros((int(landmark_mode), 2), dtype=np.float32)
+                            )
+                kpss = np.array(kpss_list, dtype=object)
 
         if (
             isinstance(kpss_5, np.ndarray)
@@ -2105,12 +2192,18 @@ class FrameWorker(threading.Thread):
             or isinstance(kpss_5, list)
             and len(kpss_5) > 0
         ):
+            safe_bboxes = cast(Any, bboxes)
+
+            _kpss_list = cast(list, kpss) if kpss is not None else []
+            _kpss_203_list = cast(list, kpss_203) if kpss_203 is not None else []
+
             for i in range(len(kpss_5)):
-                _bbox_i = bboxes[i]
+                _bbox_i = safe_bboxes[i]
                 if not is_detected_face_eligible_for_matching(
                     kpss_5[i], _bbox_i, self._MIN_FACE_PIXELS
                 ):
                     continue  # too small to produce meaningful swap
+
                 similarity_type = str("Auto")
                 face_emb, _ = self.models_processor.run_recognize_direct(
                     img,
@@ -2119,11 +2212,9 @@ class FrameWorker(threading.Thread):
                     control["RecognitionModelSelection"],
                 )
 
-                kps_all_i = kpss[i] if kpss is not None and i < len(kpss) else None
+                kps_all_i = _kpss_list[i] if i < len(_kpss_list) else None
                 # Extract the 203 points specifically
-                kps_203_i = (
-                    kpss_203[i] if kpss_203 is not None and i < len(kpss_203) else None
-                )
+                kps_203_i = _kpss_203_list[i] if i < len(_kpss_203_list) else None
 
                 det_faces_data_for_display.append(
                     {
@@ -2131,7 +2222,9 @@ class FrameWorker(threading.Thread):
                         "kps_all": kps_all_i.copy() if kps_all_i is not None else None,
                         "kps_203": kps_203_i.copy() if kps_203_i is not None else None,
                         "embedding": face_emb,
-                        "bbox": bboxes[i].copy() if bboxes[i] is not None else None,
+                        "bbox": safe_bboxes[i].copy()
+                        if safe_bboxes[i] is not None
+                        else None,
                         "original_face": None,
                         "swap_mask": None,
                         "matched_target": None,  # FW-BUG-09: cache slot
@@ -2161,14 +2254,20 @@ class FrameWorker(threading.Thread):
                     for fface in det_faces_data_for_display:
                         # FW-BUG-09: pass snapshot; cache result on fface for downstream reuse
                         tgt, tgt_params, score = self._find_best_target_match(
-                            fface["embedding"], control, target_faces_snapshot
+                            fface["embedding"],
+                            control,
+                            target_faces_snapshot,
+                            is_sequentially_tracked=is_sequentially_tracked,
                         )
                         fface["matched_target"] = tgt
                         if tgt and tgt.face_id == target_face.face_id:
-                            if (
-                                score >= tgt_params["SimilarityThresholdSlider"]
-                                and score > best_score
-                            ):
+                            # FW-ARCH-FIX: Bypass strict UI threshold locally if rescued temporally
+                            effective_threshold = (
+                                tgt_params["SimilarityThresholdSlider"]
+                                if not is_sequentially_tracked
+                                else 0.0
+                            )
+                            if score >= effective_threshold and score > best_score:
                                 best_score = score
                                 best_fface = fface
 
@@ -2298,7 +2397,10 @@ class FrameWorker(threading.Thread):
                         break
                     # FW-BUG-09: pass the target_faces snapshot to avoid re-iterating live dict
                     best_target, params, _ = self._find_best_target_match(
-                        fface["embedding"], control, target_faces_snapshot
+                        fface["embedding"],
+                        control,
+                        target_faces_snapshot,
+                        is_sequentially_tracked=is_sequentially_tracked,
                     )
                     # FW-BUG-09: cache matched target so downstream helpers can reuse it
                     fface["matched_target"] = best_target
@@ -2422,12 +2524,71 @@ class FrameWorker(threading.Thread):
 
         # Undo Rotation / Scaling
         if control["ManualRotationEnableToggle"]:
+            angle = control["ManualRotationAngleSlider"]
+
+            # FW-BUG-FIX 1: Reverse rotation WITH expand=True so the canvas can physically
+            # accommodate the restored dimensions (fixes the 90/270 degree crop).
+            # Then center crop to strictly restore the original tensor shape.
             img = v2.functional.rotate(
                 img,
-                angle=-control["ManualRotationAngleSlider"],
+                angle=-angle,
                 interpolation=v2.InterpolationMode.BILINEAR,
-                expand=True,
+                expand=True,  # CRITICAL: Was False, causing the image to be truncated
             )
+            img = v2.functional.center_crop(img, (pre_rot_h, pre_rot_w))
+
+            # FW-MATH: Reverse the affine transform on all spatial coordinates.
+            import math
+
+            rad = math.radians(angle)
+            cos_a, sin_a = math.cos(rad), math.sin(rad)
+
+            cx_orig, cy_orig = pre_rot_w / 2.0, pre_rot_h / 2.0
+            cx_rot, cy_rot = post_rot_w / 2.0, post_rot_h / 2.0
+
+            for fface in det_faces_data_for_display:
+                if fface.get("_rotation_rescaled"):
+                    continue
+
+                def unrotate_pts(pts):
+                    if pts is None or len(pts) == 0:
+                        return pts
+                    # 1. Move origin to the rotated center
+                    x0 = pts[:, 0] - cx_rot
+                    y0 = pts[:, 1] - cy_rot
+
+                    # 2. Apply 2D inverse rotation matrix (Clockwise in Y-down coordinate system)
+                    # BUG FIX: The previous signs were inverted, causing points to rotate further away!
+                    x1 = x0 * cos_a - y0 * sin_a
+                    y1 = x0 * sin_a + y0 * cos_a
+
+                    # 3. Move back to the original image center
+                    pts[:, 0] = x1 + cx_orig
+                    pts[:, 1] = y1 + cy_orig
+                    return pts
+
+                # Bounding box requires converting to 4 corners, un-rotating, and getting min/max bounds
+                if fface.get("bbox") is not None:
+                    x1, y1, x2, y2 = fface["bbox"]
+                    corners = np.array(
+                        [[x1, y1], [x2, y1], [x2, y2], [x1, y2]], dtype=np.float32
+                    )
+                    unrot_corners = unrotate_pts(corners)
+                    fface["bbox"][0] = np.min(unrot_corners[:, 0])
+                    fface["bbox"][1] = np.min(unrot_corners[:, 1])
+                    fface["bbox"][2] = np.max(unrot_corners[:, 0])
+                    fface["bbox"][3] = np.max(unrot_corners[:, 1])
+
+                # Un-rotate all Keypoint Arrays
+                if fface.get("kps_5") is not None:
+                    fface["kps_5"] = unrotate_pts(fface["kps_5"])
+                if fface.get("kps_all") is not None:
+                    fface["kps_all"] = unrotate_pts(fface["kps_all"])
+                if fface.get("kps_203") is not None:
+                    fface["kps_203"] = unrotate_pts(fface["kps_203"])
+
+                fface["_rotation_rescaled"] = True
+
         if scale_applied:
             # FW-QUAL-11: use renamed img_h/img_w variables
             # FW-PERF-08 / FW-MEM-02: LRU-bounded cache for the scale-back transform.
@@ -3235,7 +3396,11 @@ class FrameWorker(threading.Thread):
 
         Returns:
             Tuple ``(swap_chw_uint8, prev_face_hwc_float)``.
+
+        Optimized to use reference swapping (Double Buffering) to minimize VRAM
+        fragmentation during multi-iteration swaps (Strength/Iterations).
         """
+        # Pre-process: Apply sharpness adjustment if requested
         if parameters["PreSwapSharpnessDecimalSlider"] != 1.0:
             input_face_affined = input_face_affined.permute(2, 0, 1)
             input_face_affined = v2.functional.adjust_sharpness(
@@ -3243,23 +3408,19 @@ class FrameWorker(threading.Thread):
             )
             input_face_affined = input_face_affined.permute(1, 2, 0)
 
-        # prev_face is updated at the start of each iteration so that after
-        # N iterations it holds the N-1 result.  The alpha blend in swap_core
-        # then interpolates between pass N-1 and pass N for fractional slider values.
-        # Initialized here as a fallback for the DFM branch and itex=0 edge case.
-        prev_face = input_face_affined.clone()
+        # Initialize tracking states using references to avoid unnecessary VRAM copies
+        prev_face = input_face_affined
         first_pass_face = None
-
         # Strength mode 2 toggle
         use_mode_2 = parameters.get("StrengthMode2EnableToggle", False)
 
+        # --- Inswapper128 Path ---
         if swapper_model == "Inswapper128":
             _use_batched = False
 
             for k in range(itex):
-                prev_face = (
-                    input_face_affined.clone()
-                )  # save N-1 result before this pass
+                # Double Buffering: Update previous state reference before current pass
+                prev_face = input_face_affined
 
                 if _use_batched:
                     # ------ BATCHED PATH (dim > 1) ------
@@ -3273,6 +3434,7 @@ class FrameWorker(threading.Thread):
                                 .contiguous()
                             )
                             tile_coords.append((j, i))
+
                     batch_input = torch.stack(tiles_list, dim=0)  # [B, 3, 128, 128]
                     batch_output = torch.empty_like(batch_input)
 
@@ -3280,26 +3442,27 @@ class FrameWorker(threading.Thread):
                         batch_input, latent, batch_output
                     )
 
-                    if self.models_processor.device == "cuda":
+                    if self.models_processor.device_type == "cuda":
                         torch.cuda.current_stream().synchronize()
 
-                    # Replace any near-zero output tile with the input tile
+                    # Fallback for zero-output tiles
                     tile_sums = batch_output.abs().sum(dim=(1, 2, 3))
                     zero_mask = tile_sums < 1.0
                     if zero_mask.any():
                         batch_output[zero_mask] = batch_input[zero_mask]
 
+                    # Reconstruction: Only one clone needed as a canvas per iteration
+                    temp_output = input_face_affined.clone()
+                    for idx, (j, i) in enumerate(tile_coords):
+                        temp_output[j::dim, i::dim] = batch_output[idx].permute(1, 2, 0)
+
                     # --- MODE 2 ---
                     if use_mode_2:
-                        temp_output = input_face_affined.clone()
-                        for idx, (j, i) in enumerate(tile_coords):
-                            temp_output[j::dim, i::dim] = batch_output[idx].permute(
-                                1, 2, 0
-                            )
-
                         curr_chw = temp_output.permute(2, 0, 1)
                         if k == 0:
-                            first_pass_face = curr_chw.clone()
+                            first_pass_face = (
+                                curr_chw.clone()
+                            )  # Store first pass for drift correction
                         else:
                             prev_chw = prev_face.permute(2, 0, 1)
                             curr_chw = self._fix_drift_and_texture(
@@ -3307,23 +3470,14 @@ class FrameWorker(threading.Thread):
                             )
                             temp_output = curr_chw.permute(1, 2, 0)
 
-                        prev_face = input_face_affined.clone()
-                        input_face_affined = temp_output.clone()
-                        output = torch.clamp(temp_output * 255.0, 0, 255)
-
-                    # --- NORMAL MODE ---
-                    else:
-                        for idx, (j, i) in enumerate(tile_coords):
-                            output[j::dim, i::dim] = batch_output[idx].permute(1, 2, 0)
-
-                        prev_face = input_face_affined.clone()
-                        input_face_affined = output.clone()
-                        output = torch.mul(output, 255)
-                        output = torch.clamp(output, 0, 255)
+                    # Update working reference and final output buffer
+                    input_face_affined = temp_output
+                    output = torch.clamp(temp_output * 255.0, 0, 255)
 
                 else:
                     # ------ SEQUENTIAL PATH (ORT providers or dim==1) ------
-                    # Lists to hold independent memory buffers for this iteration
+                    # Allocate iteration canvas
+                    temp_output = input_face_affined.clone()
                     tile_inputs = []
                     tile_outputs = []
                     tile_coords = []
@@ -3333,7 +3487,6 @@ class FrameWorker(threading.Thread):
                             tile = input_face_affined[j::dim, i::dim]
                             t_in = tile.permute(2, 0, 1).contiguous().unsqueeze(0)
                             t_out = torch.empty_like(t_in)
-
                             tile_inputs.append(t_in)
                             tile_outputs.append(t_out)
                             tile_coords.append((j, i))
@@ -3344,22 +3497,19 @@ class FrameWorker(threading.Thread):
                                 tile_inputs[idx], latent, tile_outputs[idx]
                             )
 
-                    if self.models_processor.device == "cuda":
+                    if self.models_processor.device_type == "cuda":
                         torch.cuda.current_stream().synchronize()
+
+                    for idx, (j, i) in enumerate(tile_coords):
+                        res = (
+                            tile_inputs[idx]
+                            if tile_outputs[idx].sum() < 1.0
+                            else tile_outputs[idx]
+                        )
+                        temp_output[j::dim, i::dim] = res.squeeze(0).permute(1, 2, 0)
 
                     # --- MODE 2 ---
                     if use_mode_2:
-                        temp_output = input_face_affined.clone()
-                        for idx, (j, i) in enumerate(tile_coords):
-                            res = (
-                                tile_inputs[idx]
-                                if tile_outputs[idx].sum() < 1.0
-                                else tile_outputs[idx]
-                            )
-                            temp_output[j::dim, i::dim] = res.squeeze(0).permute(
-                                1, 2, 0
-                            )
-
                         curr_chw = temp_output.permute(2, 0, 1)
                         if k == 0:
                             first_pass_face = curr_chw.clone()
@@ -3370,26 +3520,10 @@ class FrameWorker(threading.Thread):
                             )
                             temp_output = curr_chw.permute(1, 2, 0)
 
-                        prev_face = input_face_affined.clone()
-                        input_face_affined = temp_output.clone()
-                        output = torch.clamp(temp_output * 255.0, 0, 255)
+                    input_face_affined = temp_output
+                    output = torch.clamp(temp_output * 255.0, 0, 255)
 
-                    # --- NORMAL MODE ---
-                    else:
-                        for idx, (j, i) in enumerate(tile_coords):
-                            if tile_outputs[idx].sum() < 1.0:
-                                res = tile_inputs[idx]
-                            else:
-                                res = tile_outputs[idx]
-
-                            res_hwc = res.squeeze(0).permute(1, 2, 0)
-                            output[j::dim, i::dim] = res_hwc
-
-                        prev_face = input_face_affined.clone()
-                        input_face_affined = output.clone()
-                        output = torch.mul(output, 255)
-                        output = torch.clamp(output, 0, 255)
-
+        # --- InStyleSwapper Path ---
         elif swapper_model in (
             "InStyleSwapper256 Version A",
             "InStyleSwapper256 Version B",
@@ -3398,12 +3532,10 @@ class FrameWorker(threading.Thread):
             version = swapper_model[-1]
             dim_res = dim // 2
 
-            for k in range(
-                itex
-            ):  # FW-QUAL-06: renamed k -> _ - Fix : Restored k to prevent crash
-                prev_face = (
-                    input_face_affined.clone()
-                )  # save N-1 result before this pass
+            for k in range(itex):
+                prev_face = input_face_affined
+                temp_output = input_face_affined.clone()
+
                 tile_inputs = []
                 tile_outputs = []
                 tile_coords = []
@@ -3413,7 +3545,6 @@ class FrameWorker(threading.Thread):
                         tile = input_face_affined[j::dim_res, i::dim_res]
                         t_in = tile.permute(2, 0, 1).contiguous().unsqueeze(0)
                         t_out = torch.empty_like(t_in)
-
                         tile_inputs.append(t_in)
                         tile_outputs.append(t_out)
                         tile_coords.append((j, i))
@@ -3424,22 +3555,21 @@ class FrameWorker(threading.Thread):
                             tile_inputs[idx], latent, tile_outputs[idx], version
                         )
 
-                if self.models_processor.device == "cuda":
+                if self.models_processor.device_type == "cuda":
                     torch.cuda.current_stream().synchronize()
+
+                for idx, (j, i) in enumerate(tile_coords):
+                    res = (
+                        tile_inputs[idx]
+                        if tile_outputs[idx].sum() < 1.0
+                        else tile_outputs[idx]
+                    )
+                    temp_output[j::dim_res, i::dim_res] = res.squeeze(0).permute(
+                        1, 2, 0
+                    )
 
                 # --- MODE 2 ---
                 if use_mode_2:
-                    temp_output = input_face_affined.clone()
-                    for idx, (j, i) in enumerate(tile_coords):
-                        res = (
-                            tile_inputs[idx]
-                            if tile_outputs[idx].sum() < 1.0
-                            else tile_outputs[idx]
-                        )
-                        temp_output[j::dim_res, i::dim_res] = res.squeeze(0).permute(
-                            1, 2, 0
-                        )
-
                     curr_chw = temp_output.permute(2, 0, 1)
                     if k == 0:
                         first_pass_face = curr_chw.clone()
@@ -3450,35 +3580,18 @@ class FrameWorker(threading.Thread):
                         )
                         temp_output = curr_chw.permute(1, 2, 0)
 
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = temp_output.clone()
-                    output = torch.clamp(temp_output * 255.0, 0, 255)
+                input_face_affined = temp_output
+                output = torch.clamp(temp_output * 255.0, 0, 255)
 
-                # --- NORMAL MODE ---
-                else:
-                    for idx, (j, i) in enumerate(tile_coords):
-                        if tile_outputs[idx].sum() < 1.0:
-                            res = tile_inputs[idx]
-                        else:
-                            res = tile_outputs[idx]
-
-                        res_hwc = res.squeeze(0).permute(1, 2, 0)
-                        output[j::dim_res, i::dim_res] = res_hwc
-
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = output.clone()
-                    output = torch.mul(output, 255)
-                    output = torch.clamp(output, 0, 255)
-
+        # --- SimSwap Path ---
         elif swapper_model == "SimSwap512":
-            for k in range(
-                itex
-            ):  # FW-QUAL-06: renamed k -> _ - Fix : restored k to prevent crash
-                prev_face = (
-                    input_face_affined.clone()
-                )  # save N-1 result before this pass
-                input_face_disc = input_face_affined.permute(2, 0, 1)
-                input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
+            for k in range(itex):
+                # Zero-clone optimization: Model generates a fresh tensor
+                prev_face = input_face_affined
+
+                input_face_disc = (
+                    input_face_affined.permute(2, 0, 1).unsqueeze(0).contiguous()
+                )
                 swapper_output = torch.empty(
                     (1, 3, 512, 512),
                     dtype=torch.float32,
@@ -3489,14 +3602,14 @@ class FrameWorker(threading.Thread):
                     input_face_disc, latent, swapper_output
                 )
 
-                if self.models_processor.device == "cuda":
+                if self.models_processor.device_type == "cuda":
                     torch.cuda.current_stream().synchronize()
 
-                # FW-BUG-08: use abs().max() instead of sum() for zero-face heuristic
+                # Robustness: Fallback to input if output is empty
                 if swapper_output.abs().max() < 1e-4:
                     swapper_output = input_face_disc
 
-                swapper_output = torch.squeeze(swapper_output)
+                swapper_output = swapper_output.squeeze(0)
 
                 # --- MODE 2 ---
                 if use_mode_2:
@@ -3508,31 +3621,23 @@ class FrameWorker(threading.Thread):
                             swapper_output, prev_chw, first_pass_face
                         )
 
-                    swapper_output = swapper_output.permute(1, 2, 0)
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = swapper_output.clone()
-                    output = torch.clamp(swapper_output * 255.0, 0, 255)
+                swapper_output_hwc = swapper_output.permute(1, 2, 0)
+                input_face_affined = swapper_output_hwc
+                output = torch.clamp(swapper_output_hwc * 255.0, 0, 255)
 
-                # --- NORMAL MODE ---
-                else:
-                    swapper_output = swapper_output.permute(1, 2, 0)
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = swapper_output.clone()
-
-                    output = swapper_output.clone()
-                    output = torch.mul(output, 255)
-                    output = torch.clamp(output, 0, 255)
-
-        # FW-QUAL-10: use GHOSTFACE_MODELS frozenset
+        # --- GhostFace Path ---
         elif swapper_model in self.GHOSTFACE_MODELS:
-            for k in range(itex):  # FW-QUAL-06: renamed k -> _
-                prev_face = (
-                    input_face_affined.clone()
-                )  # save N-1 result before this pass
+            for k in range(itex):
+                # Performance Optimization: Avoiding redundant VRAM allocations
+                prev_face = input_face_affined
+
+                # Model-specific preprocessing (Normalizing to [-1, 1])
                 input_face_disc = torch.mul(input_face_affined, 255.0).permute(2, 0, 1)
                 input_face_disc = torch.div(input_face_disc.float(), 127.5)
-                input_face_disc = torch.sub(input_face_disc, 1)
-                input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
+                input_face_disc = (
+                    torch.sub(input_face_disc, 1).unsqueeze(0).contiguous()
+                )
+
                 swapper_output = torch.empty(
                     (1, 3, 256, 256),
                     dtype=torch.float32,
@@ -3543,7 +3648,7 @@ class FrameWorker(threading.Thread):
                     input_face_disc, latent, swapper_output, swapper_model
                 )
 
-                if self.models_processor.device == "cuda":
+                if self.models_processor.device_type == "cuda":
                     torch.cuda.current_stream().synchronize()
 
                 swapper_output = swapper_output[0]
@@ -3555,6 +3660,7 @@ class FrameWorker(threading.Thread):
 
                 # --- MODE 2 ---
                 if use_mode_2:
+                    # Post-processing and drift correction
                     swapper_output = torch.add(torch.mul(swapper_output, 127.5), 127.5)
                     curr_chw = torch.div(swapper_output, 255.0)
 
@@ -3566,36 +3672,26 @@ class FrameWorker(threading.Thread):
                             curr_chw, prev_chw, first_pass_face
                         )
 
-                    temp_output = curr_chw.permute(1, 2, 0)
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = temp_output.clone()
-                    output = torch.clamp(curr_chw.permute(1, 2, 0) * 255.0, 0, 255)
-
-                # --- NORMAL MODE ---
+                    input_face_affined = curr_chw.permute(1, 2, 0)
+                    output = torch.clamp(input_face_affined * 255.0, 0, 255)
                 else:
-                    if swapper_output.sum() < 1.0:
-                        pass
                     swapper_output = swapper_output.permute(1, 2, 0)
-                    swapper_output = torch.mul(swapper_output, 127.5)
-                    swapper_output = torch.add(swapper_output, 127.5)
+                    swapper_output = torch.add(torch.mul(swapper_output, 127.5), 127.5)
 
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = swapper_output.clone()
-                    input_face_affined = torch.div(input_face_affined, 255)
+                    input_face_affined = torch.div(swapper_output, 255.0)
+                    output = torch.clamp(swapper_output, 0, 255)
 
-                    output = swapper_output.clone()
-                    output = torch.clamp(output, 0, 255)
-
+        # --- CSCS Path ---
         elif swapper_model == "CSCS":
-            for k in range(itex):  # FW-QUAL-06: renamed k -> _
-                prev_face = (
-                    input_face_affined.clone()
-                )  # save N-1 result before this pass
+            for k in range(itex):
+                prev_face = input_face_affined
+
                 input_face_disc = input_face_affined.permute(2, 0, 1)
                 input_face_disc = v2.functional.normalize(
                     input_face_disc, (0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=False
                 )
-                input_face_disc = torch.unsqueeze(input_face_disc, 0).contiguous()
+                input_face_disc = input_face_disc.unsqueeze(0).contiguous()
+
                 swapper_output = torch.empty(
                     (1, 3, 256, 256),
                     dtype=torch.float32,
@@ -3606,10 +3702,10 @@ class FrameWorker(threading.Thread):
                     input_face_disc, latent, swapper_output
                 )
 
-                if self.models_processor.device == "cuda":
+                if self.models_processor.device_type == "cuda":
                     torch.cuda.current_stream().synchronize()
 
-                swapper_output = torch.squeeze(swapper_output)
+                swapper_output = swapper_output.squeeze(0)
                 swapper_output = torch.add(torch.mul(swapper_output, 0.5), 0.5)
 
                 # --- MODE 2 ---
@@ -3622,63 +3718,59 @@ class FrameWorker(threading.Thread):
                             swapper_output, prev_chw, first_pass_face
                         )
 
-                    temp_output = swapper_output.permute(1, 2, 0)
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = temp_output.clone()
-                    output = torch.clamp(temp_output * 255.0, 0, 255)
-
-                # --- NORMAL MODE ---
+                    input_face_affined = swapper_output.permute(1, 2, 0)
+                    output = torch.clamp(input_face_affined * 255.0, 0, 255)
                 else:
-                    swapper_output = swapper_output.permute(1, 2, 0)
+                    input_face_affined = swapper_output.permute(1, 2, 0)
+                    output = torch.clamp(input_face_affined * 255.0, 0, 255)
 
-                    prev_face = input_face_affined.clone()
-                    input_face_affined = swapper_output.clone()
-
-                    output = swapper_output.clone()
-                    output = torch.mul(output, 255)
-                    output = torch.clamp(output, 0, 255)
-
+        # --- DeepFaceLive (DFM) Path ---
         elif swapper_model == "DeepFaceLive (DFM)" and dfm_model:
-            # --- 1. DFM Resolution Detection (Deep Introspection) ---
-            dfm_res = 256  # Fallback
+            # Detect model resolution (Results are cached for performance)
+            if hasattr(dfm_model, "_cached_dfm_res"):
+                dfm_res = dfm_model._cached_dfm_res
+            else:
+                dfm_res = 256  # Safe default
+                from collections import deque
 
-            from collections import deque
+                queue = deque([dfm_model])
+                visited = set([id(dfm_model)])
+                found_res = None
 
-            queue = deque([dfm_model])
-            visited = set([id(dfm_model)])
-            found_res = None
+                while queue and not found_res:
+                    current = queue.popleft()
+                    if hasattr(current, "get_inputs") and callable(current.get_inputs):
+                        try:
+                            shape = current.get_inputs()[0].shape
+                            for s in shape:
+                                if isinstance(s, int) and s > 32 and s % 16 == 0:
+                                    found_res = s
+                                    break
+                        except Exception:
+                            pass
 
-            while queue and not found_res:
-                current = queue.popleft()
-                if hasattr(current, "get_inputs") and callable(current.get_inputs):
-                    try:
-                        shape = current.get_inputs()[0].shape
-                        for s in shape:
-                            if isinstance(s, int) and s > 32 and s % 16 == 0:
-                                found_res = s
-                                break
-                    except Exception:
-                        pass
+                    if not found_res and hasattr(current, "__dict__"):
+                        for k, v in current.__dict__.items():
+                            if id(v) not in visited and not k.startswith("__"):
+                                visited.add(id(v))
+                                queue.append(v)
 
-                if not found_res and hasattr(current, "__dict__"):
-                    for k, v in current.__dict__.items():
-                        if id(v) not in visited and not k.startswith("__"):
-                            visited.add(id(v))
-                            queue.append(v)
+                if found_res:
+                    dfm_res = found_res
+                elif hasattr(dfm_model, "_dfm_filename_fallback"):
+                    import re
 
-            if found_res:
-                dfm_res = found_res
-            elif hasattr(dfm_model, "_dfm_filename_fallback"):
-                import re
+                    match = re.search(
+                        r"(128|192|224|256|320|384|448|512)",
+                        dfm_model._dfm_filename_fallback,
+                    )
+                    if match:
+                        dfm_res = int(match.group(1))
 
-                match = re.search(
-                    r"(128|192|224|256|320|384|448|512)",
-                    dfm_model._dfm_filename_fallback,
-                )
-                if match:
-                    dfm_res = int(match.group(1))
+                # Cache it for all future frames
+                dfm_model._cached_dfm_res = dfm_res
 
-            # --- 2. Strict Resize to preserve uint8 (Fixes CUDA White Square) ---
+            # Prepare input for DFM
             if dfm_res != 512:
                 dfm_input = v2.functional.resize(
                     original_face_512.float(),
@@ -3689,11 +3781,9 @@ class FrameWorker(threading.Thread):
             else:
                 dfm_input = original_face_512.clone()
 
-            # --- 3. Synchronized DFM Inference ---
-            # We use the new dfm_inference_lock to ensure thread-safety
+            # Execute DFM inference with thread-safety lock
             with self.models_processor.dfm_inference_lock:
-                # PRE-SYNC: Ensure GPU input is ready
-                if self.models_processor.device == "cuda":
+                if self.models_processor.device_type == "cuda":
                     torch.cuda.current_stream().synchronize()
 
                 out_celeb, _, _ = dfm_model.convert(
@@ -3702,7 +3792,6 @@ class FrameWorker(threading.Thread):
                     rct=parameters["DFMRCTColorToggle"],
                 )
 
-            # Format security
             if isinstance(out_celeb, np.ndarray):
                 out_celeb = torch.from_numpy(out_celeb).to(original_face_512.device)
 
@@ -3711,31 +3800,30 @@ class FrameWorker(threading.Thread):
                     f"[WARN] DFM output shape unexpected: {out_celeb.shape}. Proceeding anyway."
                 )
 
-            # --- 4. Dynamic Value Scaling ---
+            # Standardize output scale
             if out_celeb.max() > 2.0:
                 out_celeb_float = out_celeb.float() / 255.0
             else:
                 out_celeb_float = out_celeb.float()
 
-            input_face_affined = out_celeb_float.clone()
-
-            prev_face = out_celeb_float.clone()
-
+            # VRAM Optimization: Direct reference assignment
+            input_face_affined = out_celeb_float
+            prev_face = out_celeb_float
             output = out_celeb_float * 255.0
 
-        # FW-QUAL-08: warn when all tiles produced zero output (model returned blank).
-        # Threshold 30.0 works for the unified [0,255] scale used by all models (incl. DFM after fix above).
+        # Quality check: Alert if output is abnormally dark (potential VRAM/Model issue)
         if output.abs().max() < 30.0:
             print(
                 "[WARN] Swap model output near-zero for face — possible VRAM pressure"
             )
 
+        # Prepare final CHW tensor and resize back to canonical template size (512)
         output = output.permute(2, 0, 1)
-
         assert self.t512 is not None, (
             "t512 transform must be initialized before swapping"
         )
         swap = self.t512(output)
+
         return swap, prev_face
 
     def get_border_mask(self, parameters):
@@ -4063,6 +4151,12 @@ class FrameWorker(threading.Thread):
             _ratio, _alpha, _threshold, single_frame_mode=_single_frame_mode
         )
 
+        _exclude_upper_teeth = bool(
+            params.get("AutoMouthExcludeUpperTeethToggle", False)
+        )
+        _was_auto_active = bool(getattr(target_fb, "_auto_mouth_prev_active", False))
+        target_fb._auto_mouth_prev_active = _auto_active
+
         if not _auto_active:
             return params
 
@@ -4078,7 +4172,13 @@ class FrameWorker(threading.Thread):
         _strength = _base_strength * _proportion
 
         # Skip entirely when strength is negligible — avoids a full warp-decode cycle.
+        # Still apply FaceParser overrides (teeth exclusion) even at low strength.
         if _strength < 0.01:
+            if _exclude_upper_teeth:
+                _p = dict(params)
+                _p["FaceParserEnableToggle"] = True
+                _p["AutoMouthUpperTeethExcludeActive"] = True
+                return _p
             return params
 
         _p = dict(params)
@@ -4087,11 +4187,12 @@ class FrameWorker(threading.Thread):
         _mouth_val = int(params.get("AutoMouthMouthParserSlider", 1))
         _upper_val = int(params.get("AutoMouthUpperLipParserSlider", 3))
         _lower_val = int(params.get("AutoMouthLowerLipParserSlider", 17))
-        if _mouth_val > 0 or _upper_val > 0 or _lower_val > 0:
+        if _mouth_val > 0 or _upper_val > 0 or _lower_val > 0 or _exclude_upper_teeth:
             _p["FaceParserEnableToggle"] = True
         _p["MouthParserSlider"] = _mouth_val
         _p["UpperLipParserSlider"] = _upper_val
         _p["LowerLipParserSlider"] = _lower_val
+        _p["AutoMouthUpperTeethExcludeActive"] = _exclude_upper_teeth
 
         if _restore_mode == "Face Parser Only":
             # Mask-only mode: do not touch the expression restorer.
@@ -4384,9 +4485,9 @@ class FrameWorker(threading.Thread):
         )
 
         # Legacy pointers mapped to our clean core mask to prevent crashing the rest of the pipeline
-        calc_mask = core_stats_mask.clone()
-        calc_mask_dill = core_stats_mask.clone()
-        mask_forcalc_512 = core_stats_mask.clone()
+        calc_mask = core_stats_mask
+        calc_mask_dill = core_stats_mask
+        mask_forcalc_512 = core_stats_mask
 
         M_ref = cast(np.ndarray, tform.params)[0:2]
         ones_column_ref = np.ones((kps_5.shape[0], 1), dtype=np.float32)
@@ -4538,6 +4639,8 @@ class FrameWorker(threading.Thread):
 
         FaceParser_mask = None
         mouth_512 = None
+        mouth_debug_512 = None
+        mouth_debug_teeth_512 = None
         inner_mouth_protection_512 = None
 
         if need_any_parser:
@@ -4552,6 +4655,8 @@ class FrameWorker(threading.Thread):
 
             texture_exclude_512 = out.get("texture_mask", texture_exclude_512)
             mouth_512 = out.get("mouth", None)
+            mouth_debug_512 = out.get("mouth_debug", None)
+            mouth_debug_teeth_512 = out.get("mouth_debug_teeth", None)
             inner_mouth_protection_512 = out.get("inner_mouth_protection", None)
 
         if FaceParser_mask is not None:
@@ -4726,22 +4831,20 @@ class FrameWorker(threading.Thread):
             parameters["FaceRestorerEnableToggle"]
             and parameters["FaceRestorerAutoEnableToggle"]
         ):
-            original_face_512_autorestore = original_face_512.clone()
             assert swap_original is not None, (
                 "swap_original must be set when FaceRestorerEnableToggle is active"
             )
-            swap_original_autorestore = swap_original.clone()
             alpha_restorer = float(parameters["FaceRestorerBlendSlider"]) / 100.0
             adjust_sharpness = float(parameters["FaceRestorerAutoSharpAdjustSlider"])
             scale_factor = round(tform.scale, 2)
             automasktoggle = parameters["FaceRestorerAutoMaskEnableToggle"]
             automaskadjust = parameters["FaceRestorerAutoSharpMaskAdjustDecimalSlider"]
             automaskblur = 2
-            restore_mask = mask_forcalc_512.clone()
+            restore_mask = mask_forcalc_512
 
             alpha_auto, blur_value = self.face_restorer_auto(
-                original_face_512_autorestore,
-                swap_original_autorestore,
+                original_face_512,
+                swap_original,
                 swap_restorecalc,
                 alpha_restorer,
                 adjust_sharpness,
@@ -5396,6 +5499,8 @@ class FrameWorker(threading.Thread):
             )
 
             FaceParser_mask = out.get("FaceParser_mask", None)
+            mouth_debug_512 = out.get("mouth_debug", mouth_debug_512)
+            mouth_debug_teeth_512 = out.get("mouth_debug_teeth", mouth_debug_teeth_512)
 
             if FaceParser_mask is not None:
                 if FaceParser_mask.shape[-1] != swap_mask.shape[-1]:
@@ -5577,7 +5682,7 @@ class FrameWorker(threading.Thread):
                         "edit_enabled", True
                     )  # FW-RACE-02
                 ):
-                    swap_mask_clone = torch.ones_like(swap_mask).clone()
+                    swap_mask_clone = torch.ones_like(swap_mask)
                 else:
                     swap_mask_clone = swap_mask.clone()
             elif mask_show_type == "diff":
@@ -5588,6 +5693,7 @@ class FrameWorker(threading.Thread):
             if swap_mask_clone is not None:
                 if swap_mask_clone.shape[-1] != 512:
                     swap_mask_clone = t512_mask(swap_mask_clone)
+
                 swap_mask_clone = torch.sub(1, swap_mask_clone)
                 swap_mask_clone = torch.cat(
                     (swap_mask_clone, swap_mask_clone, swap_mask_clone), 0
@@ -5634,6 +5740,36 @@ class FrameWorker(threading.Thread):
         img_float = swap_full + (img_float * swap_mask_minus)
 
         img = img_float.clamp_(0, 255).type(torch.uint8)
+
+        # --- DEBUG: Draw mouth-region contours on full-frame preview ---
+        # Colors: mouth(11+12+13)=green, teeth-keep=cyan.
+        if parameters.get("AutoMouthShowDebugOutlineToggle", False):
+            _debug_layers = [
+                (mouth_debug_512, [0, 255, 0]),  # mouth region: green
+                (mouth_debug_teeth_512, [0, 255, 255]),  # teeth keep:   cyan
+            ]
+            for _mask_512, _color in _debug_layers:
+                if _mask_512 is None:
+                    continue
+                _mf = (
+                    kgm.warp_affine(
+                        _mask_512.unsqueeze(0).unsqueeze(0).float(),
+                        M_inv,
+                        dsize=dsize,
+                        mode="bilinear",
+                        padding_mode="zeros",
+                        align_corners=True,
+                    )
+                    .squeeze(0)
+                    .squeeze(0)
+                )
+                _bin = (_mf > 0.5).float().unsqueeze(0).unsqueeze(0)
+                _dil = F.max_pool2d(_bin, kernel_size=3, stride=1, padding=1)
+                _ero = -F.max_pool2d(-_bin, kernel_size=3, stride=1, padding=1)
+                _edge = (_dil - _ero).squeeze(0).squeeze(0) > 0.0
+                img[0][_edge] = _color[0]
+                img[1][_edge] = _color[1]
+                img[2][_edge] = _color[2]
 
         return img, original_face_512_clone, swap_mask_clone
 
@@ -5751,22 +5887,18 @@ class FrameWorker(threading.Thread):
             kernel_size, sigma, lambd, gamma, psi, theta_values, image.device
         )  # [N, 1, k, k]
 
-        # FW-PERF-06: cache expanded kernels keyed by (shape, C) to avoid repeat_interleave overhead
-        if not hasattr(self, "_gabor_kernels_cache"):
-            from collections import OrderedDict
-
-            self._gabor_kernels_cache = OrderedDict()
+        # FW-PERF-06: cache expanded kernels keyed by (shape, C)
         expand_cache_key = (*kernels.shape, C)
-        if expand_cache_key not in self._gabor_kernels_cache:
-            # FW-MEM-01: bound the LRU cache size
-            MAX_GABOR_CACHE = 16
-            if len(self._gabor_kernels_cache) >= MAX_GABOR_CACHE:
-                self._gabor_kernels_cache.popitem(last=False)
-            self._gabor_kernels_cache[expand_cache_key] = kernels.repeat_interleave(
-                C, dim=0
+
+        if expand_cache_key not in self._gabor_kernels_expanded_cache:
+            MAX_GABOR_EXPANDED_CACHE = 16
+            if len(self._gabor_kernels_expanded_cache) >= MAX_GABOR_EXPANDED_CACHE:
+                self._gabor_kernels_expanded_cache.popitem(last=False)
+            self._gabor_kernels_expanded_cache[expand_cache_key] = (
+                kernels.repeat_interleave(C, dim=0)
             )
-        # expand to all channels:
-        weight = self._gabor_kernels_cache[expand_cache_key]  # → [N*C, 1, k, k]
+
+        weight = self._gabor_kernels_expanded_cache[expand_cache_key]
         out = F.conv2d(
             image,  # [1, C, H, W]
             weight,
@@ -5961,6 +6093,33 @@ class FrameWorker(threading.Thread):
 
         # Fallback: scalar like before
         return prev_alpha, iteration_blur
+
+    @property
+    def kernel_lap(self) -> torch.Tensor:
+        """Lazy initialization of the Laplacian kernel to ensure Thread-Safe CUDA allocation."""
+        if self._kernel_lap is None:
+            device = self.models_processor.device
+            self._kernel_lap = torch.tensor(
+                [[0, 1, 0], [1, -4, 1], [0, 1, 0]], device=device, dtype=torch.float32
+            ).view(1, 1, 3, 3)
+        return self._kernel_lap
+
+    @property
+    def kernel_sobel_x(self) -> torch.Tensor:
+        """Lazy initialization of the Sobel X kernel to ensure Thread-Safe CUDA allocation."""
+        if self._kernel_sobel_x is None:
+            device = self.models_processor.device
+            self._kernel_sobel_x = torch.tensor(
+                [[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], device=device, dtype=torch.float32
+            ).view(1, 1, 3, 3)
+        return self._kernel_sobel_x
+
+    @property
+    def kernel_sobel_y(self) -> torch.Tensor:
+        """Lazy initialization of the Sobel Y kernel to ensure Thread-Safe CUDA allocation."""
+        if self._kernel_sobel_y is None:
+            self._kernel_sobel_y = self.kernel_sobel_x.transpose(2, 3)
+        return self._kernel_sobel_y
 
     def sharpness_score(
         self,

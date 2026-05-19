@@ -80,6 +80,7 @@ class FrameEdits:
         # for the RAM-to-VRAM transfer to complete via the PCIe bus.
         M_c2o_tensor = (
             torch.from_numpy(M_c2o)
+            .pin_memory()
             .float()
             .unsqueeze(0)
             .to(out.device, non_blocking=True)
@@ -137,7 +138,7 @@ class FrameEdits:
             else contextlib.nullcontext()
         )
 
-        with stream_context:
+        with stream_context, torch.inference_mode():
             # --- CONFIGURATION ---
             use_mean_eyes = parameters.get("LandmarkMeanEyesToggle", False)
             # Sanitized Mode Selection
@@ -294,62 +295,205 @@ class FrameEdits:
             t_anchor[..., 2].fill_(0)
             scale_anchor = x_s_info["scale"]
 
-            # Load Lip Array (Neutral reference for lips)
-            lp_lip_array = torch.from_numpy(self.models_processor.lp_lip_array).to(
-                dtype=torch.float32, device=self.models_processor.device
-            )
+            # Only send to GPU once by checking if it's already a tensor in the central processor.
+            if not hasattr(self, "_cached_lp_lip_tensor"):
+                self._cached_lp_lip_tensor = torch.from_numpy(
+                    self.models_processor.lp_lip_array
+                ).to(dtype=torch.float32, device=self.models_processor.device)
+            lp_lip_array = self._cached_lp_lip_tensor
 
             # --- SHARED HELPER FUNCTION ---
             def get_component_motion(
-                indices,
-                driving_exp,
-                multiplier,
-                extra_delta=0,
-                is_relative=False,
-                neutral_ref=None,
-                use_boost=False,
-            ):
+                indices: list[int],
+                driving_exp: torch.Tensor,
+                multiplier: float,
+                extra_delta: torch.Tensor | int | float = 0,
+                is_relative: bool = False,
+                neutral_ref: torch.Tensor | int | None = None,
+                use_boost: bool = False,
+            ) -> torch.Tensor:
                 """
                 Helper to calculate motion with 'Smart Dynamic Boost' and 'Neutral Factor'.
+
+                - Openness Gate: Ignores closed eyes.
+                - Yaw Falloff (Cosine Squared): Boosts strength (+25%) when facing forward,
+                  and smoothly attenuates strength on profiles (>45 deg) to prevent fisheye limits.
                 """
                 delta_local = x_s_info["exp"].clone()
+                force_camera_gaze = parameters.get(
+                    "FaceExpressionCameraGazeToggle", False
+                )
 
+                # 1. COMPUTE BASE EXPRESSION DELTA (Relative or Absolute)
                 if is_relative:
-                    # Relative Motion Calculation
                     ref = neutral_ref if neutral_ref is not None else 0
                     if isinstance(ref, torch.Tensor) and ref.shape[-2] == 21:
                         ref_part = ref[..., indices, :]
                     else:
                         ref_part = ref
 
-                    # Calculate the raw difference (motion intent)
                     raw_diff = driving_exp[:, indices, :] - ref_part
 
-                    # --- SMART DYNAMIC BOOST ---
                     boost_val = micro_expression_boost if use_boost else 1.0
-
                     if use_boost and boost_val > 1.0:
                         magnitude = torch.abs(raw_diff)
                         decay = torch.exp(-10.0 * magnitude)
-                        dynamic_scale = 1.0 + (boost_val - 1.0) * decay
+                        noise_gate = torch.clamp(magnitude / 0.005, 0.0, 1.0)
+                        dynamic_scale = 1.0 + (boost_val - 1.0) * decay * noise_gate
                         diff = raw_diff * dynamic_scale
                     else:
                         diff = raw_diff * boost_val
 
-                    # --- NEUTRAL FACTOR (Anti-Surenchère) ---
                     diff = diff * neutral_factor
-
                     delta_local[:, indices, :] = x_s_info["exp"][:, indices, :] + diff
+
                 else:
-                    # Absolute Motion
                     target_exp = driving_exp[:, indices, :]
                     current_exp = x_s_info["exp"][:, indices, :]
-
                     delta_local[:, indices, :] = (
                         current_exp * (1 - neutral_factor) + target_exp * neutral_factor
                     )
 
-                # Projection & Refinement
+                # 2. HYBRID GAZE STABILIZATION PIPELINE
+                if 11 in indices and 15 in indices:
+                    idx_11, idx_15 = indices.index(11), indices.index(15)
+
+                    if force_camera_gaze:
+                        import math
+
+                        # --- A. OPENNESS GATE (Blink protection) ---
+                        current_eye_openness = max(
+                            c_d_eyes_lst[0][0], c_d_eyes_lst[0][1]
+                        )
+                        openness_gate = max(
+                            0.0, min(1.0, (current_eye_openness - 0.15) / 0.07)
+                        )
+
+                        # --- B. YAW FALLOFF (Profile Attenuation & Frontal Boost) ---
+                        # Extract the real-time horizontal rotation (Yaw) of the face
+                        head_yaw_deg = faceutil.headpose_pred_to_degree(
+                            x_s_info["yaw"]
+                        ).item()
+                        abs_yaw = abs(head_yaw_deg)
+
+                        # Quadratic Cosine Falloff:
+                        # 0° = 1.25x | 30° = ~0.93x | 45° = 0.62x | 60° = 0.31x
+                        yaw_gate = 1.25 * (
+                            math.cos(math.radians(min(abs_yaw, 90.0))) ** 2
+                        )
+
+                        # --- C. FETCH UI PARAMETERS & CALCULATE FINAL STRENGTH ---
+                        ui_strength = parameters.get(
+                            "FaceExpressionCameraGazeStrengthDecimalSlider", 0.50
+                        )
+                        vertical_offset_ui = parameters.get(
+                            "FaceExpressionCameraGazeVerticalOffsetDecimalSlider",
+                            0.0,
+                        )
+
+                        # Multiply constraints and STRICTLY CLAMP at 1.0 for the lerp function
+                        active_strength = ui_strength * openness_gate * yaw_gate
+                        active_strength = max(0.0, min(1.0, active_strength))
+
+                        # Only process heavy math if the gaze lock has a tangible effect
+                        if active_strength > 0.01:
+                            # D. 3D Z-Axis Projection
+                            cam_world = torch.tensor(
+                                [0.0, 0.0, 1.0],
+                                dtype=torch.float32,
+                                device=delta_local.device,
+                            )
+                            R_inv = R_anchor.squeeze(0).transpose(0, 1)
+                            cam_local = torch.matmul(R_inv, cam_world)
+
+                            # E. DYNAMIC PERCEPTUAL COMPENSATION (Pitch)
+                            head_pitch_deg = faceutil.headpose_pred_to_degree(
+                                x_s_info["pitch"]
+                            ).item()
+                            auto_perceptual_offset = head_pitch_deg * -0.0003
+
+                            # F. CALCULATE IDEAL ABSOLUTE LATENTS
+                            ideal_gaze_x = cam_local[0].item() * 0.035
+                            ideal_gaze_y = (
+                                (cam_local[1].item() * 0.020)
+                                + auto_perceptual_offset
+                                + (vertical_offset_ui * 0.015)
+                            )
+
+                            # G. STRICT SOFT CLAMPING (Prevents mesh tearing)
+                            safe_ideal_x = (
+                                0.040 * math.tanh(ideal_gaze_x / 0.040)
+                                if ideal_gaze_x != 0
+                                else 0.0
+                            )
+                            safe_ideal_y = (
+                                0.020 * math.tanh(ideal_gaze_y / 0.020)
+                                if ideal_gaze_y != 0
+                                else 0.0
+                            )
+
+                            safe_ideal_x_t = torch.tensor(
+                                safe_ideal_x,
+                                dtype=torch.float32,
+                                device=delta_local.device,
+                            )
+                            safe_ideal_y_t = torch.tensor(
+                                safe_ideal_y,
+                                dtype=torch.float32,
+                                device=delta_local.device,
+                            )
+
+                            # H. SAVE INTENDED Y FOR EYELID CALCULATION
+                            intended_y_11 = delta_local[:, 11, 1].clone()
+                            intended_y_15 = delta_local[:, 15, 1].clone()
+
+                            # I. PURE INTERPOLATION (Using the modulated strength)
+                            delta_local[:, 11, 0] = torch.lerp(
+                                delta_local[:, 11, 0], safe_ideal_x_t, active_strength
+                            )
+                            delta_local[:, 15, 0] = torch.lerp(
+                                delta_local[:, 15, 0], safe_ideal_x_t, active_strength
+                            )
+
+                            delta_local[:, 11, 1] = torch.lerp(
+                                delta_local[:, 11, 1], safe_ideal_y_t, active_strength
+                            )
+                            delta_local[:, 15, 1] = torch.lerp(
+                                delta_local[:, 15, 1], safe_ideal_y_t, active_strength
+                            )
+
+                            # J. SOFT EYELID COMPENSATION
+                            if 13 in indices and 16 in indices:
+                                shift_y_11 = delta_local[:, 11, 1] - intended_y_11
+                                shift_y_15 = delta_local[:, 15, 1] - intended_y_15
+
+                                delta_local[:, 13, 1] += shift_y_11 * 0.35
+                                delta_local[:, 16, 1] += shift_y_15 * 0.35
+
+                    else:
+                        # --- FALLBACK: Standard Dampening ---
+                        if is_relative:
+                            gaze_dampening = 0.50
+                            delta_local[:, 11, 0] = x_s_info["exp"][:, 11, 0] + (
+                                diff[:, idx_11, 0] * gaze_dampening
+                            )
+                            delta_local[:, 15, 0] = x_s_info["exp"][:, 15, 0] + (
+                                diff[:, idx_15, 0] * gaze_dampening
+                            )
+                        else:
+                            gaze_x_blend = 0.60
+                            delta_local[:, 11, 0] = torch.lerp(
+                                current_exp[:, idx_11, 0],
+                                target_exp[:, idx_11, 0],
+                                gaze_x_blend,
+                            )
+                            delta_local[:, 15, 0] = torch.lerp(
+                                current_exp[:, idx_15, 0],
+                                target_exp[:, idx_15, 0],
+                                gaze_x_blend,
+                            )
+
+                # 3. PROJECTION & REFINEMENT
                 x_proj = scale_anchor * (x_c_s @ R_anchor + delta_local) + t_anchor
                 raw_delta = self.models_processor.lp_stitch(
                     x_s, x_proj, face_editor_type
@@ -360,8 +504,10 @@ class FrameEdits:
                 return (x_target - x_s) * multiplier
 
             def merge_eye_motion_candidates(
-                relative_motion, absolute_motion, normalize_eyes_enabled=False
-            ):
+                relative_motion: torch.Tensor,
+                absolute_motion: torch.Tensor,
+                normalize_eyes_enabled: bool = False,
+            ) -> torch.Tensor:
                 """
                 Relative Lids + Retargeted Gaze eye merge:
                 - keep horizontal gaze direction from the absolute + retargeted eye motion
@@ -371,10 +517,16 @@ class FrameEdits:
                 """
                 merged_motion = relative_motion.clone()
 
-                # Landmark 11/15 X is the clearest eyeball-direction signal.
-                # Keep it fully from the absolute + retargeted branch for better gaze stability.
-                merged_motion[:, 11, 0] = absolute_motion[:, 11, 0]
-                merged_motion[:, 15, 0] = absolute_motion[:, 15, 0]
+                # --- GAZE PRECISION (X-Axis) ---
+                # 50% Absolute provides enough authority to direct the iris precisely,
+                # while leaving 50% Relative to prevent IPD tearing on profile angles.
+                gaze_blend = 0.50
+                merged_motion[:, 11, 0] = torch.lerp(
+                    relative_motion[:, 11, 0], absolute_motion[:, 11, 0], gaze_blend
+                )
+                merged_motion[:, 15, 0] = torch.lerp(
+                    relative_motion[:, 15, 0], absolute_motion[:, 15, 0], gaze_blend
+                )
 
                 # Vertical eye motion carries both lid state and some gaze drift.
                 # Blend a limited amount of the retargeted branch back in so the
@@ -383,17 +535,29 @@ class FrameEdits:
                 eyelid_blend = 0.45 if normalize_eyes_enabled else 0.30
                 eye_center_blend = 0.35 if normalize_eyes_enabled else 0.20
 
+                # 11, 15: Eye Centers (Iris vertical position & depth)
                 for idx in (11, 15):
                     merged_motion[:, idx, 1] = torch.lerp(
                         relative_motion[:, idx, 1],
                         absolute_motion[:, idx, 1],
                         eye_center_blend,
                     )
+                    merged_motion[:, idx, 2] = torch.lerp(
+                        relative_motion[:, idx, 2],
+                        absolute_motion[:, idx, 2],
+                        eye_center_blend,
+                    )
 
+                # 13, 16: Eyelids (Blink & Squint)
                 for idx in (13, 16):
                     merged_motion[:, idx, 1] = torch.lerp(
                         relative_motion[:, idx, 1],
                         absolute_motion[:, idx, 1],
+                        eyelid_blend,
+                    )
+                    merged_motion[:, idx, 2] = torch.lerp(
+                        relative_motion[:, idx, 2],
+                        absolute_motion[:, idx, 2],
                         eyelid_blend,
                     )
 
@@ -504,33 +668,26 @@ class FrameEdits:
                 eyes_normalize_max = parameters.get(
                     "FaceExpressionNormalizeEyesMaxBothDecimalSlider", 0.50
                 )
-                combined_eyes_ratio_normalize = None
+
+                # --- EYE NORMALIZATION PRE-PROCESSING ---
+                # Default baseline is the raw driving ratio
+                eyes_target_array = c_d_eyes_lst
 
                 if flag_normalize_eyes and source_lmk is not None:
-                    c_d_eyes_normalize = c_d_eyes_lst
-                    eyes_ratio = np.array([c_d_eyes_normalize[0][0]], dtype=np.float32)
-                    eyes_ratio_normalize = max(eyes_ratio, 0.10)
-                    eyes_ratio_l = min(c_d_eyes_normalize[0][0], eyes_normalize_max)
-                    eyes_ratio_r = min(c_d_eyes_normalize[0][1], eyes_normalize_max)
-                    eyes_ratio_max = np.array(
-                        [[eyes_ratio_l, eyes_ratio_r]], dtype=np.float32
-                    )
+                    # Check if the overall eye openness exceeds the user's threshold
+                    current_max_openness = max(c_d_eyes_lst[0][0], c_d_eyes_lst[0][1])
 
-                    if eyes_ratio_normalize > eyes_normalize_threshold:
-                        combined_eyes_ratio_normalize = (
-                            faceutil.calc_combined_eye_ratio_norm(
-                                eyes_ratio_max,
-                                source_lmk,
-                                device=self.models_processor.device,
-                            )
-                        )
-                    else:
-                        combined_eyes_ratio_normalize = (
-                            faceutil.calc_combined_eye_ratio(
-                                eyes_ratio_max,
-                                source_lmk,
-                                device=self.models_processor.device,
-                            )
+                    if current_max_openness > eyes_normalize_threshold:
+                        # Clamp both eyes independently to the max allowed value
+                        # This prevents the "surprised" look while preserving winks
+                        eyes_target_array = np.array(
+                            [
+                                [
+                                    min(c_d_eyes_lst[0][0], eyes_normalize_max),
+                                    min(c_d_eyes_lst[0][1], eyes_normalize_max),
+                                ]
+                            ],
+                            dtype=np.float32,
                         )
 
                 if flag_activate_eyes:
@@ -541,21 +698,27 @@ class FrameEdits:
                             1.0,
                         )
 
-                        if (
-                            flag_normalize_eyes
-                            and combined_eyes_ratio_normalize is not None
-                        ):
-                            target_eye_ratio = combined_eyes_ratio_normalize
-                        else:
-                            target_eye_ratio = faceutil.calc_combined_eye_ratio(
-                                c_d_eyes_lst,
-                                source_lmk,
-                                device=self.models_processor.device,
-                            )
-
-                        eyes_retarget_delta = self.models_processor.lp_retarget_eye(
-                            x_s, target_eye_ratio * eye_mult, face_editor_type
+                        # 1. Get Independent Tensors for each eye to feed into the MLPs
+                        ratio_left, ratio_right = faceutil.calc_independent_eye_ratios(
+                            eyes_target_array,
+                            source_lmk,
+                            device=self.models_processor.device,
                         )
+
+                        # 2. Double MLP Inference
+                        delta_left_sym = self.models_processor.lp_retarget_eye(
+                            x_s, ratio_left * eye_mult, face_editor_type
+                        )
+                        delta_right_sym = self.models_processor.lp_retarget_eye(
+                            x_s, ratio_right * eye_mult, face_editor_type
+                        )
+
+                        # 3. Latent Splicing: Stitch Left and Right expressions
+                        # Indices: 15 (Right pupil/center), 16 (Right eyelid)
+                        eyes_retarget_delta = delta_left_sym.clone()
+                        eyes_retarget_delta[:, [15, 16], :] = delta_right_sym[
+                            :, [15, 16], :
+                        ]
 
                     if (
                         flag_stable_gaze_eyes
@@ -600,9 +763,11 @@ class FrameEdits:
 
                 if flag_activate_lips:
                     lips_retarget_delta = 0
-                    if parameters.get(
+                    flag_retarget_lips = parameters.get(
                         "FaceExpressionRetargetingLipsBothEnableToggle", False
-                    ):
+                    )
+
+                    if flag_retarget_lips:
                         lip_mult = parameters.get(
                             "FaceExpressionRetargetingLipsMultiplierBothDecimalSlider",
                             1.0,
@@ -614,15 +779,59 @@ class FrameEdits:
                             x_s, c_d_lip * lip_mult, face_editor_type
                         )
 
-                    accumulated_motion += get_component_motion(
-                        lip_indices,
-                        x_d_i_info["exp"],
-                        driving_multiplier_lips,
-                        extra_delta=lips_retarget_delta,
-                        is_relative=flag_relative_lips,
-                        neutral_ref=lp_lip_array,
-                        use_boost=True,
-                    )
+                    if flag_relative_lips and flag_retarget_lips:
+                        # 1. Pure Relative Branch: Captures shape (smirk, width, pout) on X-axis
+                        relative_lip_motion = get_component_motion(
+                            lip_indices,
+                            x_d_i_info["exp"],
+                            1.0,
+                            extra_delta=0,  # No retargeting here
+                            is_relative=True,
+                            neutral_ref=lp_lip_array,
+                            use_boost=True,
+                        )
+
+                        # 2. Pure Absolute Branch: Captures precise jaw drop and mouth opening on Y/Z-axis
+                        absolute_retarget_lip_motion = get_component_motion(
+                            lip_indices,
+                            x_d_i_info["exp"],
+                            1.0,
+                            extra_delta=lips_retarget_delta,
+                            is_relative=False,
+                            neutral_ref=lp_lip_array,
+                            use_boost=True,
+                        )
+
+                        # 3. Structural Decoupling Merge (Softened)
+                        # We use Lerp to blend Relative and Absolute on the Y axis.
+                        # 0.5 means 50% relative influence, 50% retargeting influence.
+                        merged_lip_motion = relative_lip_motion.clone()
+                        blend_factor = 0.50
+
+                        for idx in lip_indices:
+                            merged_lip_motion[:, idx, 1] = torch.lerp(
+                                relative_lip_motion[:, idx, 1],
+                                absolute_retarget_lip_motion[:, idx, 1],
+                                blend_factor,
+                            )
+                            merged_lip_motion[:, idx, 2] = absolute_retarget_lip_motion[
+                                :, idx, 2
+                            ]  # Depth stays absolute
+
+                        accumulated_motion += (
+                            merged_lip_motion * driving_multiplier_lips
+                        )
+                    else:
+                        # Standard behavior if only one mode (or neither) is used
+                        accumulated_motion += get_component_motion(
+                            lip_indices,
+                            x_d_i_info["exp"],
+                            driving_multiplier_lips,
+                            extra_delta=lips_retarget_delta,
+                            is_relative=flag_relative_lips,
+                            neutral_ref=lp_lip_array,
+                            use_boost=True,
+                        )
 
                 if flag_activate_brows:
                     accumulated_motion += get_component_motion(
@@ -656,10 +865,6 @@ class FrameEdits:
             dsize = (target.shape[1], target.shape[2])
             out = self._apply_kornia_warp(out, M_c2o, dsize)
             out = out.mul_(255.0).clamp_(0, 255)
-
-        # Sync the stream safely
-        if local_stream:
-            local_stream.synchronize()
 
         return out.type(torch.float32)
 
@@ -705,7 +910,7 @@ class FrameEdits:
                 else contextlib.nullcontext()
             )
 
-            with stream_context:
+            with stream_context, torch.inference_mode():
                 init_source_eye_ratio = 0.0
                 init_source_lip_ratio = 0.0
 
@@ -928,10 +1133,6 @@ class FrameEdits:
 
                 img = out
                 img = img.mul_(255.0).clamp_(0, 255).type(torch.float32)
-
-            # Sync the stream safely
-            if local_stream:
-                local_stream.synchronize()
 
         return img
 

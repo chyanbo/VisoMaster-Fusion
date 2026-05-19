@@ -6,7 +6,7 @@ import traceback
 import multiprocessing
 import re
 import time
-from typing import Dict, TYPE_CHECKING, Optional
+from typing import Dict, TYPE_CHECKING, Optional, Any
 from PIL import Image
 from packaging import version
 import numpy as np
@@ -117,14 +117,21 @@ def _probe_onnx_model_worker(
                 # Use setattr to configure the SessionOptions object
                 setattr(session_options, key, value)
 
+        # Set the CUDA device to match the TRT provider's device_id
+        gpu_id = trt_options.get("device_id", 0)
+        if gpu_id != 0 and torch.cuda.is_available():
+            torch.cuda.set_device(gpu_id)
+
         # Reconstruct the providers tuple
         providers = []
         for p in providers_list:
-            if p == "TensorrtExecutionProvider":
-                # This worker *must* have trt_options to trigger the build
-                providers.append((p, trt_options))
-            else:
+            name = p[0] if isinstance(p, tuple) else p
+            if name == "TensorrtExecutionProvider":
+                providers.append((name, trt_options))
+            elif isinstance(p, tuple) and len(p) > 1:
                 providers.append(p)
+            else:
+                providers.append(name)
 
         print(f"[ONNX Prober]: Attempting to load {os.path.basename(model_path)}...")
         # This line is the one that triggers the build/cache generation
@@ -200,6 +207,7 @@ class ModelsProcessor(QtCore.QObject):
         """
         super().__init__()
         self.main_window = main_window
+        self.gpu_id = getattr(main_window, "gpu_id", 0)
         self.K = K  # Assign the module-level K to an instance attribute
         self.provider_name = "TensorRT"
         # NOTE: internal_deep_copied_kv_map / internal_kv_map_source_filename were
@@ -213,7 +221,10 @@ class ModelsProcessor(QtCore.QObject):
         self.internal_kv_map_source_filename: str | None = None
         self.kv_extractor: Optional[KVExtractor] = None
         self.kv_extraction_lock = threading.Lock()
-        self.device = device
+        self.device = f"{device}:{self.gpu_id}" if device != "cpu" else device
+        self.device_type = device
+        if self.gpu_id != 0 and device != "cpu":
+            torch.cuda.set_device(self.gpu_id)
         self.model_lock = threading.RLock()  # Reentrant lock for model access
 
         self.cuda_graph_capture_lock = threading.Lock()
@@ -224,7 +235,7 @@ class ModelsProcessor(QtCore.QObject):
 
         try:
             # Get total GPU memory in bytes
-            total_vram = torch.cuda.get_device_properties(0).total_memory
+            total_vram = torch.cuda.get_device_properties(self.gpu_id).total_memory
 
             # Safely allocate 40% of total VRAM for TensorRT workspace
             calculated_workspace = int(total_vram * 0.40)
@@ -237,6 +248,7 @@ class ModelsProcessor(QtCore.QObject):
 
         # Default TensorRT options
         self.trt_ep_options = {
+            "device_id": self.gpu_id,
             "trt_engine_cache_enable": True,
             "trt_engine_cache_path": "tensorrt-engines",
             "trt_timing_cache_enable": True,
@@ -252,7 +264,7 @@ class ModelsProcessor(QtCore.QObject):
         self.models_pending_build: set = set()
         self.providers = [
             ("TensorrtExecutionProvider", self.trt_ep_options),
-            ("CUDAExecutionProvider"),
+            ("CUDAExecutionProvider", {"device_id": self.gpu_id}),
             ("CPUExecutionProvider"),
         ]
         self.syncvec = torch.empty((1, 1), dtype=torch.float32, device=self.device)
@@ -276,6 +288,9 @@ class ModelsProcessor(QtCore.QObject):
         self.dfm_models: Dict[str, DFMModel] = {}
         self.dfm_inference_lock = threading.Lock()
         self.force_unload_in_progress = False
+
+        # --- SMART UNLOAD STATE ---
+        self.deferred_unloads: Dict[str, Dict[str, Any]] = {}
 
         # Initialize Sub-Processors
         self.face_detectors = FaceDetectors(self)
@@ -508,6 +523,10 @@ class ModelsProcessor(QtCore.QObject):
         self.rgb_to_linear_rgb_converter = None
         self.linear_rgb_to_rgb_converter = None
 
+    @property
+    def binding_device_id(self) -> int:
+        return self.gpu_id if self.device_type != "cpu" else 0
+
     def _check_tensorrt_cache(self, model_name: str, onnx_path: str) -> bool:
         """
         Checks if a valid TensorRT cache (ctx and engine file) exists for the given model.
@@ -544,6 +563,117 @@ class ModelsProcessor(QtCore.QObject):
         except Exception as e:
             print(f"[ERROR] Failed TensorRT cache check: {e}")
             return False
+
+    def _clean_tensorrt_cache(self, onnx_path: str, trt_options: dict) -> None:
+        """
+        Cleans up potentially corrupted TensorRT cache files for a specific model.
+        Safely ignores missing files or locked files to prevent crashes during the cleanup process.
+
+        Args:
+            onnx_path (str): The local path to the ONNX model.
+            trt_options (dict): The TensorRT options containing the dynamic cache path.
+        """
+        import os
+        import re
+
+        cache_dir = trt_options.get("trt_engine_cache_path", "tensorrt-engines")
+        base_onnx_name = os.path.splitext(os.path.basename(onnx_path))[0]
+
+        # 1. Try to read the context file to find the specific engine file before deleting it
+        ctx_file_name = f"{base_onnx_name}_ctx.onnx"
+        ctx_file_path = os.path.join(cache_dir, ctx_file_name)
+
+        engine_file_paths_to_check = []
+        if os.path.exists(ctx_file_path) and os.path.isfile(ctx_file_path):
+            try:
+                with open(ctx_file_path, "rb") as f:
+                    content = f.read()
+
+                # Extract the engine name generated by ONNX Runtime
+                match = re.search(b"TensorrtExecutionProvider_.*?\\.engine", content)
+                if match:
+                    engine_name = match.group(0).decode("utf-8")
+
+                    # Failsafe: ORT pathing behavior varies.
+                    engine_subdirectory_name = os.path.basename(cache_dir)
+                    engine_file_paths_to_check.extend(
+                        [
+                            os.path.join(cache_dir, engine_name),
+                            os.path.join(
+                                cache_dir, engine_subdirectory_name, engine_name
+                            ),
+                        ]
+                    )
+            except Exception as e:
+                print(
+                    f"[WARN] Could not read corrupted context file {ctx_file_path} to find engine name: {e}"
+                )
+
+        # 2. Delete the context file
+        if os.path.exists(ctx_file_path) and os.path.isfile(ctx_file_path):
+            try:
+                os.remove(ctx_file_path)
+                print(
+                    f"[INFO] Deleted corrupted TensorRT context file: {ctx_file_path}"
+                )
+            except Exception as e:
+                print(
+                    f"[WARN] Failed to delete {ctx_file_path} (it might be locked or missing): {e}"
+                )
+
+        # 3. Delete the engine file(s) if we found them
+        for engine_path in engine_file_paths_to_check:
+            if (
+                engine_path
+                and os.path.exists(engine_path)
+                and os.path.isfile(engine_path)
+            ):
+                try:
+                    os.remove(engine_path)
+                    print(
+                        f"[INFO] Deleted corrupted TensorRT engine file: {engine_path}"
+                    )
+                except Exception as e:
+                    print(f"[WARN] Failed to delete engine file {engine_path}: {e}")
+
+        # 4. Delete any associated timing cache, profile files, or general cache files
+        if os.path.exists(cache_dir) and os.path.isdir(cache_dir):
+            try:
+                for file_name in os.listdir(cache_dir):
+                    # Catch model-specific files (e.g., SomeModel.profile)
+                    is_model_specific = file_name.startswith(base_onnx_name) and (
+                        file_name.endswith(".profile")
+                        or file_name.endswith(".cache")
+                        or file_name.endswith(".timing")
+                    )
+
+                    # Catch exact generic names (like DFM's "timing.cache")
+                    is_generic_timing = file_name == "timing.cache"
+
+                    # Catch ORT's global architecture-based timing caches
+                    # Example: TensorrtExecutionProvider_cache_sm120.timing
+                    is_ort_global_timing = file_name.startswith(
+                        "TensorrtExecutionProvider_"
+                    ) and (
+                        file_name.endswith(".timing") or file_name.endswith(".profile")
+                    )
+
+                    if is_model_specific or is_generic_timing or is_ort_global_timing:
+                        target_path = os.path.join(cache_dir, file_name)
+                        if os.path.isfile(target_path):
+                            try:
+                                os.remove(target_path)
+                                print(
+                                    f"[INFO] Deleted TensorRT auxiliary/timing file: {target_path}"
+                                )
+                            except Exception as e:
+                                print(
+                                    f"[WARN] Failed to delete auxiliary file {target_path}: {e}"
+                                )
+            except Exception as e:
+                print(
+                    f"[WARN] Failed to clean profile/timing/cache files in {cache_dir}: {e}"
+                )
 
     def load_model(self, model_name, session_options=None):
         """
@@ -635,11 +765,9 @@ class ModelsProcessor(QtCore.QObject):
 
                                 # Use 'spawn' context for CUDA/TRT safety
                                 ctx = multiprocessing.get_context("spawn")
-                                # Use the 'providers' variable
-                                current_providers_list = [
-                                    p[0] if isinstance(p, tuple) else p
-                                    for p in model_providers
-                                ]
+                                # Pass full providers list (with tuples) so the worker
+                                # can reconstruct them with device_id options.
+                                current_providers_list = list(model_providers)
                                 probe_process = ctx.Process(
                                     target=_probe_onnx_model_worker,
                                     args=(
@@ -663,6 +791,15 @@ class ModelsProcessor(QtCore.QObject):
                                         )
                                         probe_process.terminate()
                                         probe_process.join()
+
+                                        # Clean up corrupted caches caused by the timeout before raising
+                                        print(
+                                            f"[INFO] Cleaning up corrupted TensorRT cache for {model_name} due to timeout..."
+                                        )
+                                        self._clean_tensorrt_cache(
+                                            onnx_path, model_trt_options
+                                        )
+
                                         raise RuntimeError(
                                             "TensorRT Engine build timed out."
                                         )
@@ -683,6 +820,15 @@ class ModelsProcessor(QtCore.QObject):
                                     print(
                                         f"[WARN] Probe attempt {attempt + 1} failed with exit code {exitcode}."
                                     )
+
+                                    # Wipe corrupted artifacts before attempting the next retry
+                                    print(
+                                        f"[INFO] Cleaning up potentially corrupted TensorRT cache for {model_name}..."
+                                    )
+                                    self._clean_tensorrt_cache(
+                                        onnx_path, model_trt_options
+                                    )
+
                                     if attempt < max_retries - 1:
                                         print("[INFO] Retrying in 2 seconds...")
                                         time.sleep(2.0)
@@ -718,16 +864,16 @@ class ModelsProcessor(QtCore.QObject):
                     return self.models.get(model_name)
 
                 if session_options is None:
-                    model_instance = onnxruntime.InferenceSession(
-                        self.models_path[model_name],
-                        providers=model_providers,
-                    )
-                else:
-                    model_instance = onnxruntime.InferenceSession(
-                        self.models_path[model_name],
-                        sess_options=session_options,
-                        providers=model_providers,
-                    )
+                    session_options = onnxruntime.SessionOptions()
+
+                # Force log_severity_level to 3 (ERROR) for the actual load as well, to suppress non-critical warnings from ONNX Runtime that can clutter the console.
+                session_options.log_severity_level = 3
+
+                model_instance = onnxruntime.InferenceSession(
+                    self.models_path[model_name],
+                    sess_options=session_options,
+                    providers=model_providers,
+                )
 
                 # This ensures the CUDA context is synchronized after a new TRT
                 # engine build, before we try to load it.
@@ -862,6 +1008,7 @@ class ModelsProcessor(QtCore.QObject):
                     self.main_window.dfm_model_manager.get_models_data()[dfm_model],
                     dfm_providers,
                     self.device,
+                    self.gpu_id,
                 )
             except Exception:
                 print(f"[ERROR] Failed to load DFM model {dfm_model}.")
@@ -885,7 +1032,7 @@ class ModelsProcessor(QtCore.QObject):
         for model_name in model_names_to_unload:
             self.unload_dfm_model(model_name)
 
-    def unload_dfm_model(self, model_name_to_unload):
+    def unload_dfm_model(self, model_name_to_unload, force_immediate=False):
         """
         Unloads a single DFM model instance from memory.
 
@@ -896,6 +1043,23 @@ class ModelsProcessor(QtCore.QObject):
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
                 return  # Skip unloading
+
+        # --- SMART UNLOAD: Intercept if video is playing ---
+        if not force_immediate and not self.force_unload_in_progress:
+            vp = getattr(self.main_window, "video_processor", None)
+            if vp and getattr(vp, "processing", False):
+                # Video is playing, get the feeder's current frame and defer
+                target_frame = getattr(vp, "current_frame_number", 0) + 1
+                with self.model_lock:
+                    self.deferred_unloads[model_name_to_unload] = {
+                        "type": "dfm",
+                        "target_frame": target_frame,
+                    }
+                print(
+                    f"[INFO] Smart Unload: Deferring DFM '{model_name_to_unload}' unload after frame {target_frame}"
+                )
+                return
+
         with self.model_lock:
             if (
                 model_name_to_unload
@@ -910,7 +1074,7 @@ class ModelsProcessor(QtCore.QObject):
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
 
-    def unload_model(self, model_name_to_unload):
+    def unload_model(self, model_name_to_unload, force_immediate=False):
         """
         Unloads a single ONNX model from memory.
 
@@ -922,6 +1086,23 @@ class ModelsProcessor(QtCore.QObject):
         if not self.force_unload_in_progress:
             if self.main_window.control.get("KeepModelsAliveToggle", False):
                 return  # Skip unloading
+
+        # --- SMART UNLOAD: Intercept if video is playing ---
+        if not force_immediate and not self.force_unload_in_progress:
+            vp = getattr(self.main_window, "video_processor", None)
+            if vp and getattr(vp, "processing", False):
+                # Video is playing, get the feeder's current frame and defer
+                target_frame = getattr(vp, "current_frame_number", 0) + 1
+                with self.model_lock:
+                    self.deferred_unloads[model_name_to_unload] = {
+                        "type": "onnx",
+                        "target_frame": target_frame,
+                    }
+                print(
+                    f"[INFO] Smart Unload: Deferring ONNX '{model_name_to_unload}' unload after frame {target_frame}"
+                )
+                return
+
         with self.model_lock:
             unloaded = False
 
@@ -943,6 +1124,160 @@ class ModelsProcessor(QtCore.QObject):
                 gc.collect()
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
+
+    def is_model_active_in_ui(self, model_name: str) -> bool:
+        """
+        Live Verification JIT: Checks the UI state dynamically to see if a model is still needed.
+        Used exclusively before a deferred unload to prevent accidental purging.
+        """
+        from app.ui.widgets.models_toggle_data import MODELS_TOGGLE_MAP
+
+        # Thread Safety: Use dict() to safely create shallow copies and avoid 'dictionary changed size' errors
+        try:
+            params = dict(getattr(self.main_window, "parameters", {}))
+            ctrl = dict(getattr(self.main_window, "control", {}))
+        except Exception:
+            params = getattr(self.main_window, "parameters", {})
+            ctrl = getattr(self.main_window, "control", {})
+
+        # Create a unified flat dictionary for global lookups
+        live_global = (
+            {**params, **ctrl}
+            if isinstance(params, dict) and isinstance(ctrl, dict)
+            else params
+        )
+
+        # 1. SPECIAL CASE: FACE RESTORERS
+        if hasattr(self, "face_restorers") and hasattr(
+            self.face_restorers, "model_map"
+        ):
+            expected_combo = None
+            for combo_str, ort_name in self.face_restorers.model_map.items():
+                if ort_name == model_name:
+                    expected_combo = combo_str
+                    break
+
+            if expected_combo is not None:
+
+                def is_restorer_requested(p) -> bool:
+                    if not hasattr(p, "get"):
+                        return False
+
+                    if (
+                        p.get("FaceRestorerEnableToggle", False)
+                        and p.get("FaceRestorerTypeSelection") == expected_combo
+                    ):
+                        return True
+                    if p.get("FaceRestorerEnable2Toggle", False) and not p.get(
+                        "FaceRestorerEnable2EndToggle", False
+                    ):
+                        if p.get("FaceRestorerType2Selection") == expected_combo:
+                            return True
+                    if (
+                        p.get("FaceRestorerEnable2EndToggle", False)
+                        and p.get("FaceRestorerType2Selection") == expected_combo
+                    ):
+                        return True
+                    return False
+
+                # 1. Global check
+                if is_restorer_requested(live_global):
+                    return True
+
+                # 2. Exhaustive verification for each active face in memory
+                if hasattr(params, "items"):
+                    for face_id, face_params in params.items():
+                        if is_restorer_requested(face_params):
+                            return True
+
+                return False  # No face requested this restorer, we can safely unload it
+
+        # 2. GENERAL CASE: MODELS TOGGLE MAP
+        toggles = MODELS_TOGGLE_MAP.get(model_name)
+        if not toggles:
+            return True  # Core models without UI toggles are always assumed needed
+
+        for toggle in toggles:
+            target_key = toggle.key
+
+            if hasattr(ctrl, "get") and ctrl.get(target_key, False):
+                return True
+
+            if hasattr(params, "get") and params.get(target_key, False):
+                return True
+
+            if hasattr(params, "items"):
+                for face_id, face_params in params.items():
+                    if hasattr(face_params, "get") and face_params.get(
+                        target_key, False
+                    ):
+                        return True
+
+        return False
+
+    def check_deferred_unloads(self, current_displayed_frame: int):
+        """
+        Checks if any pending model unloads have reached their failsafe trigger.
+        Includes a Just-In-Time (JIT) UI state verification.
+        """
+        if not self.deferred_unloads:
+            return
+
+        with self.model_lock:
+            to_unload = []
+            for model_name, data in self.deferred_unloads.items():
+                if current_displayed_frame >= data["target_frame"]:
+                    to_unload.append((model_name, data["type"]))
+
+            for model_name, m_type in to_unload:
+                # Remove from pending list regardless
+                del self.deferred_unloads[model_name]
+
+                # --- JIT LIVE CHECK ---
+                if self.is_model_active_in_ui(model_name):
+                    print(
+                        f"[INFO] Smart Unload JIT: Option re-enabled for '{model_name}'. Cancelling unload."
+                    )
+                    continue  # Safe! We skip the unload.
+
+                print(
+                    f"[INFO] Smart Unload: Trigger reached. Actually releasing '{model_name}'."
+                )
+                if m_type == "onnx":
+                    self.unload_model(model_name, force_immediate=True)
+                elif m_type == "dfm":
+                    self.unload_dfm_model(model_name, force_immediate=True)
+                elif m_type == "kv":
+                    self.unload_kv_extractor(force_immediate=True)
+
+    def execute_all_deferred_unloads(self):
+        """
+        Forces the immediate unload of all deferred models.
+        Ideal for the 'Stop' function (Smart Stop).
+        Includes JIT verification to keep re-enabled models.
+        """
+        with self.model_lock:
+            if not self.deferred_unloads:
+                return
+
+            print("[INFO] Smart Stop: Executing pending UI unloads...")
+            for model_name, data in list(self.deferred_unloads.items()):
+                del self.deferred_unloads[model_name]
+
+                # --- LIVE UI VERIFICATION (JIT) ---
+                if self.is_model_active_in_ui(model_name):
+                    print(
+                        f"[INFO] Smart Stop JIT: Option is active for '{model_name}'. Keeping model in VRAM."
+                    )
+                    continue  # We skip the unload, leaving the model ready for the next run!
+
+                print(f"[INFO] Smart Stop: Releasing '{model_name}'.")
+                if data["type"] == "onnx":
+                    self.unload_model(model_name, force_immediate=True)
+                elif data["type"] == "dfm":
+                    self.unload_dfm_model(model_name, force_immediate=True)
+                elif data["type"] == "kv":
+                    self.unload_kv_extractor(force_immediate=True)
 
     def showModelLoadingProgressBar(self):
         """Shows the model-loading progress dialog in the UI."""
@@ -980,10 +1315,11 @@ class ModelsProcessor(QtCore.QObject):
                     raise RuntimeError("TensorRT is not installed.")
                 providers = [
                     ("TensorrtExecutionProvider", self.trt_ep_options),
-                    ("CUDAExecutionProvider"),
+                    ("CUDAExecutionProvider", {"device_id": self.gpu_id}),
                     ("CPUExecutionProvider"),
                 ]
-                self.device = "cuda"
+                self.device = f"cuda:{self.gpu_id}"
+                self.device_type = "cuda"
                 if (
                     version.parse(trt.__version__) < version.parse("10.2.0")
                     and provider_name == "TensorRT-Engine"
@@ -996,9 +1332,14 @@ class ModelsProcessor(QtCore.QObject):
             case "CPU":
                 providers = [("CPUExecutionProvider")]
                 self.device = "cpu"
+                self.device_type = "cpu"
             case "CUDA":
-                providers = [("CUDAExecutionProvider"), ("CPUExecutionProvider")]
-                self.device = "cuda"
+                providers = [
+                    ("CUDAExecutionProvider", {"device_id": self.gpu_id}),
+                    ("CPUExecutionProvider"),
+                ]
+                self.device = f"cuda:{self.gpu_id}"
+                self.device_type = "cuda"
             case _:
                 # MP-22: raise on unknown provider name
                 raise ValueError(f"Unknown provider: {provider_name}")
@@ -1026,7 +1367,7 @@ class ModelsProcessor(QtCore.QObject):
         """
         # MP-13: use a single nvidia-smi call for both total and free memory
         try:
-            command = "nvidia-smi --query-gpu=memory.total,memory.free --format=csv,noheader,nounits"
+            command = f"nvidia-smi --id={self.gpu_id} --query-gpu=memory.total,memory.free --format=csv,noheader,nounits"
             output = sp.check_output(command.split()).decode("ascii").strip()
             # Output format: "total, free" (one line per GPU)
             first_line = output.split("\n")[0]
@@ -1038,10 +1379,10 @@ class ModelsProcessor(QtCore.QObject):
         except Exception:
             # Fallback to torch.cuda if nvidia-smi is unavailable
             if torch.cuda.is_available():
-                props = torch.cuda.get_device_properties(0)
+                props = torch.cuda.get_device_properties(self.gpu_id)
                 memory_total_val = props.total_memory // (1024 * 1024)
                 memory_free_val = (
-                    props.total_memory - torch.cuda.memory_reserved(0)
+                    props.total_memory - torch.cuda.memory_reserved(self.gpu_id)
                 ) // (1024 * 1024)
                 memory_used = memory_total_val - memory_free_val
                 return memory_used, memory_total_val
@@ -1211,8 +1552,30 @@ class ModelsProcessor(QtCore.QObject):
             self.unload_model("RefLDMVAEEncoder")
             self.unload_model("RefLDMVAEDecoder")
 
-    def unload_kv_extractor(self):
+    def unload_kv_extractor(self, force_immediate=False):
         """Unloads the KVExtractor model and clears associated memory."""
+
+        # Check if unloading should be skipped
+        if not self.force_unload_in_progress:
+            if self.main_window.control.get("KeepModelsAliveToggle", False):
+                return  # Skip unloading
+
+        # --- SMART UNLOAD: Intercept if video is playing ---
+        if not force_immediate and not self.force_unload_in_progress:
+            vp = getattr(self.main_window, "video_processor", None)
+            if vp and getattr(vp, "processing", False):
+                # Video is playing, get the feeder's current frame and defer
+                target_frame = getattr(vp, "current_frame_number", 0) + 1
+                with self.model_lock:
+                    self.deferred_unloads["KVExtractor"] = {
+                        "type": "kv",
+                        "target_frame": target_frame,
+                    }
+                print(
+                    f"[INFO] Smart Unload: Deferring KV Extractor unload after frame {target_frame}"
+                )
+                return
+
         with self.model_lock:
             if self.kv_extractor is not None:
                 print("[INFO] Unloading KV Extractor...")
@@ -1888,18 +2251,20 @@ class ModelsProcessor(QtCore.QObject):
         del image_srgb_float_minus1_1_batched
         final_denoised_latent_x0_scaled = None
 
-        # OPTIMISATION PCIe : non_blocking=True
-        is_ref_flag_tensor_for_unet = (
-            torch.tensor([use_reference_exclusive_path], dtype=torch.bool)
-            .to(self.device, non_blocking=True)
-            .contiguous()
-        )
+        # OPTIMIZATION VRAM/PCIe: Create boolean tensors DIRECTLY on the GPU.
+        # Passing a Python list to torch.tensor() allocates CPU RAM first and forces a PCIe transfer.
+        # torch.ones/torch.zeros directly on the device avoids CPU-GPU sync overhead.
+        if use_reference_exclusive_path:
+            is_ref_flag_tensor_for_unet = torch.ones(
+                1, dtype=torch.bool, device=self.device
+            )
+        else:
+            is_ref_flag_tensor_for_unet = torch.zeros(
+                1, dtype=torch.bool, device=self.device
+            )
 
-        actual_use_exclusive_path_tensor_for_unet = (
-            torch.tensor([use_reference_exclusive_path], dtype=torch.bool)
-            .to(self.device, non_blocking=True)
-            .contiguous()
-        )
+        actual_use_exclusive_path_tensor_for_unet = is_ref_flag_tensor_for_unet
+        false_tensor_for_unet = torch.zeros(1, dtype=torch.bool, device=self.device)
 
         rng = torch.Generator(device=self.device)
         rng.manual_seed(base_seed)
@@ -1919,16 +2284,16 @@ class ModelsProcessor(QtCore.QObject):
             )
             alpha_t_bar_val = self.alphas_cumprod_np[current_t_idx]
 
-            # OPTIMISATION PCIe
+            # OPTIMIZATION VRAM: Direct GPU creation
             sqrt_alpha_bar_t_torch = torch.sqrt(
-                torch.tensor(alpha_t_bar_val, dtype=torch.float32).to(
-                    self.device, non_blocking=True
+                torch.full(
+                    (1,), alpha_t_bar_val, dtype=torch.float32, device=self.device
                 )
             )
             sqrt_one_minus_alpha_bar_t_torch = torch.sqrt(
                 1.0
-                - torch.tensor(alpha_t_bar_val, dtype=torch.float32).to(
-                    self.device, non_blocking=True
+                - torch.full(
+                    (1,), alpha_t_bar_val, dtype=torch.float32, device=self.device
                 )
             )
 
@@ -1940,9 +2305,9 @@ class ModelsProcessor(QtCore.QObject):
                 (xt_noisy_scaled_8_channel, lq_latent_x0_scaled_for_unet), dim=1
             )
 
-            # OPTIMISATION PCIe
-            timesteps_tensor_unet = torch.tensor([current_t_idx], dtype=torch.int64).to(
-                self.device, non_blocking=True
+            # OPTIMIZATION VRAM: Direct GPU creation
+            timesteps_tensor_unet = torch.full(
+                (1,), current_t_idx, dtype=torch.int64, device=self.device
             )
 
             predicted_noise_from_unet = torch.empty(
@@ -1950,7 +2315,6 @@ class ModelsProcessor(QtCore.QObject):
             ).contiguous()
 
             # CUDA Stream Sync: Ensure all non-blocking PCIe transfers are complete
-            # before ONNX/TensorRT execution begins to prevent race conditions.
             if torch.cuda.is_available():
                 torch.cuda.current_stream().synchronize()
 
@@ -1969,7 +2333,6 @@ class ModelsProcessor(QtCore.QObject):
 
         # --- PROCESS: Full Restore (DDIM) ---
         elif denoiser_mode == "Full Restore (DDIM)":
-            # Removed the redundant and wrong cuda stream sync here as the worker are now in a separate global stream
             num_ddpm_timesteps = self.alphas_cumprod_np.shape[0]
 
             _ddim_raw_ddpm_timesteps_np = ModelsProcessor.make_ddim_timesteps(
@@ -1987,7 +2350,7 @@ class ModelsProcessor(QtCore.QObject):
                 )
             )
 
-            # OPTIMISATION PCIe : Numpy -> Tensor async
+            # Numpy -> Tensor directly on device
             ddim_sigmas = (
                 torch.from_numpy(_ddim_sigmas_np)
                 .float()
@@ -2003,6 +2366,7 @@ class ModelsProcessor(QtCore.QObject):
                 .float()
                 .to(self.device, non_blocking=True)
             )
+
             ddim_sqrt_one_minus_alphas = torch.sqrt(
                 torch.clamp(1.0 - ddim_alphas, min=0.0)
             )
@@ -2018,32 +2382,36 @@ class ModelsProcessor(QtCore.QObject):
 
             pred_x0_scaled_current_step = torch.empty_like(lq_latent_x0_scaled_for_unet)
 
-            # Pre-allocate tensor
-            false_tensor_for_unet = (
-                torch.tensor([False], dtype=torch.bool)
-                .to(self.device, non_blocking=True)
-                .contiguous()
+            # --- OPTIMIZATION VRAM: Pre-allocate DDIM Loop Buffers ---
+            # Allocating these inside the loop causes massive VRAM fragmentation
+            # and stalls the CUDA allocator. We allocate once per function call.
+            ts_unet = torch.empty((1,), dtype=torch.int64, device=self.device)
+            schedule_idx_tensor = torch.empty(
+                (1,), dtype=torch.long, device=self.device
             )
+            e_t_cond = torch.empty_like(lq_latent_x0_scaled_for_unet)
+            e_t_uncond = (
+                torch.empty_like(lq_latent_x0_scaled_for_unet)
+                if denoiser_cfg_scale != 1.0
+                else None
+            )
+            noise_ddim_buffer = torch.empty_like(lq_latent_x0_scaled_for_unet)
 
             for i, step_ddpm_idx in enumerate(time_range_ddpm_indices):
                 index_for_schedules = total_steps - 1 - i
 
-                # OPTIMISATION PCIe
-                ts_unet = torch.full((1,), step_ddpm_idx, dtype=torch.int64).to(
-                    self.device, non_blocking=True
-                )
+                # OPTIMIZATION VRAM: In-place update of pre-allocated tensors
+                ts_unet.fill_(step_ddpm_idx)
+                schedule_idx_tensor.fill_(index_for_schedules)
 
                 unet_input_cond = torch.cat(
-                    [current_latent_xt_scaled, lq_latent_x0_scaled_for_unet],
-                    dim=1,
+                    [current_latent_xt_scaled, lq_latent_x0_scaled_for_unet], dim=1
                 )
-                e_t_cond = torch.empty_like(lq_latent_x0_scaled_for_unet)
 
-                # CUDA Stream Sync: Wait for the async timestep tensor transfer
-                # before running the UNet in the conditional pass.
                 if torch.cuda.is_available():
                     torch.cuda.current_stream().synchronize()
 
+                # The ONNX runtime writes directly into our pre-allocated e_t_cond buffer
                 self.face_restorers.run_ref_ldm_unet(
                     x_noisy_plus_lq_latent=unet_input_cond,
                     timesteps_tensor=ts_unet,
@@ -2056,15 +2424,9 @@ class ModelsProcessor(QtCore.QObject):
 
                 if denoiser_cfg_scale != 1.0:
                     unet_input_uncond = torch.cat(
-                        [
-                            current_latent_xt_scaled,
-                            lq_latent_x0_scaled_for_unet,
-                        ],
-                        dim=1,
+                        [current_latent_xt_scaled, lq_latent_x0_scaled_for_unet], dim=1
                     )
-                    e_t_uncond = torch.empty_like(lq_latent_x0_scaled_for_unet)
 
-                    # Optional secondary sync if there are any other async operations between calls.
                     if torch.cuda.is_available():
                         torch.cuda.current_stream().synchronize()
 
@@ -2078,15 +2440,8 @@ class ModelsProcessor(QtCore.QObject):
                     )
                     e_t = e_t_uncond + denoiser_cfg_scale * (e_t_cond - e_t_uncond)
 
-                # OPTIMISATION PCIe
-                schedule_idx_tensor = torch.tensor(
-                    [index_for_schedules], dtype=torch.long
-                ).to(self.device, non_blocking=True)
-
                 a_t = ModelsProcessor.extract_into_tensor_torch(
-                    ddim_alphas,
-                    schedule_idx_tensor,
-                    current_latent_xt_scaled.shape,
+                    ddim_alphas, schedule_idx_tensor, current_latent_xt_scaled.shape
                 )
                 a_prev = ModelsProcessor.extract_into_tensor_torch(
                     ddim_alphas_prev,
@@ -2094,9 +2449,7 @@ class ModelsProcessor(QtCore.QObject):
                     current_latent_xt_scaled.shape,
                 )
                 sigma_t = ModelsProcessor.extract_into_tensor_torch(
-                    ddim_sigmas,
-                    schedule_idx_tensor,
-                    current_latent_xt_scaled.shape,
+                    ddim_sigmas, schedule_idx_tensor, current_latent_xt_scaled.shape
                 )
                 sqrt_one_minus_a_t = ModelsProcessor.extract_into_tensor_torch(
                     ddim_sqrt_one_minus_alphas,
@@ -2111,12 +2464,11 @@ class ModelsProcessor(QtCore.QObject):
                 dir_xt = (
                     torch.sqrt(torch.clamp(1.0 - a_prev - sigma_t**2, min=1e-8)) * e_t
                 )
-                noise_ddim = sigma_t * torch.randn(
-                    current_latent_xt_scaled.shape,
-                    device=self.device,
-                    dtype=current_latent_xt_scaled.dtype,
-                    generator=rng,
-                )
+
+                # OPTIMIZATION VRAM: Reuse noise buffer instead of generating a new tensor every step
+                noise_ddim_buffer.normal_(generator=rng)
+                noise_ddim = sigma_t * noise_ddim_buffer
+
                 current_latent_xt_scaled = (
                     torch.sqrt(a_prev) * pred_x0_scaled_current_step
                     + dir_xt

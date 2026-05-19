@@ -16,6 +16,7 @@
 #   3. The button will appear automatically on the respective page.
 # ---------------------------------------------------------------------------
 
+import subprocess
 import sys
 from datetime import datetime, timezone
 from PySide6 import QtWidgets, QtGui, QtCore
@@ -81,6 +82,7 @@ ACTIONS_MAINT = [
     ("Revert to Previous Version", "_go_rollback", "Select and revert to older commit"),
     ("Back", "_go_home", "Return to home screen"),
 ]
+ROLLBACK_COMMIT_LIMIT = 50
 
 
 # ---------- Update Check ----------
@@ -137,7 +139,7 @@ class LauncherWindow(QtWidgets.QWidget):
         self.update_status = self._check_and_log_update_status()
 
         update_current_commit_in_cfg()
-        self.commits = fetch_commit_list(10)
+        self.commits = fetch_commit_list(ROLLBACK_COMMIT_LIMIT)
 
         # --- Checksum state ---
         self._load_checksum_status()
@@ -576,7 +578,7 @@ class LauncherWindow(QtWidgets.QWidget):
                 run_git(["reset", "--hard", f"origin/{branch}"])
                 update_current_commit_in_cfg()
                 update_last_updated_in_cfg()
-                self.commits = fetch_commit_list(10)
+                self.commits = fetch_commit_list(ROLLBACK_COMMIT_LIMIT)
                 self._rebuild_page("page_rollback", self._build_rollback_page)
                 self._refresh_update_indicators()
                 print("[Launcher] Update complete.")
@@ -640,7 +642,19 @@ class LauncherWindow(QtWidgets.QWidget):
     def on_update_deps(self):
         print("[Launcher] Updating/checking dependencies via uv...")
         with with_busy_state(self, busy=True, text="Updating dependencies..."):
-            uv_pip_install()
+            try:
+                uv_pip_install()
+            except subprocess.CalledProcessError as e:
+                print(
+                    f"[Launcher] Dependency update failed (exit code {e.returncode})."
+                )
+                QtWidgets.QMessageBox.critical(
+                    self,
+                    "Dependency Update Failed",
+                    "Dependency update failed.\n\n"
+                    "Check the console for details, then try again.",
+                )
+                return
             write_checksum_state(deps_sha=compute_file_sha256(PATHS["REQ_FILE"]))
             self._load_checksum_status()
             self._refresh_update_indicators()
@@ -772,7 +786,7 @@ class LauncherWindow(QtWidgets.QWidget):
                 update_current_commit_in_cfg()
                 update_last_updated_in_cfg()
                 print("[Launcher] Revert complete.")
-                self.commits = fetch_commit_list(10)
+                self.commits = fetch_commit_list(ROLLBACK_COMMIT_LIMIT)
                 self._rebuild_page("page_rollback", self._build_rollback_page)
                 self._refresh_update_indicators()
                 if is_launcher_update_available():

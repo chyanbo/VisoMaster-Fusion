@@ -350,6 +350,44 @@ COMMON_LAYOUT_DATA: Any = {
             "requiredSelectionValue": "Advanced",
             "help": "Activate the eyes face expression restorer",
         },
+        "FaceExpressionCameraGazeToggle": {
+            "level": 4,
+            "label": "Camera Gaze Lock",
+            "default": False,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionEyesToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Forces the eyes to look directly at the camera. Overrides original and driving gaze.",
+        },
+        "FaceExpressionCameraGazeStrengthDecimalSlider": {
+            "level": 5,
+            "label": "Gaze Strength",
+            "min_value": "0.00",
+            "max_value": "1.00",
+            "default": "0.50",
+            "decimals": 2,
+            "step": 0.05,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionEyesToggle & FaceExpressionCameraGazeToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Controls the strength of the camera gaze lock.",
+        },
+        "FaceExpressionCameraGazeVerticalOffsetDecimalSlider": {
+            "level": 5,
+            "label": "Gaze Vertical Fine-Tune",
+            "min_value": "-1.00",
+            "max_value": "1.00",
+            "default": "0.00",
+            "decimals": 2,
+            "step": 0.05,
+            "parentToggle": "FaceExpressionEnableBothToggle & FaceExpressionEyesToggle & FaceExpressionCameraGazeToggle",
+            "requiredToggleValue": True,
+            "parentSelection": "FaceExpressionModeSelection",
+            "requiredSelectionValue": "Advanced",
+            "help": "Micro-adjust the vertical gaze up or down to fix perceptual eye contact issues caused by eyelid shape.",
+        },
         "FaceExpressionStableGazeEyesToggle": {
             "level": 4,
             "label": "Relative Lids + Retargeted Gaze",
@@ -759,6 +797,29 @@ COMMON_LAYOUT_DATA: Any = {
                 "lp_retarget_lip (Simple/fallback)."
             ),
         },
+        "AutoMouthExcludeUpperTeethToggle": {
+            "level": 2,
+            "label": "Exclude Upper Teeth Area",
+            "default": False,
+            "parentToggle": "AutoMouthExpressionEnableToggle",
+            "requiredToggleValue": True,
+            "help": (
+                "When auto-mouth is active, trims the top part of the inner-mouth "
+                "face-parser mask to keep swapped upper teeth visible while preserving "
+                "original inner-mouth content like tongue/cavity."
+            ),
+        },
+        "AutoMouthShowDebugOutlineToggle": {
+            "level": 2,
+            "label": "Show Mouth Region Outline",
+            "default": False,
+            "parentToggle": "AutoMouthExpressionEnableToggle",
+            "requiredToggleValue": True,
+            "help": (
+                "Draw a green outline around the mouth region on the preview frame "
+                "for debugging. Only visible when Auto Mouth Expression is active."
+            ),
+        },
         "AutoMouthMouthParserSlider": {
             "level": 2,
             "label": "Mouth Parser",
@@ -794,7 +855,7 @@ COMMON_LAYOUT_DATA: Any = {
             "label": "Lower Lip Parser",
             "min_value": "0",
             "max_value": "30",
-            "default": "17",
+            "default": "8",
             "step": 1,
             "parentToggle": "AutoMouthExpressionEnableToggle",
             "requiredToggleValue": True,
